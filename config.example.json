@@ -15,7 +15,7 @@
   "boundary_tolerance_ms": 300,
   "redimnet_device": "auto",
   "redimnet_repository": "PalabraAI/redimnet2",
-  "redimnet_revision": "2c317b02ec168e103d7484e66476845f66c7e4a6",
+  "redimnet_revision": "c5bbe0b76e37df698c403f8844e41304ceab6307",
   "redimnet_anchor_min_seconds": 3.0,
   "redimnet_anchor_target_seconds": 30.0,
   "redimnet_known_threshold": 0.55,

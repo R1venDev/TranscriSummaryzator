@@ -27,7 +27,7 @@ class PipelineConfig(BaseModel):
     ultra_device: str = "auto"
     boundary_tolerance_ms: int = Field(300, ge=0)
     redimnet_repository: str = "PalabraAI/redimnet2"
-    redimnet_revision: str = "2c317b02ec168e103d7484e66476845f66c7e4a6"
+    redimnet_revision: str = "c5bbe0b76e37df698c403f8844e41304ceab6307"
     redimnet_device: str = "auto"
     redimnet_anchor_min_seconds: float = 3.0
     redimnet_anchor_target_seconds: float = 30.0

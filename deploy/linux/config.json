@@ -13,7 +13,7 @@
   "ultra_model_revision": "main",
   "ultra_device": "cuda",
   "redimnet_repository": "PalabraAI/redimnet2",
-  "redimnet_revision": "2c317b02ec168e103d7484e66476845f66c7e4a6",
+  "redimnet_revision": "c5bbe0b76e37df698c403f8844e41304ceab6307",
   "redimnet_device": "cuda",
   "gigaam_model": "v3_e2e_rnnt",
   "language": "ru",
