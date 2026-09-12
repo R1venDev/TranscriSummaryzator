@@ -145,6 +145,7 @@ def connect():
         "worker_id": "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
         "lease_until": "ALTER TABLE jobs ADD COLUMN lease_until TEXT",
         "attempt_id": "ALTER TABLE jobs ADD COLUMN attempt_id TEXT",
+        "content_sha256": "ALTER TABLE jobs ADD COLUMN content_sha256 TEXT",
     }
     for column, statement in migrations.items():
         if column not in columns:
@@ -158,6 +159,7 @@ def connect():
 
 
 def fingerprint(path):
+    """Return the immutable content digest used by cache and provenance."""
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         while True:
@@ -166,6 +168,12 @@ def fingerprint(path):
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def submission_fingerprint(content_sha256, original_name):
+    """Deduplicate only an identical recording submitted under the same name."""
+    payload = str(content_sha256) + "\0" + Path(original_name).name
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def safe_name(path):
@@ -189,7 +197,8 @@ def enqueue(path, known_fingerprint=None, speaker_count=None):
     path = Path(path).expanduser().resolve()
     if not path.is_file() or path.suffix.casefold() not in MEDIA_EXTENSIONS:
         raise ValueError("Это не поддерживаемый медиафайл: {}".format(path))
-    fp = known_fingerprint or fingerprint(path)
+    content_sha256 = known_fingerprint or fingerprint(path)
+    fp = submission_fingerprint(content_sha256, path.name)
     db = connect()
     existing = db.execute("SELECT * FROM jobs WHERE fingerprint = ?", (fp,)).fetchone()
     if existing:
@@ -200,14 +209,14 @@ def enqueue(path, known_fingerprint=None, speaker_count=None):
     job_dir.mkdir(parents=True, exist_ok=False)
     cursor = db.execute(
         """INSERT INTO jobs
-        (fingerprint, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at)
-        VALUES (?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)""",
-        (fp, str(path), path.name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
+        (fingerprint, content_sha256, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)""",
+        (fp, content_sha256, str(path), path.name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
     )
     db.commit()
     write_status_snapshot(db)
     job_id = cursor.lastrowid
-    write_json(job_dir / "job.json", {"id": job_id, "fingerprint": fp, "source": str(path), "created_at": now()})
+    write_json(job_dir / "job.json", {"id": job_id, "fingerprint": fp, "content_sha256": content_sha256, "source": str(path), "created_at": now()})
     print("Добавлено в очередь: job {} — {}".format(job_id, path.name))
     if config().get("open_dashboard_on_job", True):
         open_dashboard()
@@ -1462,9 +1471,10 @@ def process_job(job_id):
     consensus_json = job_dir / "consensus.json"
     asr_json = job_dir / "asr.json"
     duration_path = job_dir / "duration.json"
+    content_sha256 = job["content_sha256"] or fingerprint(source)
     final_dir = OUTPUTS / ("{}-{}".format(safe_name(source), job["fingerprint"][:8]))
     publishing = final_dir.with_name(final_dir.name + ".publishing")
-    audio_key = stage_cache_key("audio-v1", {"source": job["fingerprint"], "track": cfg["audio_track"], "rate": 16000, "channels": 1})
+    audio_key = stage_cache_key("audio-v1", {"source": content_sha256, "track": cfg["audio_track"], "rate": 16000, "channels": 1})
     diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg.get("diarization_batch_size", 8), "min": cfg.get("diarization_min_speakers", 1), "max": cfg.get("diarization_max_speakers", 5), "exact": job["speaker_count"]})
     ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
@@ -1597,9 +1607,9 @@ def process_job(job_id):
         for relative, producer in (("transcript.json", "export"), ("semantics/evidence_spans.json", "evidence_ledger"), ("consensus.json", "consensus")):
             artifact = publishing / relative
             if artifact.is_file():
-                manifests.append(artifact_provenance(artifact, producer, {"audio_sha256": job["fingerprint"]}))
+                manifests.append(artifact_provenance(artifact, producer, {"audio_sha256": content_sha256}))
         write_json(publishing / "source.manifest.json", {
-            "schema_version": 1, "source": job["original_name"], "audio_sha256": job["fingerprint"],
+            "schema_version": 1, "source": job["original_name"], "audio_sha256": content_sha256,
             "config_sha256": _json_hash(cfg), "artifacts": manifests,
         })
         if final_dir.exists():

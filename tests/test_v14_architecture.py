@@ -5,6 +5,7 @@ from pathlib import Path
 from scripts.config_schema import PipelineConfig, load_config
 from scripts.evidence_ledger import attach_word_ids, ledger_document, risk_level, semantic_risks
 from scripts.quality_schema import meeting_state
+import pipeline
 
 
 class V14ArchitectureTests(unittest.TestCase):
@@ -34,6 +35,13 @@ class V14ArchitectureTests(unittest.TestCase):
     def test_config_rejects_unknown_keys(self):
         with self.assertRaises(Exception):
             PipelineConfig.model_validate({"unknown": True})
+
+    def test_same_content_with_different_name_is_a_new_submission(self):
+        digest = "a" * 64
+        first = pipeline.submission_fingerprint(digest, "meeting-one.wav")
+        second = pipeline.submission_fingerprint(digest, "meeting-two.wav")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, pipeline.submission_fingerprint(digest, "meeting-one.wav"))
 
 
 if __name__ == "__main__":
