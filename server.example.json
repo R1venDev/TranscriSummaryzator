@@ -1,0 +1,7 @@
+{
+  "host": "meeting-transcript.example.ts.net",
+  "port": 22,
+  "user": "transcript",
+  "remote_inbox": "/srv/meeting-transcript/inbox",
+  "identity_file": "~/.ssh/meeting-transcript"
+}

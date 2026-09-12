@@ -19,12 +19,14 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from quality_schema import utterance_uncertainty, word_uncertainty
+from config_schema import load_config
+from evidence_ledger import attach_word_ids, ledger_document, record_resolution
 
 
 ROOT = Path(__file__).resolve().parent
@@ -49,7 +51,7 @@ def now():
 
 
 def config():
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return load_config(CONFIG_PATH, STATE / "config.resolved.json")
 
 
 def write_json(path, value):
@@ -60,11 +62,22 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
+STAGE_DEPENDENCIES = {
+    "audio": ["pipeline.py"],
+    "diarizen": ["pipeline.py", "scripts/diarize_worker.py"],
+    "ultra": ["pipeline.py", "scripts/ultra_worker.py"],
+    "consensus": ["pipeline.py", "scripts/consensus.py"],
+    "asr": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py"],
+    "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py"],
+}
+
+
 def stage_cache_key(stage, inputs):
+    family = stage.split("-", 1)[0]
+    paths = [ROOT / value for value in STAGE_DEPENDENCIES.get(family, ["pipeline.py"])]
     return _json_hash({"stage": stage, "inputs": inputs, "code": {
         str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in [Path(__file__), *sorted((ROOT / "scripts").glob("*.py"))]
-        if path.name != "summary_worker.py"
+        for path in paths if path.is_file()
     }})
 
 
@@ -79,6 +92,18 @@ def mark_stage_cached(job_dir, stage, key, artifacts):
     metadata = load_json(path) if path.is_file() else {}
     metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now()}
     write_json(path, metadata)
+
+
+def artifact_provenance(path, producer, inputs=None, model=None):
+    path = Path(path)
+    return {
+        "artifact": str(path.name),
+        "producer": {"component": producer, "stage_version": 1},
+        "model": model or {},
+        "inputs": inputs or {},
+        "output_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+        "created_at": now(),
+    }
 
 
 def connect():
@@ -117,6 +142,9 @@ def connect():
         "summary_error": "ALTER TABLE jobs ADD COLUMN summary_error TEXT",
         "summary_started_at": "ALTER TABLE jobs ADD COLUMN summary_started_at TEXT",
         "summary_finished_at": "ALTER TABLE jobs ADD COLUMN summary_finished_at TEXT",
+        "worker_id": "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
+        "lease_until": "ALTER TABLE jobs ADD COLUMN lease_until TEXT",
+        "attempt_id": "ALTER TABLE jobs ADD COLUMN attempt_id TEXT",
     }
     for column, statement in migrations.items():
         if column not in columns:
@@ -187,6 +215,8 @@ def enqueue(path, known_fingerprint=None, speaker_count=None):
 
 
 def update_job(db, job_id, **values):
+    if values.get("status") == "running" or "progress" in values:
+        values.setdefault("lease_until", (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds"))
     values["updated_at"] = now()
     query = "UPDATE jobs SET {} WHERE id = ?".format(", ".join("{} = ?".format(key) for key in values))
     db.execute(query, tuple(values.values()) + (job_id,))
@@ -427,7 +457,11 @@ def assign_speakers(words, intervals, cfg):
             flags.append("ambiguous" if ranked else "no_diarization")
         if evidence_confidence and max(evidence_confidence) < 0.7:
             flags.append("low_confidence")
-        assigned.append(dict(word, speaker=speaker, speaker_confidence=round(confidence, 3), flags=flags))
+        evidence = [{"speaker": value, "overlap_seconds": round(amount, 4), "source": "diarization"} for value, amount in ranked]
+        item = dict(word, speaker=speaker, speaker_confidence=round(confidence, 3), flags=sorted(set(flags)), speaker_evidence=evidence)
+        item["resolution"] = {"selected": speaker, "method": "acoustic_overlap" if clear else "unresolved", "risk": "low" if clear else "high"}
+        item["speaker_resolution_history"] = [{"speaker": speaker, "reason": item["resolution"]["method"]}]
+        assigned.append(item)
 
     # ASR often starts very short words a few milliseconds before diarization.
     # Recover them from the immediately adjacent, unambiguous speaker context.
@@ -445,9 +479,8 @@ def assign_speakers(words, intervals, cfg):
         if candidates and candidates[0][0] <= float(cfg.get("word_boundary_context_seconds", 0.4)):
             nearest = candidates[0][1]
             if len(candidates) == 1 or candidates[1][1] == nearest or candidates[0][0] + 0.12 < candidates[1][0]:
-                word["speaker"] = nearest
-                word["speaker_confidence"] = 0.75
-                word["flags"] = []
+                record_resolution(word, nearest, "context_nearest", 0.75, "medium")
+                word["flags"] = sorted(set(word["flags"] + ["speaker_context"]))
                 word["speaker_inferred_from_context"] = True
 
     # Bridge short ambiguous sequences when the same confidently assigned
@@ -473,9 +506,9 @@ def assign_speakers(words, intervals, cfg):
         bridge_gap = min(0.8, float(cfg.get("utterance_gap_seconds", 1.2)))
         if len(sequence) <= 5 and sequence_duration <= 2.0 and left_gap <= bridge_gap and right_gap <= bridge_gap:
             for word in sequence:
-                word["speaker"] = previous["speaker"]
-                word["speaker_confidence"] = max(0.65, min(0.8, float(word["speaker_confidence"])))
-                word["flags"] = [flag for flag in word["flags"] if flag == "overlap"]
+                score = max(0.65, min(0.8, float(word["speaker_confidence"])))
+                record_resolution(word, previous["speaker"], "context_bridge", score, "medium")
+                word["flags"] = sorted(set(word["flags"] + ["speaker_context"]))
                 word["speaker_inferred_from_context"] = True
     return assigned
 
@@ -557,6 +590,7 @@ def apply_domain_vocabulary(words, cfg):
             item["end"] = words[index + length - 1]["end"]
             item["text"] = parsed[index][0] + canonical + parsed[index + length - 1][2]
             item["asr_text"] = " ".join(originals)
+            item["source_word_ids"] = [words[position]["word_id"] for position in range(index, index + length)]
             item["vocabulary_corrected"] = True
             corrected.append(item)
             index += length
@@ -619,9 +653,8 @@ def apply_voice_segments(words, voice_segments):
         if not ranked or ranked[0][0] / duration < 0.55:
             continue
         segment = ranked[0][1]
-        word["speaker"] = "profile:" + segment["profile_id"]
-        word["speaker_confidence"] = segment["score"]
-        word["flags"] = [flag for flag in word.get("flags", []) if flag not in {"ambiguous", "no_diarization"}]
+        record_resolution(word, "profile:" + segment["profile_id"], "redimnet_phrase", segment["score"], "low")
+        word["flags"] = list(word.get("flags", []))
         if "voice_profile" not in word["flags"]:
             word["flags"].append("voice_profile")
     return words
@@ -665,9 +698,8 @@ def smooth_phrase_speakers(words, cfg):
             if island_duration > max_island or (dominant_ratio < dominance and not low_evidence):
                 continue
             for _, word in island:
-                word["speaker"] = dominant
-                word["speaker_confidence"] = max(0.7, float(word.get("speaker_confidence", 0)))
-                word["flags"] = [flag for flag in word.get("flags", []) if flag not in {"ambiguous", "no_diarization", "low_confidence"}]
+                record_resolution(word, dominant, "phrase_smoothing", max(0.7, float(word.get("speaker_confidence", 0))), "medium")
+                word["flags"] = list(word.get("flags", []))
                 if "speaker_smoothed" not in word["flags"]:
                     word["flags"].append("speaker_smoothed")
     return words
@@ -731,9 +763,8 @@ def cohere_clause_speakers(words, cfg):
                     and (not weak_evidence or boundary_gap > float(cfg.get("clause_coherence_acoustic_gap_seconds", 0.35)))):
                 continue
             for _, word in weaker["items"]:
-                word["speaker"] = dominant["speaker"]
-                word["speaker_confidence"] = max(0.72, float(word.get("speaker_confidence", 0)))
-                word["flags"] = [flag for flag in word.get("flags", []) if flag not in {"ambiguous", "no_diarization", "low_confidence"}]
+                record_resolution(word, dominant["speaker"], "clause_coherence", max(0.72, float(word.get("speaker_confidence", 0))), "high")
+                word["flags"] = list(word.get("flags", []))
                 if "clause_coherence" not in word["flags"]:
                     word["flags"].append("clause_coherence")
     return words
@@ -761,10 +792,8 @@ def bridge_short_profile_phrases(words, cfg):
             if float(following["start"]) - float(word["end"]) <= 0.5:
                 chosen = following["speaker"]
         if chosen:
-            word["speaker"] = chosen
-            word["speaker_confidence"] = max(0.7, float(word.get("speaker_confidence", 0)))
-            word["flags"] = [flag for flag in word.get("flags", []) if flag not in {"ambiguous", "no_diarization"}]
-            word["flags"].append("speaker_context")
+            record_resolution(word, chosen, "profile_context", max(0.7, float(word.get("speaker_confidence", 0))), "high")
+            word["flags"] = sorted(set(word.get("flags", []) + ["speaker_context"]))
     for unit in phrase_units(words, cfg):
         if any(str(word.get("speaker", "")).startswith("profile:") for _, word in unit):
             continue
@@ -801,9 +830,8 @@ def bridge_short_profile_phrases(words, cfg):
         if chosen is None:
             continue
         for _, word in unit:
-            word["speaker"] = chosen
-            word["speaker_confidence"] = max(0.72, float(word.get("speaker_confidence", 0)))
-            word["flags"] = [flag for flag in word.get("flags", []) if flag not in {"ambiguous", "no_diarization"}]
+            record_resolution(word, chosen, "profile_phrase_context", max(0.72, float(word.get("speaker_confidence", 0))), "high")
+            word["flags"] = list(word.get("flags", []))
             if "speaker_context" not in word["flags"]:
                 word["flags"].append("speaker_context")
     return words
@@ -859,7 +887,8 @@ def export_results(job, duration, diarization, asr, output_dir, cfg):
     speaker_data.update({"labels": labels, "available_speakers": speakers, "instructions": "Задайте имя в labels и выполните: ./pipeline rename <job-id>"})
     write_json(speaker_path, speaker_data)
 
-    normalized_words = apply_domain_vocabulary(asr["words"], cfg)
+    raw_words = attach_word_ids(asr["words"])
+    normalized_words = apply_domain_vocabulary(raw_words, cfg)
     words = assign_speakers(normalized_words, diarization["intervals"], cfg)
     voice_segments_path = output_dir / "voice_segments.json"
     voice_segments = load_json(voice_segments_path).get("segments", []) if voice_segments_path.exists() else []
@@ -871,7 +900,7 @@ def export_results(job, duration, diarization, asr, output_dir, cfg):
     for word in words:
         word["uncertainty"] = word_uncertainty(word)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "source": job["original_name"],
         "duration_seconds": round(duration, 3),
         "models": {"diarization": diarization.get("model"), "asr": asr.get("model"), "vad": asr.get("vad")},
@@ -887,6 +916,10 @@ def export_results(job, duration, diarization, asr, output_dir, cfg):
         },
     }
     write_json(output_dir / "transcript.json", payload)
+    ledger = ledger_document(raw_words, words, turns)
+    write_json(output_dir / "transcript" / "words.json", {"schema_version": 1, "words": ledger["words"]})
+    write_json(output_dir / "transcript" / "normalization.json", {"schema_version": 1, "tokens": ledger["normalized_tokens"]})
+    write_json(output_dir / "semantics" / "evidence_spans.json", {"schema_version": 1, "spans": ledger["evidence_spans"]})
 
     md = ["# {}".format(Path(job["original_name"]).stem), ""]
     txt = []
@@ -1041,7 +1074,10 @@ def extract_redimnet_embeddings(groups, destination, log, cfg):
         str(group): [dict(item, path=str(item["path"])) if isinstance(item, dict) else str(item) for item in items]
         for group, items in groups.items()
     }
-    key = _json_hash({"model": REDIMNET_MODEL, "groups": serializable})
+    key = _json_hash({
+        "model": REDIMNET_MODEL, "repository": cfg["redimnet_repository"],
+        "revision": cfg["redimnet_revision"], "groups": serializable,
+    })
     key_path = Path(str(destination) + ".key")
     if Path(destination).is_file() and key_path.is_file() and key_path.read_text().strip() == key:
         return load_json(destination).get("groups", {})
@@ -1054,6 +1090,8 @@ def extract_redimnet_embeddings(groups, destination, log, cfg):
             "--manifest", str(manifest), "--output", str(destination),
             "--cache", str(ROOT / "work" / "cache"),
             "--device", str(cfg.get("redimnet_device", "auto")),
+            "--repository", cfg["redimnet_repository"],
+            "--revision", cfg["redimnet_revision"],
         ], log, env=dict(os.environ, TORCH_HOME=str(ROOT / "work" / "cache" / "torch"), PYTHONUNBUFFERED="1"))
         key_path.write_text(key + "\n", encoding="utf-8")
     finally:
@@ -1427,8 +1465,8 @@ def process_job(job_id):
     final_dir = OUTPUTS / ("{}-{}".format(safe_name(source), job["fingerprint"][:8]))
     publishing = final_dir.with_name(final_dir.name + ".publishing")
     audio_key = stage_cache_key("audio-v1", {"source": job["fingerprint"], "track": cfg["audio_track"], "rate": 16000, "channels": 1})
-    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "batch": cfg.get("diarization_batch_size", 8), "min": cfg.get("diarization_min_speakers", 1), "max": cfg.get("diarization_max_speakers", 5), "exact": job["speaker_count"]})
-    ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "streaming": [340, 40, 40, 300]})
+    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg.get("diarization_batch_size", 8), "min": cfg.get("diarization_min_speakers", 1), "max": cfg.get("diarization_max_speakers", 5), "exact": job["speaker_count"]})
+    ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
     asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
 
@@ -1495,6 +1533,7 @@ def process_job(job_id):
                 "--audio", str(audio), "--output", str(ultra_json), "--rttm", str(ultra_rttm),
                 "--model", cfg.get("ultra_model", "mago-ai/ultra_diar_streaming_sortformer_8spk_v1"),
                 "--cache", str(ROOT / "work" / "cache" / "ultra"), "--device", cfg.get("ultra_device", "auto"),
+                "--revision", cfg["ultra_model_revision"],
             ], log, env=env)
             mark_stage_cached(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
         if not stage_cache_valid(job_dir, "consensus", consensus_key, ["consensus.json", "track_mapping.json"]):
@@ -1522,6 +1561,12 @@ def process_job(job_id):
                 str(ROOT / ".venv-gigaam" / "bin" / "python"), str(ROOT / "scripts" / "asr_worker.py"),
                 "--audio", str(audio), "--output", str(asr_json), "--model", cfg["gigaam_model"],
                 "--cache", str(ROOT / "work" / "cache" / "gigaam"), "--device", cfg["asr_device"],
+                "--vad-threshold", str(cfg["vad_threshold"]),
+                "--vad-min-speech-ms", str(cfg["vad_min_speech_ms"]),
+                "--vad-min-silence-ms", str(cfg["vad_min_silence_ms"]),
+                "--vad-speech-pad-ms", str(cfg["vad_speech_pad_ms"]),
+                "--chunk-seconds", str(cfg["asr_chunk_seconds"]),
+                "--overlap-seconds", str(cfg["asr_overlap_seconds"]),
             ], log, env=env, progress_callback=transcription_progress)
             mark_stage_cached(job_dir, "asr", asr_key, ["asr.json"])
         update_job(db, job_id, stage="export", progress=92, detail="Совмещаю текст с участниками и создаю файлы")
@@ -1548,6 +1593,15 @@ def process_job(job_id):
             fused_diarization = identity_report.get("diarization", fused_diarization)
             export_results(job, duration, fused_diarization, load_json(asr_json), publishing, cfg)
         copy_artifacts(job_dir, publishing)
+        manifests = []
+        for relative, producer in (("transcript.json", "export"), ("semantics/evidence_spans.json", "evidence_ledger"), ("consensus.json", "consensus")):
+            artifact = publishing / relative
+            if artifact.is_file():
+                manifests.append(artifact_provenance(artifact, producer, {"audio_sha256": job["fingerprint"]}))
+        write_json(publishing / "source.manifest.json", {
+            "schema_version": 1, "source": job["original_name"], "audio_sha256": job["fingerprint"],
+            "config_sha256": _json_hash(cfg), "artifacts": manifests,
+        })
         if final_dir.exists():
             archive = ROOT / "backups" / "transcript_exports"
             archive.mkdir(parents=True, exist_ok=True)
@@ -1579,8 +1633,20 @@ def run_next():
     if not config().get("processing_enabled", True):
         return False
     db = connect()
+    worker_id = "{}:{}".format(os.uname().nodename, os.getpid())
+    attempt_id = uuid.uuid4().hex
+    lease_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds")
+    db.execute("BEGIN IMMEDIATE")
     job = db.execute("SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1").fetchone()
     if not job:
+        db.commit()
+        return False
+    claimed = db.execute(
+        "UPDATE jobs SET status='running', stage='claimed', worker_id=?, attempt_id=?, lease_until=?, updated_at=? WHERE id=? AND status='queued'",
+        (worker_id, attempt_id, lease_until, now(), job["id"]),
+    )
+    db.commit()
+    if claimed.rowcount != 1:
         return False
     process_job(job["id"])
     return True
@@ -1701,7 +1767,7 @@ def watch():
         return
     dashboard = start_dashboard(background=True)
     db = connect()
-    db.execute("UPDATE jobs SET status = 'queued', detail = 'Возобновляю после перезапуска', updated_at = ? WHERE status = 'running'", (now(),))
+    db.execute("UPDATE jobs SET status = 'queued', detail = 'Возобновляю после истечения lease', worker_id = NULL, attempt_id = NULL, lease_until = NULL, updated_at = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)", (now(), now()))
     db.execute("UPDATE jobs SET summary_status = 'queued', summary_detail = 'Возобновляю после перезапуска', updated_at = ? WHERE summary_status = 'running'", (now(),))
     db.commit()
     write_status_snapshot(db)

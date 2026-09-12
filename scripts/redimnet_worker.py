@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--repository", default="PalabraAI/redimnet2")
+    parser.add_argument("--revision", required=True)
     args = parser.parse_args()
     os.environ["TORCH_HOME"] = str(Path(args.cache) / "torch")
 
@@ -58,7 +60,8 @@ def main():
     import torch
 
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-    model = torch.hub.load("PalabraAI/redimnet2", "redimnet2", model_name="b6", train_type="lm", dataset="vb2+vox2+cnc2_v0", pretrained=True, trust_repo=True)
+    repository = f"{args.repository}:{args.revision}"
+    model = torch.hub.load(repository, "redimnet2", model_name="b6", train_type="lm", dataset="vb2+vox2+cnc2_v0", pretrained=True, trust_repo=True)
     model.eval().to(device)
     manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
     results = {}
@@ -85,7 +88,7 @@ def main():
                     embeddings.append(normalize(model(tensor).float().cpu().numpy()[0]))
         if embeddings:
             results[group] = {"embedding": robust_centroid(embeddings).tolist(), "references": [v.tolist() for v in embeddings], "chunks": len(embeddings)}
-    Path(args.output).write_text(json.dumps({"model": "PalabraAI/ReDimNet2-B6-vb2+vox2+cnc2_v0-lm", "device": device, "groups": results, "errors": errors}, ensure_ascii=False) + "\n", encoding="utf-8")
+    Path(args.output).write_text(json.dumps({"model": "PalabraAI/ReDimNet2-B6-vb2+vox2+cnc2_v0-lm", "repository": args.repository, "revision": args.revision, "device": device, "groups": results, "errors": errors}, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

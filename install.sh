@@ -24,12 +24,18 @@ fi
 UV="$TOOLS_DIR/bin/uv"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" python install --no-bin 3.10
 
+UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" venv --clear --python 3.10 "$ROOT_DIR/.venv-core"
+UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-core/bin/python" -r "$ROOT_DIR/requirements-core.txt"
+
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" venv --clear --python 3.10 "$ROOT_DIR/.venv-gigaam"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-gigaam/bin/python" -r "$ROOT_DIR/requirements-gigaam.txt"
 
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" venv --clear --python 3.10 "$ROOT_DIR/.venv-diarizen"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" "setuptools<81" wheel
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" torch==2.1.1 torchaudio==2.1.1 torchvision==0.16.1 numpy==1.26.4
+
+UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" venv --clear --python 3.10 "$ROOT_DIR/.venv-fusion"
+UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-fusion/bin/python" -r "$ROOT_DIR/requirements-fusion.txt"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" -r "$ROOT_DIR/requirements-diarizen-macos.txt"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" -e "$ROOT_DIR/work/vendor/DiariZen"
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" -e "$ROOT_DIR/work/vendor/DiariZen/pyannote-audio"
@@ -38,4 +44,4 @@ UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install 
 UV_PYTHON_INSTALL_DIR="$PYTHON_DIR" UV_CACHE_DIR="$CACHE_DIR" "$UV" pip install --python "$ROOT_DIR/.venv-diarizen/bin/python" torch==2.1.1 torchaudio==2.1.1 torchvision==0.16.1 numpy==1.26.4
 
 chmod +x "$ROOT_DIR/meeting-transcript" "$ROOT_DIR/pipeline.py" "$ROOT_DIR/scripts/asr_worker.py" "$ROOT_DIR/scripts/diarize_worker.py"
-"$ROOT_DIR/meeting-transcript" doctor
+"$ROOT_DIR/.venv-core/bin/python" "$ROOT_DIR/pipeline.py" doctor

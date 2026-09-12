@@ -93,13 +93,13 @@ def transcribe(args, device: str) -> dict:
         torch.from_numpy(audio),
         vad,
         sampling_rate=sample_rate,
-        threshold=0.42,
-        min_speech_duration_ms=180,
-        min_silence_duration_ms=320,
-        speech_pad_ms=220,
+        threshold=args.vad_threshold,
+        min_speech_duration_ms=args.vad_min_speech_ms,
+        min_silence_duration_ms=args.vad_min_silence_ms,
+        speech_pad_ms=args.vad_speech_pad_ms,
         return_seconds=True,
     )
-    chunks = make_chunks(stamps)
+    chunks = make_chunks(stamps, args.chunk_seconds, args.overlap_seconds)
     print("PIPELINE_PROGRESS " + json.dumps({"current": 0, "total": len(chunks)}), flush=True)
     model = load_model(args.model, device, args.cache)
     words: list[dict] = []
@@ -133,7 +133,12 @@ def transcribe(args, device: str) -> dict:
     return {
         "model": args.model,
         "device": device,
-        "vad": "silero-vad-v6-onnx",
+        "vad": {
+            "model": "silero-vad-v6-onnx", "threshold": args.vad_threshold,
+            "min_speech_duration_ms": args.vad_min_speech_ms,
+            "min_silence_duration_ms": args.vad_min_silence_ms,
+            "speech_pad_ms": args.vad_speech_pad_ms,
+        },
         "segments": segments,
         "words": words,
     }
@@ -146,6 +151,12 @@ def main() -> int:
     parser.add_argument("--model", default="v3_e2e_rnnt")
     parser.add_argument("--cache", required=True)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--vad-threshold", type=float, default=0.42)
+    parser.add_argument("--vad-min-speech-ms", type=int, default=180)
+    parser.add_argument("--vad-min-silence-ms", type=int, default=320)
+    parser.add_argument("--vad-speech-pad-ms", type=int, default=220)
+    parser.add_argument("--chunk-seconds", type=float, default=22.0)
+    parser.add_argument("--overlap-seconds", type=float, default=0.45)
     args = parser.parse_args()
 
     device = choose_torch_device(args.device)

@@ -260,6 +260,8 @@ def normalize_semantic_record(raw, fact):
         "answer_resolution_basis": answer_resolution_basis,
         "evidence_ids": evidence_ids,
         "uncertainty": uncertainty,
+        "semantic_risks": list(fact.get("semantic_risks", [])),
+        "risk_level": fact.get("risk_level", "LOW"),
     }
 
 
@@ -289,3 +291,51 @@ def task_records(records):
             "uncertainty": record["uncertainty"],
         })
     return result
+
+
+def meeting_state(records):
+    """Build the canonical DialogueEvent graph and deterministic state views."""
+    events = []
+    for record in records:
+        event_id = "EV" + str(record["record_id"])[1:]
+        act = {
+            "action": "assignment", "current_state": "assertion", "observation": "assertion",
+            "metric": "assertion", "goal": "proposal",
+        }.get(record.get("kind"), record.get("kind", "assertion"))
+        events.append({
+            "event_id": event_id, "source_record_id": record["record_id"], "act": act,
+            "proposition": {"subject": record.get("subject"), "predicate": record.get("predicate"), "object": record.get("object")},
+            "speaker_ids": list(record.get("attributed_speakers", [])),
+            "mentioned_participant_ids": list(record.get("assignees", [])),
+            "polarity": record.get("polarity", "positive"), "modality": record.get("modality", "asserted"),
+            "quantities": list(record.get("quantities", [])), "conditions": list(record.get("conditions", [])),
+            "evidence_ids": list(record.get("evidence_ids", [])), "start": float(record.get("start", 0)),
+            "risk": {"level": record.get("risk_level", "LOW"), "signals": list(record.get("semantic_risks", [])), **record.get("uncertainty", {})},
+            "presentation": record.get("statement"),
+        })
+    relations = []
+    for index, current in enumerate(events):
+        for older in events[:index]:
+            a, b = current["proposition"], older["proposition"]
+            if not a.get("subject") or not a.get("predicate") or (a["subject"], a["predicate"]) != (b.get("subject"), b.get("predicate")):
+                continue
+            relation = None
+            if current["polarity"] != older["polarity"]:
+                relation = "contradicts"
+            elif current.get("quantities") != older.get("quantities") and current.get("quantities") and older.get("quantities"):
+                relation = "supersedes"
+            elif current["act"] == "decision" and older["act"] in {"proposal", "assertion"}:
+                relation = "accepts"
+            if relation:
+                relations.append({"source_event": current["event_id"], "relation": relation, "target_event": older["event_id"], "evidence_ids": current["evidence_ids"]})
+
+    superseded = {item["target_event"] for item in relations if item["relation"] == "supersedes"}
+    decisions = [item for item in events if item["act"] == "decision" and item["event_id"] not in superseded]
+    questions = [{**item, "state": next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
+    tasks = task_records(records)
+    return {
+        "schema_version": 1,
+        "events": events,
+        "relations": relations,
+        "views": {"decisions": decisions, "tasks": tasks, "questions": questions},
+    }

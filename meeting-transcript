@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-exec /usr/bin/python3 "$ROOT_DIR/pipeline.py" "$@"
-
+PYTHON="$ROOT_DIR/.venv-core/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON=/usr/bin/python3
+fi
+exec "$PYTHON" "$ROOT_DIR/pipeline.py" "$@"

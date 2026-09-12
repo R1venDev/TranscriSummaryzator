@@ -28,13 +28,14 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--rttm", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--revision", default="main")
     args = parser.parse_args()
 
     import torch
     from huggingface_hub import hf_hub_download
     from nemo.collections.asr.models import SortformerEncLabelModel
 
-    model_path = hf_hub_download(args.model, "ultra_diar_streaming_sortformer_8spk_v1.nemo", cache_dir=args.cache)
+    model_path = hf_hub_download(args.model, "ultra_diar_streaming_sortformer_8spk_v1.nemo", revision=args.revision, cache_dir=args.cache)
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
     model = SortformerEncLabelModel.restore_from(model_path, map_location=device, strict=False)
     model.eval()
@@ -46,7 +47,7 @@ def main():
     with torch.inference_mode(), context:
         raw = model.diarize(audio=[args.audio], batch_size=1, verbose=True)[0]
     intervals = sorted((parse_segment(item) for item in raw), key=lambda x: (x["start"], x["end"], x["speaker"]))
-    payload = {"model": args.model, "device": device, "model_file": Path(model_path).name, "intervals": intervals}
+    payload = {"model": args.model, "revision": args.revision, "device": device, "model_file": Path(model_path).name, "intervals": intervals}
     Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     write_rttm(args.rttm, Path(args.rttm).stem, intervals)
 

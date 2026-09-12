@@ -1019,7 +1019,7 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertEqual(details["degraded_batches"], [])
 
-    def test_large_public_auditor_failure_does_not_interrupt_summary(self):
+    def test_large_public_auditor_failure_quarantines_critical_fact(self):
         item = fact(kind="action", statement="Проверить BOS в симуляции")
         item["owner_refs"] = ["@Riven"]
 
@@ -1031,8 +1031,8 @@ class SummaryWorkerTests(unittest.TestCase):
             kept, rejected, details = summary.audit_public_surface_facts(
                 Client(), "large-model", [item], Path(directory), 60
             )
-        self.assertEqual([value["fact_id"] for value in kept], ["F00001"])
-        self.assertEqual(rejected, [])
+            self.assertEqual(kept, [])
+            self.assertEqual(rejected[0]["reason"], "public_auditor_unavailable")
         self.assertEqual(len(details["degraded_batches"]), 1)
 
     def test_overview_uses_real_chapter_evidence(self):

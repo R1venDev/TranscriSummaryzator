@@ -1,5 +1,21 @@
 # Архитектура транскрипции и саммари
 
+## v14: evidence ledger и MeetingState
+
+Markdown-саммари теперь считается представлением, а не источником истины. Новые
+запуски сохраняют исходные ASR-слова со стабильными `W########`, отдельное
+нормализованное представление и точные `EvidenceSpan`. Исправления speaker ID
+добавляются в историю resolution и больше не удаляют acoustic warning flags.
+
+Семантический слой публикует `DialogueEvent`, `Relation` и `MeetingState` в
+`semantics/`; решения, задачи и вопросы в `views/` являются его проекциями.
+Extraction использует адаптивные turn-aware сегменты с контекстным halo, но
+ссылаться на evidence разрешено только внутри текущей зоны.
+
+`PipelineConfig` валидирует конфигурацию, запрещает неизвестные ключи и пишет
+эффективные значения в `state/config.resolved.json`. Cache использует зависимости
+конкретного stage, а очередь атомарно резервирует job с worker/attempt/lease.
+
 ## AS-IS (baseline preserved)
 
 - `pipeline.py` owns the SQLite queue, resumable stages, web API and exports.

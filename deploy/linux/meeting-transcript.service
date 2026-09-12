@@ -8,12 +8,18 @@ Type=simple
 User=transcript
 Group=transcript
 WorkingDirectory=/srv/meeting-transcript
-Environment=PATH=/srv/meeting-transcript/.venv-gigaam/bin:/srv/meeting-transcript/.venv-diarizen/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 /srv/meeting-transcript/pipeline.py watch
-Restart=always
+Environment=PATH=/srv/meeting-transcript/.venv-core/bin:/srv/meeting-transcript/.venv-gigaam/bin:/srv/meeting-transcript/.venv-diarizen/bin:/srv/meeting-transcript/.venv-fusion/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/srv/meeting-transcript/.venv-core/bin/python /srv/meeting-transcript/pipeline.py watch
+Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
 Nice=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/meeting-transcript /mnt/shared-data/MeetingTranscript
 
 [Install]
 WantedBy=multi-user.target

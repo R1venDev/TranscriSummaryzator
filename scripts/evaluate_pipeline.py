@@ -44,11 +44,18 @@ def text_score(reference, hypothesis):
     ref = normalize_text(transcript_text(reference))
     hyp = normalize_text(transcript_text(hypothesis))
     ref_words, hyp_words = ref.split(), hyp.split()
+    def class_error(pattern):
+        expected = pattern.findall(ref)
+        actual = pattern.findall(hyp)
+        return round(edit_distance(expected, actual) / max(1, len(expected)), 6)
     return {
         "WER": round(edit_distance(ref_words, hyp_words) / max(1, len(ref_words)), 6),
         "CER": round(edit_distance(list(ref.replace(" ", "")), list(hyp.replace(" ", ""))) / max(1, len(ref.replace(" ", ""))), 6),
         "reference_words": len(ref_words),
         "hypothesis_words": len(hyp_words),
+        "number_error_rate": class_error(re.compile(r"\d+(?:[.,:]\d+)*%?")),
+        "negation_error_rate": class_error(re.compile(r"\b(?:не|нет|нельзя|никогда|без)\b")),
+        "technical_term_error_rate": class_error(re.compile(r"\b(?:bos|fbos|smc|order block|tradingview|binance|[a-zа-я]+\d+)\b")),
     }
 
 
@@ -145,6 +152,9 @@ def evaluate(manifest):
             "cases": len(values),
             "WER_macro": round(sum(item["text"]["WER"] for item in values) / len(values), 6),
             "CER_macro": round(sum(item["text"]["CER"] for item in values) / len(values), 6),
+            "number_error_rate_macro": round(sum(item["text"]["number_error_rate"] for item in values) / len(values), 6),
+            "negation_error_rate_macro": round(sum(item["text"]["negation_error_rate"] for item in values) / len(values), 6),
+            "technical_term_error_rate_macro": round(sum(item["text"]["technical_term_error_rate"] for item in values) / len(values), 6),
             "DER_macro": round(sum(item["speaker"]["DER"] for item in values) / len(values), 6),
             "missed_speech_macro": round(sum(item["speaker"]["missed_speech"] for item in values) / len(values), 6),
             "false_alarm_macro": round(sum(item["speaker"]["false_alarm"] for item in values) / len(values), 6),
