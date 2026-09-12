@@ -119,7 +119,11 @@ entry point is `python diarize.py --audio meeting.wav --enrollment enrollment
 - precision/recall/F1 тезисов, типов, исполнителей и условий измеряют смысл.
 
 Режим `--fail-on-regression` блокирует выпуск при ухудшении любого основного показателя. Автоматический вывод pipeline запрещено помечать как `gold`; до появления ручной разметки система сообщает отсутствие измерения и не публикует фиктивную «точность».
-# Summary v15: canonical meeting intelligence
+# Summary v16: canonical meeting intelligence
+
+High-risk claims are verified by Ministral 3 14B. Critical claims require
+matching verdicts from Ministral and Gemma 3 12B; disagreement fails closed
+after the evidence-repair pass instead of being exposed in the final summary.
 
 The publication path is now state-first:
 
