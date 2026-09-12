@@ -895,7 +895,13 @@ ARBITRATE_SYSTEM = """Ты — строгий арбитр критичных ф
 def arbitrate(client, model, facts, cache_path, progress=None):
     if not facts:
         return [], []
-    prompt = "Независимо перепроверь критичные и сомнительные факты:\n" + json.dumps([compact_fact(item) for item in facts], ensure_ascii=False)
+    prompt = """ОБЯЗАТЕЛЬНАЯ КАЛИБРОВКА ПЕРЕД ПРОВЕРКОЙ:
+- evidence «Решили установить порог 0.5» и совпадающий claim типа decision => supported. Слово «решили» является явным маркером решения.
+- evidence «Предлагаю установить порог 0.5» => не decision, а proposal.
+- не требуй голосования, процедурного оформления или реплик каждого участника, если решение выражено явно.
+
+Независимо перепроверь критичные и сомнительные факты:
+""" + json.dumps([compact_fact(item) for item in facts], ensure_ascii=False)
     prompt += """\nВерни строго такой формат и никаких полей decision/action/reasoning:
 {"reviews":[{"fact_id":"F00001","verdict":"supported|corrected|reject","type":"proposal","statement":"исправленный атомарный факт","evidence_ids":["U00001"],"confidence":0.0,"reason":"кратко"}]}"""
     try:
