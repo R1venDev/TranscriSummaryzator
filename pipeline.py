@@ -1,1537 +1,12 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
-import argparse
-import csv
-import fcntl
-import hashlib
-import html
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import json
-import mimetypes
-import os
-import re
-import shutil
-import sqlite3
-import subprocess
-import sys
-import threading
-import time
-import traceback
-import uuid
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
-from quality_schema import utterance_uncertainty, word_uncertainty
-from config_schema import load_config
-from evidence_ledger import attach_word_ids, ledger_document, record_resolution
-
-
-ROOT = Path(__file__).resolve().parent
-INBOX = ROOT / "inbox"
-STATE = ROOT / "state"
-JOBS = ROOT / "work" / "jobs"
-OUTPUTS = ROOT / "outputs"
-VOICE_PROFILES = ROOT / "voice_profiles"
-DB_PATH = STATE / "queue.sqlite3"
-CONFIG_PATH = ROOT / "config.json"
-VOCABULARY_PATH = ROOT / "vocabulary.json"
-DASHBOARD_PATH = ROOT / "dashboard.html"
-PROFILES_PATH = ROOT / "profiles.html"
-SUMMARY_BENCHMARK = Path("/mnt/shared-data/MeetingTranscript/summary-benchmark")
-SUMMARY_STATUS_PATH = SUMMARY_BENCHMARK / "current.json"
-MEDIA_EXTENSIONS = {".mkv", ".mp4", ".mov", ".m4v", ".webm", ".wav", ".mp3", ".m4a", ".flac", ".ogg"}
-PROFILE_LOCK = threading.Lock()
-
-
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def config():
-    return load_config(CONFIG_PATH, STATE / "config.resolved.json")
-
-
-def write_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-
-
-STAGE_DEPENDENCIES = {
-    "audio": ["pipeline.py"],
-    "diarizen": ["pipeline.py", "scripts/diarize_worker.py"],
-    "ultra": ["pipeline.py", "scripts/ultra_worker.py"],
-    "consensus": ["pipeline.py", "scripts/consensus.py"],
-    "asr": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py"],
-    "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py"],
-}
-
-
-def stage_cache_key(stage, inputs):
-    family = stage.split("-", 1)[0]
-    paths = [ROOT / value for value in STAGE_DEPENDENCIES.get(family, ["pipeline.py"])]
-    return _json_hash({"stage": stage, "inputs": inputs, "code": {
-        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in paths if path.is_file()
-    }})
-
-
-def stage_cache_valid(job_dir, stage, key, artifacts):
-    path = Path(job_dir) / "stage_cache.json"
-    metadata = load_json(path) if path.is_file() else {}
-    return metadata.get(stage, {}).get("key") == key and all(Path(job_dir, name).is_file() for name in artifacts)
-
-
-def mark_stage_cached(job_dir, stage, key, artifacts):
-    path = Path(job_dir) / "stage_cache.json"
-    metadata = load_json(path) if path.is_file() else {}
-    metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now()}
-    write_json(path, metadata)
-
-
-def artifact_provenance(path, producer, inputs=None, model=None):
-    path = Path(path)
-    return {
-        "artifact": str(path.name),
-        "producer": {"component": producer, "stage_version": 1},
-        "model": model or {},
-        "inputs": inputs or {},
-        "output_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
-        "created_at": now(),
-    }
-
-
-def connect():
-    STATE.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY,
-            fingerprint TEXT NOT NULL UNIQUE,
-            source_path TEXT NOT NULL,
-            original_name TEXT NOT NULL,
-            status TEXT NOT NULL,
-            stage TEXT NOT NULL,
-            job_dir TEXT NOT NULL,
-            output_dir TEXT,
-            error TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
-    migrations = {
-        "progress": "ALTER TABLE jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0",
-        "detail": "ALTER TABLE jobs ADD COLUMN detail TEXT",
-        "started_at": "ALTER TABLE jobs ADD COLUMN started_at TEXT",
-        "finished_at": "ALTER TABLE jobs ADD COLUMN finished_at TEXT",
-        "speaker_count": "ALTER TABLE jobs ADD COLUMN speaker_count INTEGER",
-        "summary_status": "ALTER TABLE jobs ADD COLUMN summary_status TEXT NOT NULL DEFAULT 'not_started'",
-        "summary_stage": "ALTER TABLE jobs ADD COLUMN summary_stage TEXT",
-        "summary_progress": "ALTER TABLE jobs ADD COLUMN summary_progress REAL NOT NULL DEFAULT 0",
-        "summary_detail": "ALTER TABLE jobs ADD COLUMN summary_detail TEXT",
-        "summary_error": "ALTER TABLE jobs ADD COLUMN summary_error TEXT",
-        "summary_started_at": "ALTER TABLE jobs ADD COLUMN summary_started_at TEXT",
-        "summary_finished_at": "ALTER TABLE jobs ADD COLUMN summary_finished_at TEXT",
-        "worker_id": "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
-        "lease_until": "ALTER TABLE jobs ADD COLUMN lease_until TEXT",
-        "attempt_id": "ALTER TABLE jobs ADD COLUMN attempt_id TEXT",
-        "content_sha256": "ALTER TABLE jobs ADD COLUMN content_sha256 TEXT",
-    }
-    for column, statement in migrations.items():
-        if column not in columns:
-            db.execute(statement)
-    # Legacy fingerprints were raw content hashes. Preserve them for stable
-    # output paths while backfilling the new explicit content digest.
-    db.execute("UPDATE jobs SET content_sha256 = fingerprint WHERE content_sha256 IS NULL")
-    db.execute("UPDATE jobs SET progress = 100 WHERE status = 'done' AND progress < 100")
-    db.execute("UPDATE jobs SET detail = '–ì–æ—Ç–æ–≤–æ' WHERE status = 'done' AND detail IS NULL")
-    db.execute("UPDATE jobs SET started_at = created_at WHERE started_at IS NULL AND status IN ('running', 'done', 'failed')")
-    db.execute("UPDATE jobs SET finished_at = updated_at WHERE finished_at IS NULL AND status IN ('done', 'failed')")
-    db.commit()
-    return db
-
-
-def fingerprint(path):
-    """Return the immutable content digest used by cache and provenance."""
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while True:
-            block = stream.read(8 * 1024 * 1024)
-            if not block:
-                break
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def submission_fingerprint(content_sha256, original_name):
-    """Deduplicate only an identical recording submitted under the same name."""
-    payload = str(content_sha256) + "\0" + Path(original_name).name
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def find_existing_job(db, content_sha256, original_name):
-    submission = submission_fingerprint(content_sha256, original_name)
-    return db.execute(
-        "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
-        (submission, content_sha256, Path(original_name).name),
-    ).fetchone()
-
-
-def safe_name(path):
-    cleaned = "".join(c if c.isalnum() or c in "-_." else "_" for c in Path(path).stem).strip("._")
-    return cleaned[:100] or "recording"
-
-
-def normalize_speaker_count(value):
-    if value in (None, "", "auto"):
-        return None
-    try:
-        count = int(value)
-    except (TypeError, ValueError):
-        raise ValueError("–ö–æ–ª–∏—á–µ—Å—Ç–≤–æ —É—á–∞—Å—Ç–Ω–∏–∫–æ–≤ –¥–æ–ª–∂–Ω–æ –±—ã—Ç—å –æ—Ç 1 –¥–æ 8")
-    if count < 1 or count > 8:
-        raise ValueError("–ö–æ–ª–∏—á–µ—Å—Ç–≤–æ —É—á–∞—Å—Ç–Ω–∏–∫–æ–≤ –¥–æ–ª–∂–Ω–æ –±—ã—Ç—å –æ—Ç 1 –¥–æ 8")
-    return count
-
-
-def enqueue(path, known_fingerprint=None, speaker_count=None, original_name=None):
-    path = Path(path).expanduser().resolve()
-    if not path.is_file() or path.suffix.casefold() not in MEDIA_EXTENSIONS:
-        raise ValueError("–≠—Ç–æ –Ω–µ –ø–æ–¥–¥–µ—Ä–∂–∏–≤–∞–µ–º—ã–π –º–µ–¥–∏–∞—Ñ–∞–π–ª: {}".format(path))
-    original_name = Path(original_name or path.name).name
-    content_sha256 = known_fingerprint or fingerprint(path)
-    fp = submission_fingerprint(content_sha256, original_name)
-    db = connect()
-    existing = find_existing_job(db, content_sha256, original_name)
-    if existing:
-        print("–£–∂–µ –≤ –æ—á–µ—Ä–µ–¥–∏: job {} ({})".format(existing["id"], existing["status"]))
-        return existing["id"]
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    job_dir = JOBS / ("{}-{}".format(stamp, fp[:10]))
-    job_dir.mkdir(parents=True, exist_ok=False)
-    cursor = db.execute(
-        """INSERT INTO jobs
-        (fingerprint, content_sha256, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)""",
-        (fp, content_sha256, str(path), original_name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
-    )
-    db.commit()
-    write_status_snapshot(db)
-    job_id = cursor.lastrowid
-    write_json(job_dir / "job.json", {"id": job_id, "fingerprint": fp, "content_sha256": content_sha256, "source": str(path), "created_at": now()})
-    print("–î–æ–±–∞–≤–ª–µ–Ω–æ –≤ –æ—á–µ—Ä–µ–¥—å: job {} ‚Äî {}".format(job_id, original_name))
-    if config().get("open_dashboard_on_job", True):
-        open_dashboard()
-    return job_id
-
-
-def update_job(db, job_id, **values):
-    if values.get("status") == "running" or "progress" in values:
-        values.setdefault("lease_until", (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds"))
-    values["updated_at"] = now()
-    query = "UPDATE jobs SET {} WHERE id = ?".format(", ".join("{} = ?".format(key) for key in values))
-    db.execute(query, tuple(values.values()) + (job_id,))
-    db.commit()
-    write_status_snapshot(db)
-
-
-def status_rows(db):
-    return db.execute(
-        "SELECT id, original_name, status, stage, progress, detail, error, output_dir, speaker_count, created_at, started_at, finished_at, updated_at, summary_status, summary_stage, summary_progress, summary_detail, summary_error, summary_started_at, summary_finished_at FROM jobs ORDER BY id DESC LIMIT 50"
-    ).fetchall()
-
-
-def write_status_snapshot(db):
-    payload = {"jobs": [dict(row) for row in status_rows(db)], "inbox": str(INBOX), "outputs": str(OUTPUTS), "updated_at": now()}
-    write_json(STATE / "progress.json", payload)
-
-
-def run_command(command, log_path, env=None, progress_callback=None):
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a", encoding="utf-8") as log:
-        log.write("\n[{}] {}\n".format(now(), " ".join(map(str, command))))
-        log.flush()
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1)
-        assert process.stdout is not None
-        for line in process.stdout:
-            log.write(line)
-            log.flush()
-            if progress_callback:
-                progress_callback(line.strip())
-        process.wait()
-    if process.returncode:
-        raise RuntimeError("–ö–æ–º–∞–Ω–¥–∞ –∑–∞–≤–µ—Ä—à–∏–ª–∞—Å—å —Å –∫–æ–¥–æ–º {}. –°–º. {}".format(process.returncode, log_path))
-
-
-def validate_media(source):
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(source)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode or not result.stdout.strip():
-        raise RuntimeError("FFprobe –Ω–µ —Å–º–æ–≥ –ø—Ä–æ—á–∏—Ç–∞—Ç—å –º–µ–¥–∏–∞—Ñ–∞–π–ª: {}".format(result.stderr.strip()))
-    return float(result.stdout.strip())
-
-
-def extract_audio(source, destination, track, log):
-    run_command(
-        [
-            "ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(source),
-            "-map", "0:a:{}".format(track), "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "pcm_s16le", str(destination),
-        ],
-        log,
-    )
-
-
-def load_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def profile_path(profile_id):
-    if not profile_id or any(character not in "0123456789abcdef" for character in profile_id) or len(profile_id) != 32:
-        raise ValueError("–ü—Ä–æ—Ñ–∏–ª—å –Ω–µ –Ω–∞–π–¥–µ–Ω")
-    return VOICE_PROFILES / profile_id / "profile.json"
-
-
-def load_voice_profiles():
-    profiles = []
-    if not VOICE_PROFILES.exists():
-        return profiles
-    for path in VOICE_PROFILES.glob("*/profile.json"):
-        try:
-            profile = load_json(path)
-            samples = profile.get("samples", [])
-            profile["sample_count"] = len(samples)
-            profile["duration_seconds"] = round(sum(float(sample.get("duration_seconds", 0)) for sample in samples), 1)
-            profile["ready"] = profile["sample_count"] >= 2 and profile["duration_seconds"] >= 30
-            profiles.append(profile)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            continue
-    return sorted(profiles, key=lambda item: (item.get("name", "").casefold(), item.get("created_at", "")))
-
-
-def public_profile(profile):
-    samples = profile.get("samples", [])
-    sample_count = profile.get("sample_count", len(samples))
-    duration_seconds = profile.get("duration_seconds", round(sum(float(sample.get("duration_seconds", 0)) for sample in samples), 1))
-    return {
-        "id": profile["id"],
-        "name": profile["name"],
-        "sample_count": sample_count,
-        "duration_seconds": duration_seconds,
-        "ready": profile.get("ready", sample_count >= 2 and duration_seconds >= 30),
-        "samples": [
-            {
-                "id": sample["id"],
-                "name": sample.get("name", "–û–±—Ä–∞–∑–µ—Ü"),
-                "duration_seconds": sample.get("duration_seconds", 0),
-                "created_at": sample.get("created_at"),
-            }
-            for sample in profile.get("samples", [])
-        ],
-    }
-
-
-def propagate_profile_name(profile_id, name):
-    """Keep labels assigned from this voice profile in finished exports in sync."""
-    db = connect()
-    jobs = db.execute("SELECT id, output_dir FROM jobs WHERE status = 'done' AND output_dir IS NOT NULL").fetchall()
-    updated = 0
-    for job in jobs:
-        speakers_path = Path(job["output_dir"]) / "speakers.json"
-        if not speakers_path.is_file():
-            continue
-        try:
-            speaker_data = load_json(speakers_path)
-            labels = speaker_data.get("labels", {})
-            sources = speaker_data.get("label_sources", {})
-            matches = speaker_data.get("voice_matches", {})
-            changed = False
-            for speaker, match in matches.items():
-                if match.get("profile_id") != profile_id:
-                    continue
-                match["name"] = name
-                if sources.get(speaker) == "voice_profile":
-                    labels[speaker] = name
-                changed = True
-            profile_speaker = "profile:" + profile_id
-            if sources.get(profile_speaker) == "voice_profile" and profile_speaker in labels:
-                labels[profile_speaker] = name
-                changed = True
-            voice_segments_path = Path(job["output_dir"]) / "voice_segments.json"
-            if voice_segments_path.is_file():
-                voice_segments = load_json(voice_segments_path)
-                segment_changed = False
-                for segment in voice_segments.get("segments", []):
-                    if segment.get("profile_id") == profile_id:
-                        segment["name"] = name
-                        segment_changed = True
-                if segment_changed:
-                    write_json(voice_segments_path, voice_segments)
-                    changed = True
-            if changed:
-                write_json(speakers_path, speaker_data)
-                rename_export(job["id"])
-                updated += 1
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            continue
-    return updated
-
-
-def voice_embedding_model_path():
-    matches = sorted((ROOT / "work" / "cache" / "huggingface" / "hub" / "models--pyannote--wespeaker-voxceleb-resnet34-LM" / "snapshots").glob("*/pytorch_model.bin"))
-    if not matches:
-        raise FileNotFoundError("–ú–æ–¥–µ–ª—å –≥–æ–ª–æ—Å–æ–≤—ã—Ö –æ—Ç–ø–µ—á–∞—Ç–∫–æ–≤ –Ω–µ —É—Å—Ç–∞–Ω–æ–≤–ª–µ–Ω–∞")
-    return matches[-1]
-
-
-def normalized_mean(vectors):
-    if not vectors:
-        return None
-    dimension = len(vectors[0])
-    if not dimension or any(len(vector) != dimension for vector in vectors):
-        return None
-    mean = [sum(float(vector[index]) for vector in vectors) / len(vectors) for index in range(dimension)]
-    length = sum(value * value for value in mean) ** 0.5
-    return [value / length for value in mean] if length > 1e-8 else None
-
-
-def cosine_similarity(left, right):
-    if not left or not right or len(left) != len(right):
-        return -1.0
-    return sum(float(a) * float(b) for a, b in zip(left, right))
-
-
-def extract_voice_embeddings(groups, destination, log, segments=None):
-    manifest = destination.with_suffix(".manifest.json")
-    write_json(manifest, {
-        "groups": {str(key): [str(path) for path in paths] for key, paths in groups.items()},
-        "segments": {
-            str(key): [dict(item, path=str(item["path"])) for item in items]
-            for key, items in (segments or {}).items()
-        },
-    })
-    try:
-        run_command([
-            str(ROOT / ".venv-diarizen" / "bin" / "python"),
-            str(ROOT / "scripts" / "voice_embedding_worker.py"),
-            "--manifest", str(manifest),
-            "--output", str(destination),
-            "--model", str(voice_embedding_model_path()),
-            "--device", str(config().get("voice_embedding_device", "auto")),
-        ], log)
-    finally:
-        manifest.unlink(missing_ok=True)
-    return load_json(destination).get("groups", {})
-
-
-def overlap(a_start, a_end, b_start, b_end):
-    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
-
-
-def timestamp(seconds, srt=False):
-    millis = max(0, int(round(seconds * 1000)))
-    hours, remainder = divmod(millis, 3_600_000)
-    minutes, remainder = divmod(remainder, 60_000)
-    secs, ms = divmod(remainder, 1000)
-    separator = "," if srt else "."
-    return "{:02d}:{:02d}:{:02d}{}{:03d}".format(hours, minutes, secs, separator, ms)
-
-
-def assign_speakers(words, intervals, cfg):
-    assigned = []
-    for word in words:
-        start, end = float(word["start"]), float(word["end"])
-        duration = max(0.04, end - start)
-        scores = {}
-        active = set()
-        evidence_confidence = []
-        for interval in intervals:
-            amount = overlap(start, end, interval["start"], interval["end"])
-            if amount > 0:
-                scores[interval["speaker"]] = scores.get(interval["speaker"], 0.0) + amount
-                active.add(interval["speaker"])
-                if interval.get("confidence") is not None:
-                    evidence_confidence.append(float(interval["confidence"]))
-        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-        best = ranked[0] if ranked else (None, 0.0)
-        second = ranked[1][1] if len(ranked) > 1 else 0.0
-        confidence = best[1] / duration
-        clear = confidence >= cfg["speaker_match_min_overlap"] and (best[1] - second) / duration >= cfg["speaker_match_margin"]
-        speaker = best[0] if clear else None
-        flags = list(word.get("flags", []))
-        if len(active) > 1:
-            flags.append("overlap")
-        if not clear:
-            flags.append("ambiguous" if ranked else "no_diarization")
-        if evidence_confidence and max(evidence_confidence) < 0.7:
-            flags.append("low_confidence")
-        evidence = [{"speaker": value, "overlap_seconds": round(amount, 4), "source": "diarization"} for value, amount in ranked]
-        item = dict(word, speaker=speaker, speaker_confidence=round(confidence, 3), flags=sorted(set(flags)), speaker_evidence=evidence)
-        item["resolution"] = {"selected": speaker, "method": "acoustic_overlap" if clear else "unresolved", "risk": "low" if clear else "high"}
-        item["speaker_resolution_history"] = [{"speaker": speaker, "reason": item["resolution"]["method"]}]
-        assigned.append(item)
-
-    # ASR often starts very short words a few milliseconds before diarization.
-    # Recover them from the immediately adjacent, unambiguous speaker context.
-    for index, word in enumerate(assigned):
-        if word["speaker"] is not None or float(word["end"]) - float(word["start"]) > 0.35:
-            continue
-        previous = next((assigned[i] for i in range(index - 1, -1, -1) if assigned[i]["speaker"] is not None), None)
-        following = next((assigned[i] for i in range(index + 1, len(assigned)) if assigned[i]["speaker"] is not None), None)
-        candidates = []
-        if previous is not None:
-            candidates.append((max(0.0, float(word["start"]) - float(previous["end"])), previous["speaker"]))
-        if following is not None:
-            candidates.append((max(0.0, float(following["start"]) - float(word["end"])), following["speaker"]))
-        candidates.sort()
-        if candidates and candidates[0][0] <= float(cfg.get("word_boundary_context_seconds", 0.4)):
-            nearest = candidates[0][1]
-            if len(candidates) == 1 or candidates[1][1] == nearest or candidates[0][0] + 0.12 < candidates[1][0]:
-                record_resolution(word, nearest, "context_nearest", 0.75, "medium")
-                word["flags"] = sorted(set(word["flags"] + ["speaker_context"]))
-                word["speaker_inferred_from_context"] = True
-
-    # Bridge short ambiguous sequences when the same confidently assigned
-    # speaker continues on both sides. Diarization and ASR boundaries often
-    # disagree slightly, especially where voices overlap.
-    index = 0
-    while index < len(assigned):
-        if assigned[index]["speaker"] is not None:
-            index += 1
-            continue
-        start_index = index
-        while index < len(assigned) and assigned[index]["speaker"] is None:
-            index += 1
-        end_index = index
-        previous = assigned[start_index - 1] if start_index > 0 else None
-        following = assigned[end_index] if end_index < len(assigned) else None
-        if previous is None or following is None or previous["speaker"] != following["speaker"]:
-            continue
-        sequence = assigned[start_index:end_index]
-        sequence_duration = float(sequence[-1]["end"]) - float(sequence[0]["start"])
-        left_gap = max(0.0, float(sequence[0]["start"]) - float(previous["end"]))
-        right_gap = max(0.0, float(following["start"]) - float(sequence[-1]["end"]))
-        bridge_gap = min(0.8, float(cfg.get("utterance_gap_seconds", 1.2)))
-        if len(sequence) <= 5 and sequence_duration <= 2.0 and left_gap <= bridge_gap and right_gap <= bridge_gap:
-            for word in sequence:
-                score = max(0.65, min(0.8, float(word["speaker_confidence"])))
-                record_resolution(word, previous["speaker"], "context_bridge", score, "medium")
-                word["flags"] = sorted(set(word["flags"] + ["speaker_context"]))
-                word["speaker_inferred_from_context"] = True
-    return assigned
-
-
-def phrase_units(words, cfg):
-    """Split ASR words into short linguistic units suitable for voice ID."""
-    units = []
-    current = []
-    max_duration = float(cfg.get("voice_identity_max_phrase_seconds", 10.0))
-    pause = float(cfg.get("voice_identity_phrase_gap_seconds", 0.65))
-    terminal = (".", "?", "!", "‚Ä¶")
-    for index, word in enumerate(words):
-        if current:
-            previous = current[-1][1]
-            gap = max(0.0, float(word["start"]) - float(previous["end"]))
-            previous_text = str(previous.get("text", "")).rstrip('"\'¬ª‚Äù)]}')
-            too_long = float(word["end"]) - float(current[0][1]["start"]) > max_duration
-            if gap >= pause or previous_text.endswith(terminal) or too_long:
-                units.append(current)
-                current = []
-        current.append((index, word))
-    if current:
-        units.append(current)
-    return units
-
-
-def clause_units(words, cfg):
-    """Join pause-split ASR units while punctuation says the clause continues."""
-    clauses = []
-    continuation_gap = float(cfg.get("clause_coherence_gap_seconds", 2.5))
-    for unit in phrase_units(words, cfg):
-        if clauses:
-            previous_word = clauses[-1][-1][1]
-            current_word = unit[0][1]
-            gap = float(current_word["start"]) - float(previous_word["end"])
-            previous_text = str(previous_word.get("text", "")).rstrip()
-            if gap <= continuation_gap and not previous_text.endswith((".", "?", "!", "‚Ä¶")):
-                clauses[-1].extend(unit)
-                continue
-        clauses.append(list(unit))
-    return clauses
-
-
-def apply_domain_vocabulary(words, cfg):
-    """Apply explicit, punctuation-preserving word and phrase corrections."""
-    vocabulary = load_json(VOCABULARY_PATH) if VOCABULARY_PATH.is_file() else {}
-    replacements = {
-        str(source).casefold(): str(target)
-        for source, target in {
-            **vocabulary.get("replacements", {}),
-            **cfg.get("domain_vocabulary", {}),
-        }.items()
-    }
-    phrases = {
-        tuple(str(source).casefold().split()): str(target)
-        for source, target in vocabulary.get("phrases", {}).items()
-    }
-    corrected = []
-    token_pattern = re.compile(r"^([^\w@]*)(.*?)([^\w]*)$", re.UNICODE)
-    parsed = []
-    for word in words:
-        match = token_pattern.match(str(word.get("text", "")))
-        parsed.append(match.groups() if match else ("", str(word.get("text", "")), ""))
-    phrase_lengths = sorted({len(key) for key in phrases}, reverse=True)
-    index = 0
-    while index < len(words):
-        phrase_match = None
-        for length in phrase_lengths:
-            if index + length > len(words):
-                continue
-            key = tuple(parsed[position][1].casefold() for position in range(index, index + length))
-            if key in phrases:
-                phrase_match = (length, phrases[key])
-                break
-        if phrase_match:
-            length, canonical = phrase_match
-            originals = [str(words[position].get("text", "")) for position in range(index, index + length)]
-            item = dict(words[index])
-            item["end"] = words[index + length - 1]["end"]
-            item["text"] = parsed[index][0] + canonical + parsed[index + length - 1][2]
-            item["asr_text"] = " ".join(originals)
-            item["source_word_ids"] = [words[position]["word_id"] for position in range(index, index + length)]
-            item["vocabulary_corrected"] = True
-            corrected.append(item)
-            index += length
-            continue
-        word = words[index]
-        item = dict(word)
-        text = str(item.get("text", ""))
-        leading, token, trailing = parsed[index]
-        canonical = replacements.get(token.casefold())
-        if canonical is not None:
-            item["text"] = leading + canonical + trailing
-            item["asr_text"] = text
-            item["vocabulary_corrected"] = True
-        corrected.append(item)
-        index += 1
-    return corrected
-
-
-def identity_units(asr_words, diarization, cfg):
-    """Build 6‚Äì12 second voice-ID windows without crossing a diarized speaker change."""
-    assigned = assign_speakers(asr_words, diarization.get("intervals", []), cfg)
-    base = []
-    for unit in phrase_units(assigned, cfg):
-        weights = {}
-        for _, word in unit:
-            speaker = word.get("speaker")
-            if speaker is None:
-                continue
-            weights[speaker] = weights.get(speaker, 0.0) + max(0.04, float(word["end"]) - float(word["start"]))
-        speaker = max(weights, key=weights.get) if weights else None
-        base.append({"speaker": speaker, "words": unit})
-
-    merged = []
-    max_duration = float(cfg.get("voice_identity_max_window_seconds", 12.0))
-    merge_gap = float(cfg.get("voice_identity_merge_gap_seconds", 1.5))
-    for item in base:
-        if merged:
-            previous = merged[-1]
-            start = float(previous["words"][0][1]["start"])
-            gap = max(0.0, float(item["words"][0][1]["start"]) - float(previous["words"][-1][1]["end"]))
-            combined = float(item["words"][-1][1]["end"]) - start
-            if item["speaker"] is not None and item["speaker"] == previous["speaker"] and gap <= merge_gap and combined <= max_duration:
-                previous["words"].extend(item["words"])
-                continue
-        merged.append(item)
-    return [item["words"] for item in merged]
-
-
-def apply_voice_segments(words, voice_segments):
-    if not voice_segments:
-        return words
-    for word in words:
-        start, end = float(word["start"]), float(word["end"])
-        duration = max(0.04, end - start)
-        ranked = sorted(
-            ((overlap(start, end, segment["start"], segment["end"]), segment) for segment in voice_segments),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        if not ranked or ranked[0][0] / duration < 0.55:
-            continue
-        segment = ranked[0][1]
-        record_resolution(word, "profile:" + segment["profile_id"], "redimnet_phrase", segment["score"], "low")
-        word["flags"] = list(word.get("flags", []))
-        if "voice_profile" not in word["flags"]:
-            word["flags"].append("voice_profile")
-    return words
-
-
-def smooth_phrase_speakers(words, cfg):
-    """Remove short speaker islands inside one ASR phrase without hiding real turns."""
-    max_island = float(cfg.get("speaker_island_max_seconds", 2.2))
-    dominance = float(cfg.get("speaker_phrase_dominance", 0.68))
-    for unit in phrase_units(words, cfg):
-        if len(unit) < 2:
-            continue
-        weights = {}
-        for _, word in unit:
-            if word.get("speaker") is None:
-                continue
-            duration = max(0.04, float(word["end"]) - float(word["start"]))
-            weights[word["speaker"]] = weights.get(word["speaker"], 0.0) + duration
-        if not weights:
-            continue
-        ranked = sorted(weights.items(), key=lambda item: item[1], reverse=True)
-        dominant, dominant_weight = ranked[0]
-        dominant_ratio = dominant_weight / max(0.04, sum(weights.values()))
-        if dominant_ratio < float(cfg.get("speaker_phrase_low_confidence_dominance", 0.55)):
-            continue
-        position = 0
-        while position < len(unit):
-            if unit[position][1].get("speaker") == dominant:
-                position += 1
-                continue
-            start = position
-            while position < len(unit) and unit[position][1].get("speaker") != dominant:
-                position += 1
-            island = unit[start:position]
-            island_duration = float(island[-1][1]["end"]) - float(island[0][1]["start"])
-            low_evidence = all("low_confidence" in word.get("flags", []) for _, word in island)
-            # A direct ReDimNet phrase identity is stronger evidence than the
-            # duration-majority heuristic used by this cleanup pass.
-            if any("voice_profile" in word.get("flags", []) for _, word in island):
-                continue
-            if island_duration > max_island or (dominant_ratio < dominance and not low_evidence):
-                continue
-            for _, word in island:
-                record_resolution(word, dominant, "phrase_smoothing", max(0.7, float(word.get("speaker_confidence", 0))), "medium")
-                word["flags"] = list(word.get("flags", []))
-                if "speaker_smoothed" not in word["flags"]:
-                    word["flags"].append("speaker_smoothed")
-    return words
-
-
-def cohere_clause_speakers(words, cfg):
-    """Remove only weak speaker islands inside a continuous ASR clause.
-
-    Punctuation is not acoustic evidence.  In particular an unfinished phrase
-    may be interrupted by another person, so this pass must never overwrite a
-    supported identity merely because the text looks syntactically continuous.
-    """
-    if not words:
-        return words
-    gap_limit = float(cfg.get("clause_coherence_gap_seconds", 2.5))
-    short_limit = float(cfg.get("clause_coherence_short_seconds", 3.0))
-    for clause in clause_units(words, cfg):
-        runs = []
-        for index, word in clause:
-            if not runs or runs[-1]["speaker"] != word.get("speaker"):
-                runs.append({"speaker": word.get("speaker"), "items": [(index, word)]})
-            else:
-                runs[-1]["items"].append((index, word))
-        for left, right in zip(runs, runs[1:]):
-            if left["speaker"] is None or right["speaker"] is None or left["speaker"] == right["speaker"]:
-                continue
-            left_first, left_last = left["items"][0][1], left["items"][-1][1]
-            right_first, right_last = right["items"][0][1], right["items"][-1][1]
-            if float(right_first["start"]) - float(left_last["end"]) > gap_limit:
-                continue
-            left_duration = float(left_last["end"]) - float(left_first["start"])
-            right_duration = float(right_last["end"]) - float(right_first["start"])
-            if min(left_duration, right_duration) > short_limit:
-                continue
-            dominant, weaker = (left, right) if left_duration >= right_duration else (right, left)
-            weak_words = [word for _, word in weaker["items"]]
-            weak_evidence = all(
-                "low_confidence" in word.get("flags", [])
-                or "ambiguous" in word.get("flags", [])
-                or word.get("speaker") is None
-                for word in weak_words
-            )
-            boundary_gap = max(0.0, float(right_first["start"]) - float(left_last["end"]))
-            continuation_text = next((
-                str(word.get("text", "")).lstrip("‚Äî‚Äì- ¬´\"'(")
-                for _, word in dominant["items"]
-                if str(word.get("text", "")).lstrip("‚Äî‚Äì- ¬´\"'(")
-            ), "")
-            continuation_without_voice_anchor = (
-                weaker is left
-                and left_duration <= float(cfg.get("clause_unanchored_prefix_max_seconds", 1.5))
-                and not any("voice_profile" in word.get("flags", []) for word in weak_words)
-                and any("voice_profile" in word.get("flags", []) for _, word in dominant["items"])
-                and continuation_text[:1].islower()
-                and boundary_gap <= float(cfg.get("clause_unanchored_prefix_gap_seconds", 2.0))
-            )
-            # A known voice on each side is a real acoustic boundary unless the
-            # shorter side was explicitly marked weak and the boundary is tight.
-            both_known = all(str(run.get("speaker", "")).startswith("profile:") for run in (left, right))
-            if (both_known and not continuation_without_voice_anchor
-                    and (not weak_evidence or boundary_gap > float(cfg.get("clause_coherence_acoustic_gap_seconds", 0.35)))):
-                continue
-            for _, word in weaker["items"]:
-                record_resolution(word, dominant["speaker"], "clause_coherence", max(0.72, float(word.get("speaker_confidence", 0))), "high")
-                word["flags"] = list(word.get("flags", []))
-                if "clause_coherence" not in word["flags"]:
-                    word["flags"].append("clause_coherence")
-    return words
-
-
-def bridge_short_profile_phrases(words, cfg):
-    """Attach a very short sentence to an adjacent, verified voice identity."""
-    maximum = float(cfg.get("voice_identity_context_max_seconds", 2.0))
-    gap_limit = float(cfg.get("voice_identity_context_gap_seconds", 0.3))
-    # First repair single boundary tokens even when the surrounding ASR phrase
-    # contains a real speaker change and therefore cannot be smoothed whole.
-    for index, word in enumerate(words):
-        if word.get("speaker") is not None or float(word["end"]) - float(word["start"]) > 1.0:
-            continue
-        previous = words[index - 1] if index else None
-        following = words[index + 1] if index + 1 < len(words) else None
-        chosen = None
-        if previous and following and previous.get("speaker") == following.get("speaker") and str(previous.get("speaker", "")).startswith("profile:"):
-            if float(word["start"]) - float(previous["end"]) <= 4.0 and float(following["start"]) - float(word["end"]) <= 4.0:
-                chosen = previous["speaker"]
-        if chosen is None and previous and str(previous.get("speaker", "")).startswith("profile:") and str(word.get("text", "")).rstrip().endswith((".", ",", ":", ";", "?", "!")):
-            if float(word["start"]) - float(previous["end"]) <= 2.0:
-                chosen = previous["speaker"]
-        if chosen is None and following and str(following.get("speaker", "")).startswith("profile:") and str(following.get("text", ""))[:1].islower():
-            if float(following["start"]) - float(word["end"]) <= 0.5:
-                chosen = following["speaker"]
-        if chosen:
-            record_resolution(word, chosen, "profile_context", max(0.7, float(word.get("speaker_confidence", 0))), "high")
-            word["flags"] = sorted(set(word.get("flags", []) + ["speaker_context"]))
-    for unit in phrase_units(words, cfg):
-        if any(str(word.get("speaker", "")).startswith("profile:") for _, word in unit):
-            continue
-        start_index = unit[0][0]
-        end_index = unit[-1][0]
-        duration = float(unit[-1][1]["end"]) - float(unit[0][1]["start"])
-        if duration > maximum:
-            continue
-        previous = words[start_index - 1] if start_index > 0 else None
-        following = words[end_index + 1] if end_index + 1 < len(words) else None
-        candidates = []
-        if previous is not None and str(previous.get("speaker", "")).startswith("profile:"):
-            candidates.append((max(0.0, float(unit[0][1]["start"]) - float(previous["end"])), previous["speaker"]))
-        if following is not None and str(following.get("speaker", "")).startswith("profile:"):
-            candidates.append((max(0.0, float(following["start"]) - float(unit[-1][1]["end"])), following["speaker"]))
-        candidates.sort()
-        if not candidates:
-            continue
-        chosen = None
-        if len(candidates) > 1 and candidates[0][1] == candidates[1][1] and max(candidates[0][0], candidates[1][0]) <= float(cfg.get("voice_identity_same_context_gap_seconds", 4.0)):
-            chosen = candidates[0][1]
-        elif previous is not None and str(previous.get("speaker", "")).startswith("profile:"):
-            previous_gap = max(0.0, float(unit[0][1]["start"]) - float(previous["end"]))
-            final_text = str(unit[-1][1].get("text", "")).rstrip()
-            if previous_gap <= float(cfg.get("voice_identity_punctuation_gap_seconds", 2.0)) and final_text.endswith((".", ",", ":", ";", "?", "!")):
-                chosen = previous["speaker"]
-        if chosen is None and following is not None and str(following.get("speaker", "")).startswith("profile:"):
-            following_gap = max(0.0, float(following["start"]) - float(unit[-1][1]["end"]))
-            following_text = str(following.get("text", ""))
-            if following_gap <= max(gap_limit, 0.5) and following_text[:1].islower():
-                chosen = following["speaker"]
-        if chosen is None and candidates[0][0] <= gap_limit and (len(candidates) == 1 or candidates[0][1] == candidates[1][1] or candidates[0][0] + 0.12 < candidates[1][0]):
-            chosen = candidates[0][1]
-        if chosen is None:
-            continue
-        for _, word in unit:
-            record_resolution(word, chosen, "profile_phrase_context", max(0.72, float(word.get("speaker_confidence", 0))), "high")
-            word["flags"] = list(word.get("flags", []))
-            if "speaker_context" not in word["flags"]:
-                word["flags"].append("speaker_context")
-    return words
-
-
-def speaker_display(speaker, labels):
-    if speaker is None:
-        return "–£—á–∞—Å—Ç–Ω–∏–∫ –Ω–µ –æ–ø—Ä–µ–¥–µ–ª—ë–Ω"
-    return labels.get(speaker) or "–°–ø–∏–∫–µ—Ä {}".format(speaker)
-
-
-def utterances(words, gap):
-    result = []
-    for word in words:
-        previous_text = str(result[-1]["words"][-1].get("text", "")).rstrip() if result else ""
-        adaptive_gap = max(gap, float(config().get("utterance_continuation_gap_seconds", 3.0))) if result and not previous_text.endswith((".", "?", "!", "‚Ä¶")) else gap
-        if not result or word["speaker"] != result[-1]["speaker"] or word["start"] - result[-1]["end"] > adaptive_gap:
-            result.append({"start": word["start"], "end": word["end"], "speaker": word["speaker"], "words": [word]})
-        else:
-            result[-1]["end"] = word["end"]
-            result[-1]["words"].append(word)
-    for item in result:
-        item["text"] = " ".join(word["text"] for word in item["words"]).strip()
-        item["flags"] = sorted({flag for word in item["words"] for flag in word["flags"]})
-        item["uncertainty"] = utterance_uncertainty(item["words"])
-    return result
-
-
-def split_srt(items, max_duration=8.0, max_chars=92):
-    result = []
-    for item in items:
-        current = None
-        for word in item["words"]:
-            if current is None or word["end"] - current["start"] > max_duration or len(current["text"]) + len(word["text"]) + 1 > max_chars:
-                current = {"start": word["start"], "end": word["end"], "speaker": item["speaker"], "text": word["text"]}
-                result.append(current)
-            else:
-                current["end"] = word["end"]
-                current["text"] += " " + word["text"]
-    return result
-
-
-def export_results(job, duration, diarization, asr, output_dir, cfg):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    speakers = sorted({item["speaker"] for item in diarization["intervals"]})
-    speaker_path = output_dir / "speakers.json"
-    if speaker_path.exists():
-        speaker_data = load_json(speaker_path)
-        labels = speaker_data.get("labels", {})
-    else:
-        speaker_data = {}
-        labels = {}
-    speaker_data.update({"labels": labels, "available_speakers": speakers, "instructions": "–ó–∞–¥–∞–π—Ç–µ –∏–º—è –≤ labels –∏ –≤—ã–ø–æ–ª–Ω–∏—Ç–µ: ./pipeline rename <job-id>"})
-    write_json(speaker_path, speaker_data)
-
-    raw_words = attach_word_ids(asr["words"])
-    normalized_words = apply_domain_vocabulary(raw_words, cfg)
-    words = assign_speakers(normalized_words, diarization["intervals"], cfg)
-    voice_segments_path = output_dir / "voice_segments.json"
-    voice_segments = load_json(voice_segments_path).get("segments", []) if voice_segments_path.exists() else []
-    words = apply_voice_segments(words, voice_segments)
-    words = bridge_short_profile_phrases(words, cfg)
-    words = smooth_phrase_speakers(words, cfg)
-    words = cohere_clause_speakers(words, cfg)
-    turns = utterances(words, cfg["utterance_gap_seconds"])
-    for word in words:
-        word["uncertainty"] = word_uncertainty(word)
-    payload = {
-        "schema_version": 3,
-        "source": job["original_name"],
-        "duration_seconds": round(duration, 3),
-        "models": {"diarization": diarization.get("model"), "asr": asr.get("model"), "vad": asr.get("vad")},
-        "speakers": labels,
-        "diarization": diarization["intervals"],
-        "words": words,
-        "utterances": [{k: v for k, v in item.items() if k != "words"} for item in turns],
-        "uncertainty_schema": {
-            "version": 1,
-            "recognition_confidence": "model value when available; otherwise null",
-            "speaker_confidence": "pipeline heuristic, not a calibrated probability",
-            "needs_review": "true when the source contains an explicit risk flag or inferred speaker",
-        },
-    }
-    write_json(output_dir / "transcript.json", payload)
-    ledger = ledger_document(raw_words, words, turns)
-    write_json(output_dir / "transcript" / "words.json", {"schema_version": 1, "words": ledger["words"]})
-    write_json(output_dir / "transcript" / "normalization.json", {"schema_version": 1, "tokens": ledger["normalized_tokens"]})
-    write_json(output_dir / "semantics" / "evidence_spans.json", {"schema_version": 1, "spans": ledger["evidence_spans"]})
-
-    md = ["# {}".format(Path(job["original_name"]).stem), ""]
-    txt = []
-    for item in turns:
-        label = speaker_display(item["speaker"], labels)
-        marker = " ‚ö†" if item["speaker"] is None or any(flag in {"ambiguous", "no_diarization"} for flag in item["flags"]) else ""
-        md.append("**[{}] {}{}:** {}".format(timestamp(item["start"]), label, marker, item["text"]))
-        md.append("")
-        txt.append("[{}] {}{}: {}".format(timestamp(item["start"]), label, marker, item["text"]))
-    (output_dir / "transcript.md").write_text("\n".join(md).rstrip() + "\n", encoding="utf-8")
-    (output_dir / "transcript.txt").write_text("\n".join(txt) + "\n", encoding="utf-8")
-
-    srt_lines = []
-    for index, item in enumerate(split_srt(turns), 1):
-        srt_lines.extend([
-            str(index),
-            "{} --> {}".format(timestamp(item["start"], True), timestamp(item["end"], True)),
-            "{}: {}".format(speaker_display(item["speaker"], labels), item["text"]),
-            "",
-        ])
-    (output_dir / "subtitles.srt").write_text("\n".join(srt_lines), encoding="utf-8")
-
-    with (output_dir / "review.csv").open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(["start", "end", "text", "speaker", "flags", "speaker_confidence"])
-        for word in words:
-            if word["flags"]:
-                writer.writerow([timestamp(word["start"]), timestamp(word["end"]), word["text"], word["speaker"] or "", ";".join(word["flags"]), word["speaker_confidence"]])
-
-
-def create_speaker_samples(audio, intervals, output_dir, log):
-    samples_dir = output_dir / "speaker_samples"
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    candidates = []
-    for interval in intervals:
-        start, end = float(interval["start"]), float(interval["end"])
-        duration = end - start
-        if duration < 1.8:
-            continue
-        contaminated = any(
-            other is not interval
-            and other["speaker"] != interval["speaker"]
-            and overlap(start, end, float(other["start"]), float(other["end"])) > 0.08
-            for other in intervals
-        )
-        if not contaminated:
-            candidates.append((min(duration, 8.0), start, interval["speaker"]))
-    per_speaker = {}
-    sample_limit = max(3, int(config().get("voice_meeting_samples_per_speaker", 8)))
-    for duration, start, speaker in sorted(candidates, reverse=True):
-        count = per_speaker.get(speaker, 0)
-        if count >= sample_limit:
-            continue
-        destination = samples_dir / ("speaker_{}_{}.wav".format(speaker, count + 1))
-        run_command([
-            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-            "-ss", str(start), "-t", str(duration), "-i", str(audio), "-c:a", "pcm_s16le", str(destination),
-        ], log)
-        per_speaker[speaker] = count + 1
-
-
-def identify_voice_phrases(audio, asr, diarization, enrolled, output_dir, cfg, log):
-    units = identity_units(asr.get("words", []), diarization, cfg)
-    minimum = float(cfg.get("voice_identity_min_phrase_seconds", 2.0))
-    segment_groups = {}
-    metadata = {}
-    for index, unit in enumerate(units):
-        start = float(unit[0][1]["start"])
-        end = float(unit[-1][1]["end"])
-        if end - start < minimum:
-            continue
-        key = "phrase_{:05d}".format(index)
-        segment_groups[key] = [{"path": Path(audio), "start": start, "end": end}]
-        metadata[key] = {
-            "start": round(start, 3),
-            "end": round(end, 3),
-            "text": " ".join(str(word.get("text", "")) for _, word in unit).strip(),
-        }
-    if not segment_groups:
-        write_json(Path(output_dir) / "voice_segments.json", {"segments": [], "message": "–ù–µ—Ç –¥–æ—Å—Ç–∞—Ç–æ—á–Ω–æ –¥–ª–∏–Ω–Ω—ã—Ö —Ñ—Ä–∞–∑"})
-        return [], {}, float(cfg.get("voice_identity_threshold", 0.56))
-
-    embedding_path = Path(output_dir) / "voice_phrase_embeddings.json"
-    embeddings = extract_voice_embeddings({}, embedding_path, log, segments=segment_groups)
-    cross_profile = max(
-        [cosine_similarity(left["embedding"], right["embedding"]) for index, left in enumerate(enrolled) for right in enrolled[index + 1:]]
-        or [-1.0]
-    )
-    base_threshold = float(cfg.get("voice_identity_threshold", 0.56))
-    threshold = max(base_threshold, cross_profile + float(cfg.get("voice_identity_profile_separation", 0.02)))
-    margin = float(cfg.get("voice_identity_margin", 0.12))
-    strong_threshold = float(cfg.get("voice_identity_strong_threshold", 0.72))
-    strong_margin = float(cfg.get("voice_identity_strong_margin", 0.08))
-    accepted = []
-    scores_report = {}
-    for key, data in embeddings.items():
-        scores = sorted(
-            [
-                {"profile_id": profile["id"], "name": profile["name"], "score": round(cosine_similarity(data.get("embedding"), profile["embedding"]), 4)}
-                for profile in enrolled
-            ],
-            key=lambda item: item["score"],
-            reverse=True,
-        )
-        scores_report[key] = scores
-        if not scores:
-            continue
-        runner_up = scores[1]["score"] if len(scores) > 1 else -1.0
-        difference = scores[0]["score"] - runner_up
-        duration = metadata[key]["end"] - metadata[key]["start"]
-        short_window = duration < float(cfg.get("voice_identity_short_window_seconds", 4.0))
-        short_threshold = float(cfg.get("voice_identity_short_threshold", 0.72))
-        short_margin = float(cfg.get("voice_identity_short_margin", 0.14))
-        accepted_match = (
-            scores[0]["score"] >= short_threshold and difference >= short_margin
-            if short_window
-            else (
-                (scores[0]["score"] >= threshold and difference >= margin)
-                or (scores[0]["score"] >= strong_threshold and difference >= strong_margin)
-            )
-        )
-        if not accepted_match:
-            continue
-        accepted.append({
-            **metadata[key],
-            "profile_id": scores[0]["profile_id"],
-            "name": scores[0]["name"],
-            "score": scores[0]["score"],
-            "margin": round(difference, 4),
-        })
-    payload = {
-        "model": "pyannote/wespeaker-voxceleb-resnet34-LM",
-        "threshold": round(threshold, 4),
-        "margin": margin,
-        "segments": accepted,
-        "scores": scores_report,
-    }
-    write_json(Path(output_dir) / "voice_segments.json", payload)
-    return accepted, scores_report, threshold
-
-
-REDIMNET_MODEL = "PalabraAI/ReDimNet2-B6-vb2+vox2+cnc2_v0-lm"
-
-
-def _json_hash(value):
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def extract_redimnet_embeddings(groups, destination, log, cfg):
-    """Run ReDimNet in its isolated environment and cache by exact manifest."""
-    serializable = {
-        str(group): [dict(item, path=str(item["path"])) if isinstance(item, dict) else str(item) for item in items]
-        for group, items in groups.items()
-    }
-    key = _json_hash({
-        "model": REDIMNET_MODEL, "repository": cfg["redimnet_repository"],
-        "revision": cfg["redimnet_revision"], "groups": serializable,
-    })
-    key_path = Path(str(destination) + ".key")
-    if Path(destination).is_file() and key_path.is_file() and key_path.read_text().strip() == key:
-        return load_json(destination).get("groups", {})
-    manifest = Path(str(destination) + ".manifest.json")
-    write_json(manifest, {"groups": serializable})
-    try:
-        run_command([
-            str(ROOT / ".venv-fusion" / "bin" / "python"),
-            str(ROOT / "scripts" / "redimnet_worker.py"),
-            "--manifest", str(manifest), "--output", str(destination),
-            "--cache", str(ROOT / "work" / "cache"),
-            "--device", str(cfg.get("redimnet_device", "auto")),
-            "--repository", cfg["redimnet_repository"],
-            "--revision", cfg["redimnet_revision"],
-        ], log, env=dict(os.environ, TORCH_HOME=str(ROOT / "work" / "cache" / "torch"), PYTHONUNBUFFERED="1"))
-        key_path.write_text(key + "\n", encoding="utf-8")
-    finally:
-        manifest.unlink(missing_ok=True)
-    return load_json(destination).get("groups", {})
-
-
-def enrollment_signature(profiles):
-    values = []
-    for profile in profiles:
-        if not profile.get("ready"):
-            continue
-        samples = []
-        for sample in profile.get("samples", []):
-            path = VOICE_PROFILES / profile["id"] / sample.get("audio", "missing")
-            if path.is_file():
-                stat = path.stat()
-                samples.append([str(path), stat.st_size, stat.st_mtime_ns])
-        values.append([profile["id"], samples])
-    return _json_hash({"model": REDIMNET_MODEL, "profiles": values})
-
-
-def ensure_redimnet_enrollment(cfg, log):
-    profiles = [profile for profile in load_voice_profiles() if profile.get("ready")]
-    if not profiles:
-        return []
-    destination = VOICE_PROFILES / "_redimnet2_enrollment.json"
-    signature = enrollment_signature(profiles)
-    if destination.is_file():
-        cached = load_json(destination)
-        if cached.get("signature") == signature:
-            names = {profile["id"]: profile["name"] for profile in profiles}
-            result = cached.get("profiles", [])
-            for item in result:
-                item["name"] = names.get(item["id"], item.get("name", item["id"]))
-            return result
-    groups = {
-        profile["id"]: [VOICE_PROFILES / profile["id"] / sample["audio"] for sample in profile.get("samples", [])]
-        for profile in profiles
-    }
-    raw_path = VOICE_PROFILES / "_redimnet2_enrollment.raw.json"
-    groups_result = extract_redimnet_embeddings(groups, raw_path, log, cfg)
-    result = []
-    by_id = {profile["id"]: profile for profile in profiles}
-    for profile_id, data in groups_result.items():
-        if profile_id in by_id and data.get("embedding"):
-            result.append({"id": profile_id, "name": by_id[profile_id]["name"], **data})
-    write_json(destination, {"model": REDIMNET_MODEL, "signature": signature, "profiles": result})
-    return result
-
-
-def cluster_anchor_groups(audio, intervals, cfg, consensus=None):
-    """Collect long, clean, cross-diarizer-agreed speech per anonymous cluster."""
-    if consensus:
-        # Include verifier-only candidates from disputed regions.  They are
-        # precisely the tracks that can reveal an under-clustered primary
-        # result.  ReDimNet will reject them unless global evidence is strong.
-        clean = []
-        for item in consensus:
-            if item.get("overlap"):
-                continue
-            for speaker in item.get("candidates", item.get("clusters", [])):
-                clean.append({"speaker": speaker, "start": item["start"], "end": item["end"]})
-    else:
-        clean = [item for item in intervals if not item.get("overlap") and float(item.get("consensus_confidence", 0)) >= 0.7]
-    merged = []
-    for item in sorted(clean, key=lambda value: (str(value["speaker"]), float(value["start"]))):
-        current = {"speaker": str(item["speaker"]), "start": float(item["start"]), "end": float(item["end"])}
-        if merged and merged[-1]["speaker"] == current["speaker"] and current["start"] - merged[-1]["end"] <= 0.35:
-            merged[-1]["end"] = max(merged[-1]["end"], current["end"])
-        else:
-            merged.append(current)
-    groups = {}
-    minimum = float(cfg.get("redimnet_anchor_min_seconds", 3.0))
-    target = float(cfg.get("redimnet_anchor_target_seconds", 30.0))
-    by_speaker = {}
-    for item in merged:
-        if item["end"] - item["start"] >= minimum:
-            by_speaker.setdefault(item["speaker"], []).append(item)
-    for speaker, items in by_speaker.items():
-        total = 0.0
-        for item in sorted(items, key=lambda value: value["end"] - value["start"], reverse=True):
-            if total >= target:
-                break
-            duration = min(item["end"] - item["start"], target - total, 12.0)
-            if duration >= minimum:
-                groups.setdefault(speaker, []).append({"path": Path(audio), "start": item["start"] + 0.1, "end": item["start"] + duration - 0.1})
-                total += duration
-    return groups
-
-
-def _profile_support(start, end, timeline, matches, source="verifier_mapped"):
-    """Return duration support per known profile for one diarizer source."""
-    support = {}
-    for item in timeline or []:
-        duration = overlap(start, end, float(item["start"]), float(item["end"]))
-        if duration <= 0 or item.get("overlap"):
-            continue
-        for cluster in item.get(source, []):
-            match = matches.get(str(cluster)) or matches.get(cluster)
-            if match:
-                profile_id = match["profile_id"]
-                support[profile_id] = support.get(profile_id, 0.0) + duration
-    return support
-
-
-def _track_support(start, end, timeline, source="verifier_mapped"):
-    """Return raw diarizer-track support without requiring known identity."""
-    support = {}
-    for item in timeline or []:
-        duration = overlap(start, end, float(item["start"]), float(item["end"]))
-        if duration <= 0:
-            continue
-        for track in item.get(source, []):
-            support[str(track)] = support.get(str(track), 0.0) + duration
-    return support
-
-
-def diarization_aware_clause_units(words, cfg, timeline=None, matches=None):
-    """Split textual clauses at independently verified acoustic identities."""
-    if not timeline or not matches:
-        return clause_units(words, cfg)
-    result = []
-    minimum_boundary_gap = float(cfg.get("voice_identity_boundary_gap_seconds", 0.25))
-    for clause in clause_units(words, cfg):
-        current, previous_profile, previous_tracks = [], None, set()
-        for pair in clause:
-            _, word = pair
-            start, end = float(word["start"]), float(word["end"])
-            support = _profile_support(start, end, timeline, matches, "verifier_mapped")
-            profile = max(support, key=support.get) if support else None
-            raw_support = _track_support(start, end, timeline, "verifier_mapped")
-            tracks = {track for track, amount in raw_support.items() if amount > 0}
-            identity_changed = profile and previous_profile and profile != previous_profile
-            track_changed = tracks and previous_tracks and tracks != previous_tracks
-            if current and (identity_changed or track_changed):
-                gap = max(0.0, start - float(current[-1][1]["end"]))
-                # Even a short silence is meaningful when independent tracks
-                # switch identities.  Zero-gap word boundaries remain together
-                # to avoid splitting on frame-level verifier jitter.
-                if gap >= minimum_boundary_gap:
-                    result.append(current)
-                    current = []
-            current.append(pair)
-            if profile:
-                previous_profile = profile
-            if tracks:
-                previous_tracks = tracks
-        if current:
-            result.append(current)
-    return result
-
-
-def phrase_identity_groups(audio, asr, cfg, timeline=None, matches=None):
-    groups, metadata = {}, {}
-    minimum = float(cfg.get("redimnet_phrase_min_seconds", 1.8))
-    maximum = float(cfg.get("redimnet_phrase_max_seconds", 24.0))
-    for number, unit in enumerate(diarization_aware_clause_units(asr.get("words", []), cfg, timeline, matches)):
-        start, end = float(unit[0][1]["start"]), float(unit[-1][1]["end"])
-        if end - start < minimum:
-            continue
-        key = "phrase_{:05d}".format(number)
-        groups[key] = [{"path": Path(audio), "start": start, "end": min(end, start + maximum)}]
-        verifier_support = _profile_support(start, end, timeline, matches, "verifier_mapped")
-        primary_support = _profile_support(start, end, timeline, matches, "primary")
-        metadata[key] = {
-            "start": start, "end": end,
-            "text": " ".join(str(word.get("text", "")) for _, word in unit),
-            "verifier_support": verifier_support,
-            "primary_support": primary_support,
-        }
-    return groups, metadata
-
-
-def conflict_embedding_groups(audio, consensus, matches, cfg):
-    """Prepare only substantial known-vs-known disagreements for pass two."""
-    def known_ids(clusters):
-        return {matches[value]["profile_id"] for value in clusters if value in matches}
-
-    runs = []
-    for index, item in enumerate(consensus):
-        if item.get("overlap"):
-            continue
-        primary = list(item.get("primary", []))
-        verifier = list(item.get("verifier_mapped", []))
-        if not known_ids(primary) or not known_ids(verifier) or known_ids(primary) == known_ids(verifier):
-            continue
-        signature = (tuple(primary), tuple(verifier))
-        if runs and runs[-1]["signature"] == signature and float(item["start"]) - runs[-1]["end"] <= 0.35:
-            runs[-1]["end"] = float(item["end"])
-            runs[-1]["indices"].append(index)
-        else:
-            runs.append({"signature": signature, "start": float(item["start"]), "end": float(item["end"]), "indices": [index]})
-    groups, index_map = {}, {}
-    minimum = float(cfg.get("redimnet_second_pass_min_seconds", 1.8))
-    context = float(cfg.get("redimnet_second_pass_context_seconds", 0.35))
-    for number, run in enumerate(runs):
-        if run["end"] - run["start"] < minimum:
-            continue
-        key = "conflict_{:05d}".format(number)
-        groups[key] = [{"path": Path(audio), "start": max(0.0, run["start"] - context), "end": run["end"] + context}]
-        index_map[key] = run["indices"]
-    return groups, index_map
-
-
-def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=None, cache_dir=None, consensus=None):
-    """Cluster-level ReDimNet ID followed by automatic per-region arbitration."""
-    from scripts.speaker_identity import match_clusters, resolve_timeline, rttm_lines
-
-    enrolled = ensure_redimnet_enrollment(cfg, log)
-    if not enrolled:
-        return {"matches": {}, "message": "–î–æ–±–∞–≤—å—Ç–µ –≥–æ–ª–æ—Å–æ–≤—ã–µ –æ–±—Ä–∞–∑—Ü—ã", "diarization": diarization}
-    groups = cluster_anchor_groups(audio, diarization.get("intervals", []), cfg, consensus)
-    if not groups:
-        return {"matches": {}, "message": "–ù–µ—Ç —á–∏—Å—Ç—ã—Ö –æ–ø–æ—Ä–Ω—ã—Ö —Ñ—Ä–∞–≥–º–µ–Ω—Ç–æ–≤", "diarization": diarization}
-    embedding_path = Path(cache_dir or output_dir) / "redimnet_cluster_embeddings.json"
-    cluster_embeddings = extract_redimnet_embeddings(groups, embedding_path, log, cfg)
-    threshold = float(cfg.get("redimnet_known_threshold", 0.55))
-    margin = float(cfg.get("redimnet_known_margin", 0.08))
-    matches, scores = match_clusters(cluster_embeddings, enrolled, threshold, margin)
-    timeline = consensus or []
-    if not timeline:
-        timeline = [{
-            "start": item["start"], "end": item["end"], "primary": [item["speaker"]],
-            "verifier_mapped": [item["speaker"]], "candidates": [item["speaker"]],
-            "agreement": 1.0, "overlap": item.get("overlap", False),
-        } for item in diarization.get("intervals", [])]
-    phrase_groups, phrase_metadata = phrase_identity_groups(audio, asr or {"words": []}, cfg, timeline, matches)
-    phrase_segments, phrase_scores = [], {}
-    if phrase_groups:
-        phrase_path = Path(cache_dir or output_dir) / "redimnet_phrase_embeddings.json"
-        phrase_embeddings = extract_redimnet_embeddings(phrase_groups, phrase_path, log, cfg)
-        phrase_matches, phrase_scores = match_clusters(
-            phrase_embeddings, enrolled,
-            float(cfg.get("redimnet_phrase_threshold", 0.78)),
-            float(cfg.get("redimnet_phrase_margin", 0.20)),
-        )
-        # A short/codec-damaged phrase can have a lower absolute cosine score.
-        # Accept it only when the margin is decisive and the independent Ultra
-        # track supports the same enrolled identity over most of the phrase.
-        corroborated_threshold = float(cfg.get("redimnet_corroborated_phrase_threshold", 0.58))
-        corroborated_margin = float(cfg.get("redimnet_corroborated_phrase_margin", 0.20))
-        corroborated_coverage = float(cfg.get("redimnet_corroborated_phrase_coverage", 0.72))
-        for key, report_item in phrase_scores.items():
-            if key in phrase_matches or not report_item.get("scores"):
-                continue
-            best = report_item["scores"][0]
-            meta = phrase_metadata.get(key, {})
-            duration = max(0.04, float(meta.get("end", 0)) - float(meta.get("start", 0)))
-            coverage = float(meta.get("verifier_support", {}).get(best["profile_id"], 0.0)) / duration
-            if (best["score"] >= corroborated_threshold
-                    and float(report_item.get("margin", 0)) >= corroborated_margin
-                    and coverage >= corroborated_coverage):
-                phrase_matches[key] = {**best, "margin": report_item["margin"], "corroborated": True}
-                report_item["accepted"] = True
-                report_item["corroborated"] = True
-                report_item["verifier_coverage"] = round(coverage, 4)
-        for key, match in phrase_matches.items():
-            phrase_segments.append({
-                **{k: v for k, v in phrase_metadata[key].items() if not k.endswith("_support")}, "profile_id": match["profile_id"],
-                "name": match["name"], "score": match["score"],
-                "margin": match["margin"],
-                "source": "redimnet_phrase_corroborated" if match.get("corroborated") else "redimnet_phrase",
-            })
-    conflict_groups, conflict_indices = conflict_embedding_groups(audio, timeline, matches, cfg)
-    local_decisions = {}
-    if conflict_groups:
-        conflict_path = Path(cache_dir or output_dir) / "redimnet_conflict_embeddings.json"
-        conflict_embeddings = extract_redimnet_embeddings(conflict_groups, conflict_path, log, cfg)
-        local_matches, local_scores = match_clusters(
-            conflict_embeddings, enrolled,
-            float(cfg.get("redimnet_second_pass_threshold", threshold)),
-            float(cfg.get("redimnet_second_pass_margin", margin)),
-        )
-        for key, match in local_matches.items():
-            for index in conflict_indices.get(key, []):
-                item = timeline[index]
-                duration = float(item["end"]) - float(item["start"])
-                candidate_profiles = {
-                    matches[cluster]["profile_id"]
-                    for cluster in item.get("candidates", item.get("clusters", []))
-                    if cluster in matches
-                }
-                # Embeddings are not reliable enough to overwrite a genuine
-                # sub-1.5-second interjection. The exception is strong evidence
-                # for a third identity while both diarizers are active: that
-                # indicates a contaminated anonymous cluster, not a short turn.
-                third_identity = (
-                    match["profile_id"] not in candidate_profiles
-                    and bool(item.get("primary")) and bool(item.get("verifier_mapped"))
-                )
-                if duration >= float(cfg.get("short_turn_seconds", 1.5)) or third_identity:
-                    local_decisions[index] = match
-    else:
-        local_scores = {}
-    final_segments, debug = resolve_timeline(
-        timeline, matches,
-        short_seconds=float(cfg.get("short_turn_seconds", 1.5)),
-        boundary_tolerance=float(cfg.get("boundary_tolerance_ms", 300)) / 1000.0,
-        local_decisions=local_decisions,
-    )
-    final_diarization = {
-        "model": "DiariZen+Ultra+ReDimNet2 automatic fusion",
-        "intervals": [{
-            "start": item["start"], "end": item["end"], "speaker": item["speaker_id"],
-            "confidence": item["confidence"], "confidence_level": item["confidence_level"],
-            "overlap": item["overlap"], "known_speaker": item["known_speaker"],
-            "decision": item["decision"],
-        } for item in final_segments],
-    }
-    labels = {"profile:" + profile["id"]: profile["name"] for profile in enrolled}
-    speaker_path = Path(output_dir) / "speakers.json"
-    speaker_data = load_json(speaker_path) if speaker_path.exists() else {"labels": {}}
-    speaker_data.setdefault("labels", {}).update(labels)
-    speaker_data["label_sources"] = {key: "redimnet_profile" for key in labels}
-    speaker_data["voice_matches"] = matches
-    write_json(speaker_path, speaker_data)
-    write_json(Path(output_dir) / "voice_segments.json", {
-        "model": REDIMNET_MODEL, "segments": phrase_segments, "scores": phrase_scores,
-        "threshold": float(cfg.get("redimnet_phrase_threshold", 0.78)),
-        "margin": float(cfg.get("redimnet_phrase_margin", 0.20)),
-    })
-    report = {"model": REDIMNET_MODEL, "threshold": threshold, "margin": margin, "matches": matches, "scores": scores, "identified_phrases": len(phrase_segments), "phrase_scores": phrase_scores, "second_pass": {"regions": len(conflict_groups), "resolved_intervals": len(local_decisions), "scores": local_scores}}
-    write_json(Path(output_dir) / "voice_matches.json", report)
-    write_json(Path(output_dir) / "result.json", final_segments)
-    write_json(Path(output_dir) / "debug.json", {"matches": report, "timeline": debug})
-    (Path(output_dir) / "result.rttm").write_text("\n".join(rttm_lines(final_segments, Path(audio).stem)) + "\n", encoding="utf-8")
-    report["diarization"] = final_diarization
-    return report
-
-
-def copy_artifacts(job_dir, output_dir):
-    for name in ("diarization.rttm", "ultra.rttm", "ultra.json", "track_mapping.json", "consensus.json", "redimnet_cluster_embeddings.json"):
-        source = job_dir / name
-        if source.exists():
-            shutil.copy2(source, output_dir / name)
-    shutil.copy2(job_dir / "processing.log", output_dir / "processing.log")
-
-
-def consensus_diarization(job_dir, diarization):
-    path = Path(job_dir) / "consensus.json"
-    if not path.exists():
-        return diarization
-    intervals = []
-    for segment in load_json(path).get("intervals", []):
-        for speaker in segment.get("clusters", []):
-            intervals.append({"start": segment["start"], "end": segment["end"], "speaker": speaker, "consensus_confidence": segment.get("confidence"), "overlap": segment.get("overlap", False)})
-    return {**diarization, "model": "DiariZen+Ultra consensus", "intervals": intervals}
-
-
-def process_job(job_id):
-    cfg = config()
-    db = connect()
-    job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-    if not job:
-        raise ValueError("–ù–µ—Ç –∑–∞–¥–∞–Ω–∏—è {}".format(job_id))
-    source = Path(job["source_path"])
-    if not source.exists():
-        raise FileNotFoundError("–ò—Å—Ö–æ–¥–Ω—ã–π —Ñ–∞–π–ª –±–æ–ª—å—à–µ –Ω–µ —Å—É—â–µ—Å—Ç–≤—É–µ—Ç: {}".format(source))
-    job_dir = Path(job["job_dir"])
-    log = job_dir / "processing.log"
-    audio = job_dir / "audio.wav"
-    diar_json = job_dir / "diarization.json"
-    rttm = job_dir / "diarization.rttm"
-    ultra_json = job_dir / "ultra.json"
-    ultra_rttm = job_dir / "ultra.rttm"
-    mapping_json = job_dir / "track_mapping.json"
-    consensus_json = job_dir / "consensus.json"
-    asr_json = job_dir / "asr.json"
-    duration_path = job_dir / "duration.json"
-    content_sha256 = job["content_sha256"] or fingerprint(source)
-    final_dir = OUTPUTS / ("{}-{}".format(safe_name(source), job["fingerprint"][:8]))
-    publishing = final_dir.with_name(final_dir.name + ".publishing")
-    audio_key = stage_cache_key("audio-v1", {"source": content_sha256, "track": cfg["audio_track"], "rate": 16000, "channels": 1})
-    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg.get("diarization_batch_size", 8), "min": cfg.get("diarization_min_speakers", 1), "max": cfg.get("diarization_max_speakers", 5), "exact": job["speaker_count"]})
-    ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
-    consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
-    asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
-
-    try:
-        update_job(db, job_id, status="running", stage="validate", progress=2, detail="–ü—Ä–æ–≤–µ—Ä—è—é –∑–∞–ø–∏—Å—å", error=None, started_at=job["started_at"] or now(), finished_at=None)
-        if not duration_path.exists():
-            duration = validate_media(source)
-            write_json(duration_path, {"seconds": duration})
-        else:
-            duration = load_json(duration_path)["seconds"]
-        update_job(db, job_id, progress=5)
-        if not stage_cache_valid(job_dir, "audio", audio_key, ["audio.wav"]):
-            update_job(db, job_id, stage="extract_audio", progress=7, detail="–ò–∑–≤–ª–µ–∫–∞—é –∑–≤—É–∫–æ–≤—É—é –¥–æ—Ä–æ–∂–∫—É")
-            extract_audio(source, audio, cfg["audio_track"], log)
-            mark_stage_cached(job_dir, "audio", audio_key, ["audio.wav"])
-        update_job(db, job_id, progress=12)
-        if not stage_cache_valid(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"]):
-            update_job(db, job_id, stage="diarization", progress=15, detail="DiariZen: –æ–ø—Ä–µ–¥–µ–ª—è—é —É—á–∞—Å—Ç–Ω–∏–∫–æ–≤")
-            env = dict(os.environ, PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
-            def diarization_progress(line):
-                markers = {
-                    "Extracting segmentations.": (20, "DiariZen: –∞–Ω–∞–ª–∏–∑–∏—Ä—É—é —É—á–∞—Å—Ç–∫–∏ —Ä–µ—á–∏"),
-                    "Extracting Embeddings.": (40, "DiariZen: —Å—Ä–∞–≤–Ω–∏–≤–∞—é –≥–æ–ª–æ—Å–∞"),
-                    "Clustering.": (52, "DiariZen: –æ–±—ä–µ–¥–∏–Ω—è—é –≥–æ–ª–æ—Å–∞ –ø–æ —É—á–∞—Å—Ç–Ω–∏–∫–∞–º"),
-                }
-                if line in markers:
-                    progress, detail = markers[line]
-                    update_job(db, job_id, progress=progress, detail=detail)
-                    return
-                prefix = "DIARIZEN_PROGRESS "
-                if not line.startswith(prefix):
-                    return
-                payload = json.loads(line[len(prefix):])
-                current = int(payload.get("current", 0))
-                total = max(1, int(payload.get("total", 1)))
-                if payload.get("step") == "segmentation":
-                    progress = 20 + 20 * current / total
-                    detail = "DiariZen: –∞–Ω–∞–ª–∏–∑ —Ä–µ—á–∏, –ø–∞–∫–µ—Ç {} –∏–∑ {}".format(current, total)
-                elif payload.get("step") == "embeddings":
-                    progress = 40 + 12 * current / total
-                    detail = "DiariZen: —Å—Ä–∞–≤–Ω–µ–Ω–∏–µ –≥–æ–ª–æ—Å–æ–≤, –ø–∞–∫–µ—Ç {} –∏–∑ {}".format(current, total)
-                else:
-                    return
+Y™Áäx-ÆÈ‹j◊ù¢Îi∫⁄+äßj[hëÈ‹¢ÈÌ„ûwÌ:-jZ.∂õ≠ñ)ﬁ≥R2˜W7"ˆ&ñ‚ˆVÁbóFÜˆ„0¶g&ˆ“ıˆgWGW&UıÚñ◊˜'BÊÊ˜FFñˆÁ0†¶ñ◊˜'B&w'6P¶ñ◊˜'B77`¶ñ◊˜'Bf6ÁF¿¶ñ◊˜'BÜ6Ü∆ñ ¶ñ◊˜'BáF÷¿¶g&ˆ“áGGÁ6W'fW"ñ◊˜'B&6TÖEE&WVW7DÜÊF∆W"¬Fá&VFñÊtÖEE6W'fW ¶ñ◊˜'Bß6ˆ‡¶ñ◊˜'B÷ñ÷WGóW0¶ñ◊˜'B˜0¶ñ◊˜'B&P¶ñ◊˜'B6áWFñ¿¶ñ◊˜'B7∆óFS0¶ñ◊˜'B7V'&ˆ6W70¶ñ◊˜'B7ó0¶ñ◊˜'BFá&VFñÊp¶ñ◊˜'BFñ÷P¶ñ◊˜'BG&6V&6∞¶ñ◊˜'BWVñ@¶g&ˆ“FFWFñ÷Rñ◊˜'BFFWFñ÷R¬Fñ÷VFV«F¬Fñ÷W¶ˆÊP¶g&ˆ“FÜ∆ñ"ñ◊˜'BFÄ¶g&ˆ“W&∆∆ñ"Á'6Rñ◊˜'B'6U˜2¬W&«'6P†ß7ó2ÁFÇÊñÁ6W'BÉ¬7G"ÖFÇÖıˆfñ∆UıÚíÁ&W6ˆ«fRÇíÁ&VÁBÚ'67&óG2"íê¶g&ˆ“V∆óGï˜66ÜV÷ñ◊˜'BWGFW&Ê6U˜VÊ6W'FñÁGí¬v˜&E˜VÊ6W'FñÁGê¶g&ˆ“6ˆÊfñu˜66ÜV÷ñ◊˜'B∆ˆEˆ6ˆÊfñp¶g&ˆ“WfñFVÊ6Uˆ∆VFvW"ñ◊˜'BGF6Ö˜v˜&EˆñG2¬∆VFvW%ˆFˆ7V÷VÁB¬&V6˜&E˜&W6ˆ«WFñˆ‡††•$ÙıB“FÇÖıˆfñ∆UıÚíÁ&W6ˆ«fRÇíÁ&VÁ@§î‰$ıÇ“$ÙıBÚ&ñÊ&˜Ç •5DDR“$ÙıBÚ'7FFR §§Ù%2“$ÙıBÚ'v˜&≤"Ú&¶ˆ'2 §ıUEUE2“$ÙıBÚ&˜WGWG2 •dÙî4Uı$ÙdîƒU2“$ÙıBÚ'fˆñ6U˜&ˆfñ∆W2 §D%ıDÇ“5DDRÚ'VWVRÁ7∆óFS2 §4Ù‰dîuıDÇ“$ÙıBÚ&6ˆÊfñrÊß6ˆ‚ •dÙ4%Tƒ%ïıDÇ“$ÙıBÚ'fˆ6'V∆'íÊß6ˆ‚ §D4Ñ$Ù$EıDÇ“$ÙıBÚ&F6Ü&ˆ&BÊáF÷¬ •$ÙdîƒU5ıDÇ“$ÙıBÚ'&ˆfñ∆W2ÊáF÷¬ •5T‘‘%ïÙ$T‰4Ñ‘$≤“FÇÇ"ˆ÷ÁB˜6Ü&VB÷FFÙ÷VWFñÊuG&Á67&óB˜7V÷÷'í÷&VÊ6Ü÷&≤"ê•5T‘‘%ïı5DEU5ıDÇ“5T‘‘%ïÙ$T‰4Ñ‘$≤Ú&7W'&VÁBÊß6ˆ‚ §‘TDîÙUÖDTÂ4îÙÂ2“≤"Ê÷∑b"¬"Ê◊B"¬"Ê÷˜b"¬"Ê”Gb"¬"ÁvV&“"¬"Ávb"¬"Ê◊2"¬"Ê”F"¬"Êf∆2"¬"Êˆvr'–•$ÙdîƒUÙƒÙ4≤“Fá&VFñÊr‰∆ˆ6≤Çê††¶FVbÊ˜rÇì†¢&WGW&‚FFWFñ÷RÊÊ˜ráFñ÷W¶ˆÊRÁWF2íÊó6ˆf˜&÷BáFñ÷W7V3“'6V6ˆÊG2"ê††¶FVb6ˆÊfñrÇì†¢&WGW&‚∆ˆEˆ6ˆÊfñrÑ4Ù‰dîuıDÇ¬5DDRÚ&6ˆÊfñrÁ&W6ˆ«fVBÊß6ˆ‚"ê††¶FVbw&óFUˆß6ˆ‚áFÇ¬f«VRì†¢FÇ“FÇáFÇê¢FÇÁ&VÁBÊ÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥’G'VRê¢FV◊˜&'í“FÇÁvóFÖ˜7VffóÇáFÇÁ7VffóÇ≤"ÁF◊"ê¢FV◊˜&'íÁw&óFU˜FWáBÜß6ˆ‚ÊGV◊2áf«VR¬VÁ7W&Uˆ66ñì‘f«6R¬ñÊFVÁC”"í≤%∆‚"¬VÊ6ˆFñÊs“'WFb”Ç"ê¢˜2Á&W∆6RáFV◊˜&'í¬FÇê††•5DtUÙDUT‰DT‰4îU2“∞¢&VFñÚ#¢≤'óV∆ñÊRÁí%“¿¢&Fñ&ó¶V‚#¢≤'óV∆ñÊRÁí"¬'67&óG2ˆFñ&ó¶U˜v˜&∂W"Áí%“¿¢'V«G&#¢≤'óV∆ñÊRÁí"¬'67&óG2˜V«G&˜v˜&∂W"Áí%“¿¢&6ˆÁ6VÁ7W2#¢≤'óV∆ñÊRÁí"¬'67&óG2ˆ6ˆÁ6VÁ7W2Áí%“¿¢&7"#¢≤'óV∆ñÊRÁí"¬'67&óG2ˆ7%˜v˜&∂W"Áí"¬'67&óG2ˆ÷ˆFV≈ˆ6ˆ÷÷ˆ‚Áí%“¿¢&Wá˜'B#¢≤'óV∆ñÊRÁí"¬'67&óG2˜V∆óGï˜66ÜV÷Áí"¬'67&óG2ˆWfñFVÊ6Uˆ∆VFvW"Áí%“¿ß–††¶FVb7FvUˆ66ÜUˆ∂Wíá7FvR¬ñÁWG2ì†¢f÷ñ«í“7FvRÁ7∆óBÇ"“"¬ï≥–¢Fá2“µ$ÙıBÚf«VRf˜"f«VRñ‚5DtUÙDUT‰DT‰4îU2ÊvWBÜf÷ñ«í¬≤'óV∆ñÊRÁí%“ï–¢&WGW&‚ˆß6ˆÂˆÜ6Çá≤'7FvR#¢7FvR¬&ñÁWG2#¢ñÁWG2¬&6ˆFR#¢∞¢7G"áFÇÁ&V∆FófU˜FÚÖ$ÙıBíì¢Ü6Ü∆ñ"Á6Ü#SbáFÇÁ&VEˆ'óFW2ÇííÊÜWÜFñvW7BÇê¢f˜"FÇñ‚Fá2ñbFÇÊó5ˆfñ∆RÇê¢◊“ê††¶FVb7FvUˆ66ÜU˜f∆ñBÜ¶ˆ%ˆFó"¬7FvR¬∂Wí¬'Fñf7G2ì†¢FÇ“FÇÜ¶ˆ%ˆFó"íÚ'7FvUˆ66ÜRÊß6ˆ‚ ¢÷WFFF“∆ˆEˆß6ˆ‚áFÇíñbFÇÊó5ˆfñ∆RÇíV«6R∑–¢&WGW&‚÷WFFFÊvWBá7FvR¬∑“íÊvWBÇ&∂Wí"í”“∂WíÊB∆¬ÖFÇÜ¶ˆ%ˆFó"¬Ê÷RíÊó5ˆfñ∆RÇíf˜"Ê÷Rñ‚'Fñf7G2ê††¶FVb÷&µ˜7FvUˆ66ÜVBÜ¶ˆ%ˆFó"¬7FvR¬∂Wí¬'Fñf7G2ì†¢FÇ“FÇÜ¶ˆ%ˆFó"íÚ'7FvUˆ66ÜRÊß6ˆ‚ ¢÷WFFF“∆ˆEˆß6ˆ‚áFÇíñbFÇÊó5ˆfñ∆RÇíV«6R∑–¢÷WFFF∑7FvU““≤&∂Wí#¢∂Wí¬&'Fñf7G2#¢∆ó7BÜ'Fñf7G2í¬&6ˆ◊∆WFVEˆB#¢Ê˜rÇó–¢w&óFUˆß6ˆ‚áFÇ¬÷WFFFê††¶FVb'Fñf7E˜&˜fVÊÊ6RáFÇ¬&ˆGV6W"¬ñÁWG3‘ÊˆÊR¬÷ˆFV√‘ÊˆÊRì†¢FÇ“FÇáFÇê¢&WGW&‚∞¢&'Fñf7B#¢7G"áFÇÊÊ÷Rí¿¢'&ˆGV6W"#¢≤&6ˆ◊ˆÊVÁB#¢&ˆGV6W"¬'7FvU˜fW'6ñˆ‚#¢“¿¢&÷ˆFV¬#¢÷ˆFV¬˜"∑“¿¢&ñÁWG2#¢ñÁWG2˜"∑“¿¢&˜WGWE˜6Ü#Sb#¢Ü6Ü∆ñ"Á6Ü#SbáFÇÁ&VEˆ'óFW2ÇííÊÜWÜFñvW7BÇíñbFÇÊó5ˆfñ∆RÇíV«6RÊˆÊR¿¢&7&VFVEˆB#¢Ê˜rÇí¿¢–††¶FVb6ˆÊÊV7BÇì†¢5DDRÊ÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥’G'VRê¢F"“7∆óFS2Ê6ˆÊÊV7BÑD%ıDÇê¢F"Á&˜uˆf7F˜'í“7∆óFS2Â&˜p¢F"ÊWÜV7WFRÇ%$t‘¶˜W&Ê≈ˆ÷ˆFS’t¬"ê¢F"ÊWÜV7WFRÄ¢"" ¢5$TDRD$ƒRîb‰ıBUÑï5E2¶ˆ'2Ä¢ñBîÂDTtU"$î‘%í¥Uí¿¢fñÊvW'&ñÁBDUÖB‰ıBÂTƒ¬T‰ïTR¿¢6˜W&6U˜FÇDUÖB‰ıBÂTƒ¬¿¢˜&ñvñÊ≈ˆÊ÷RDUÖB‰ıBÂTƒ¬¿¢7FGW2DUÖB‰ıBÂTƒ¬¿¢7FvRDUÖB‰ıBÂTƒ¬¿¢¶ˆ%ˆFó"DUÖB‰ıBÂTƒ¬¿¢˜WGWEˆFó"DUÖB¿¢W'&˜"DUÖB¿¢7&VFVEˆBDUÖB‰ıBÂTƒ¬¿¢WFFVEˆBDUÖB‰ıBÂTƒ¿¢ê¢"" ¢ê¢6ˆ«V÷Á2“∑&˜u≥“f˜"&˜rñ‚F"ÊWÜV7WFRÇ%$t‘F&∆UˆñÊfÚÜ¶ˆ'2í"ó–¢÷ñw&FñˆÁ2“∞¢'&ˆw&W72#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚&ˆw&W72$T¬‰ıBÂTƒ¬DTdT≈B"¿¢&FWFñ¬#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚FWFñ¬DUÖB"¿¢'7F'FVEˆB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7F'FVEˆBDUÖB"¿¢&fñÊó6ÜVEˆB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚fñÊó6ÜVEˆBDUÖB"¿¢'7V∂W%ˆ6˜VÁB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V∂W%ˆ6˜VÁBîÂDTtU""¿¢'7V÷÷'ï˜7FGW2#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ï˜7FGW2DUÖB‰ıBÂTƒ¬DTdT≈BvÊ˜E˜7F'FVBr"¿¢'7V÷÷'ï˜7FvR#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ï˜7FvRDUÖB"¿¢'7V÷÷'ï˜&ˆw&W72#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ï˜&ˆw&W72$T¬‰ıBÂTƒ¬DTdT≈B"¿¢'7V÷÷'ïˆFWFñ¬#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ïˆFWFñ¬DUÖB"¿¢'7V÷÷'ïˆW'&˜"#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ïˆW'&˜"DUÖB"¿¢'7V÷÷'ï˜7F'FVEˆB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ï˜7F'FVEˆBDUÖB"¿¢'7V÷÷'ïˆfñÊó6ÜVEˆB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚7V÷÷'ïˆfñÊó6ÜVEˆBDUÖB"¿¢'v˜&∂W%ˆñB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚v˜&∂W%ˆñBDUÖB"¿¢&∆V6U˜VÁFñ¬#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚∆V6U˜VÁFñ¬DUÖB"¿¢&GFV◊EˆñB#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚GFV◊EˆñBDUÖB"¿¢&6ˆÁFVÁE˜6Ü#Sb#¢$≈DU"D$ƒR¶ˆ'2DB4Ù≈T‘‚6ˆÁFVÁE˜6Ü#SbDUÖB"¿¢–¢f˜"6ˆ«V÷‚¬7FFV÷VÁBñ‚÷ñw&FñˆÁ2ÊóFV◊2Çì†¢ñb6ˆ«V÷‚Ê˜Bñ‚6ˆ«V÷Á3†¢F"ÊWÜV7WFRá7FFV÷VÁBê¢2∆Vv7ífñÊvW'&ñÁG2vW&R&r6ˆÁFVÁBÜ6ÜW2‚&W6W'fRFÜV“f˜"7F&∆P¢2˜WGWBFá2vÜñ∆R&6∂fñ∆∆ñÊrFÜRÊWrWá∆ñ6óB6ˆÁFVÁBFñvW7B‡¢F"ÊWÜV7WFRÇ%UDDR¶ˆ'24UB6ˆÁFVÁE˜6Ü#Sb“fñÊvW'&ñÁBtÑU$R6ˆÁFVÁE˜6Ü#Sbï2ÂTƒ¬"ê¢F"ÊWÜV7WFRÇ%UDDR¶ˆ'24UB&ˆw&W72“tÑU$R7FGW2“vFˆÊRr‰B&ˆw&W72¬"ê¢F"ÊWÜV7WFRÇ%UDDR¶ˆ'24UBFWFñ¬“}	=Ì-Ì-‚rtÑU$R7FGW2“vFˆÊRr‰BFWFñ¬ï2ÂTƒ¬"ê¢F"ÊWÜV7WFRÇ%UDDR¶ˆ'24UB7F'FVEˆB“7&VFVEˆBtÑU$R7F'FVEˆBï2ÂTƒ¬‰B7FGW2î‚Çw'VÊÊñÊrr¬vFˆÊRr¬vfñ∆VBrí"ê¢F"ÊWÜV7WFRÇ%UDDR¶ˆ'24UBfñÊó6ÜVEˆB“WFFVEˆBtÑU$RfñÊó6ÜVEˆBï2ÂTƒ¬‰B7FGW2î‚ÇvFˆÊRr¬vfñ∆VBrí"ê¢F"Ê6ˆ÷÷óBÇê¢&WGW&‚F ††¶FVbfñÊvW'&ñÁBáFÇì†¢""%&WGW&‚FÜRñ÷◊WF&∆R6ˆÁFVÁBFñvW7BW6VB'í66ÜRÊB&˜fVÊÊ6R‚"" ¢FñvW7B“Ü6Ü∆ñ"Á6Ü#SbÇê¢vóFÇFÇáFÇíÊ˜V‚Ç'&""í27G&V”†¢vÜñ∆RG'VS†¢&∆ˆ6≤“7G&V“Á&VBÉÇ¢#B¢#Bê¢ñbÊ˜B&∆ˆ6≥†¢'&V∞¢FñvW7BÁWFFRÜ&∆ˆ6≤ê¢&WGW&‚FñvW7BÊÜWÜFñvW7BÇê††¶FVb7V&÷ó76ñˆÂˆfñÊvW'&ñÁBÜ6ˆÁFVÁE˜6Ü#Sb¬˜&ñvñÊ≈ˆÊ÷Rì†¢""$FVGW∆ñ6FRˆÊ«í‚ñFVÁFñ6¬&V6˜&FñÊr7V&÷óGFVBVÊFW"FÜR6÷RÊ÷R‚"" ¢ñ∆ˆB“7G"Ü6ˆÁFVÁE˜6Ü#Sbí≤%√"≤FÇÜ˜&ñvñÊ≈ˆÊ÷RíÊÊ÷P¢&WGW&‚Ü6Ü∆ñ"Á6Ü#Sbáñ∆ˆBÊVÊ6ˆFRÇ'WFb”Ç"ííÊÜWÜFñvW7BÇê††¶FVbfñÊEˆWÜó7FñÊuˆ¶ˆ"ÜF"¬6ˆÁFVÁE˜6Ü#Sb¬˜&ñvñÊ≈ˆÊ÷Rì†¢7V&÷ó76ñˆ‚“7V&÷ó76ñˆÂˆfñÊvW'&ñÁBÜ6ˆÁFVÁE˜6Ü#Sb¬˜&ñvñÊ≈ˆÊ÷Rê¢&WGW&‚F"ÊWÜV7WFRÄ¢%4TƒT5B¢e$Ù“¶ˆ'2tÑU$RfñÊvW'&ñÁB“Úı"Ü6ˆÁFVÁE˜6Ü#Sb“Ú‰B˜&ñvñÊ≈ˆÊ÷R“Úíı$DU"%íñBƒî‘ïB"¿¢á7V&÷ó76ñˆ‚¬6ˆÁFVÁE˜6Ü#Sb¬FÇÜ˜&ñvñÊ≈ˆÊ÷RíÊÊ÷Rí¿¢íÊfWF6ÜˆÊRÇê††¶FVb6fUˆÊ÷RáFÇì†¢6∆VÊVB“""Ê¶ˆñ‚Ü2ñb2Êó6∆ÁV“Çí˜"2ñ‚"’Ú‚"V«6R%Ú"f˜"2ñ‚FÇáFÇíÁ7FV“íÁ7G&óÇ"ÂÚ"ê¢&WGW&‚6∆VÊVE≥£“˜"'&V6˜&FñÊr ††¶FVbÊ˜&÷∆ó¶U˜7V∂W%ˆ6˜VÁBáf«VRì†¢ñbf«VRñ‚ÑÊˆÊR¬""¬&WFÚ"ì†¢&WGW&‚ÊˆÊP¢G'ì†¢6˜VÁB“ñÁBáf«VRê¢WÜ6WBÖGóTW'&˜"¬f«VTW'&˜"ì†¢&ó6Rf«VTW'&˜"Ç-	≠ÌΩç}]--‚=}-›ç≠Ì"MÌΩm›‚Ω-¬Ì"M‚Ç"ê¢ñb6˜VÁB¬˜"6˜VÁB‚É†¢&ó6Rf«VTW'&˜"Ç-	≠ÌΩç}]--‚=}-›ç≠Ì"MÌΩm›‚Ω-¬Ì"M‚Ç"ê¢&WGW&‚6˜VÁ@††¶FVbVÁVWVRáFÇ¬∂Ê˜vÂˆfñÊvW'&ñÁC‘ÊˆÊR¬7V∂W%ˆ6˜VÁC‘ÊˆÊR¬˜&ñvñÊ≈ˆÊ÷S‘ÊˆÊRì†¢FÇ“FÇáFÇíÊWáÊGW6W"ÇíÁ&W6ˆ«fRÇê¢ñbÊ˜BFÇÊó5ˆfñ∆RÇí˜"FÇÁ7VffóÇÊ66Vfˆ∆BÇíÊ˜Bñ‚‘TDîÙUÖDTÂ4îÙÂ3†¢&ó6Rf«VTW'&˜"Ç-
+›-‚›R˝ÌMM]mç-]ÕΩíÕ]MçMù≥¢∑“"Êf˜&÷BáFÇíê¢˜&ñvñÊ≈ˆÊ÷R“FÇÜ˜&ñvñÊ≈ˆÊ÷R˜"FÇÊÊ÷RíÊÊ÷P¢6ˆÁFVÁE˜6Ü#Sb“∂Ê˜vÂˆfñÊvW'&ñÁB˜"fñÊvW'&ñÁBáFÇê¢g“7V&÷ó76ñˆÂˆfñÊvW'&ñÁBÜ6ˆÁFVÁE˜6Ü#Sb¬˜&ñvñÊ≈ˆÊ÷Rê¢F"“6ˆÊÊV7BÇê¢WÜó7FñÊr“fñÊEˆWÜó7FñÊuˆ¶ˆ"ÜF"¬6ˆÁFVÁE˜6Ü#Sb¬˜&ñvñÊ≈ˆÊ÷Rê¢ñbWÜó7FñÊs†¢&ñÁBÇ-
+=mR"Ì}]]MÉ¢¶ˆ"∑“á∑“í"Êf˜&÷BÜWÜó7FñÊu≤&ñB%“¬WÜó7FñÊu≤'7FGW2%“íê¢&WGW&‚WÜó7FñÊu≤&ñB%–¢7F◊“FFWFñ÷RÊÊ˜rÇíÁ7G&gFñ÷RÇ"UíV“VB“TÇT“U2"ê¢¶ˆ%ˆFó"“§Ù%2ÚÇ'∑“◊∑“"Êf˜&÷Bá7F◊¬g≥£“íê¢¶ˆ%ˆFó"Ê÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥‘f«6Rê¢7W'6˜"“F"ÊWÜV7WFRÄ¢""$îÂ4U%BîÂDÚ¶ˆ'0¢ÜfñÊvW'&ñÁB¬6ˆÁFVÁE˜6Ü#Sb¬6˜W&6U˜FÇ¬˜&ñvñÊ≈ˆÊ÷R¬7FGW2¬7FvR¬¶ˆ%ˆFó"¬7V∂W%ˆ6˜VÁB¬7&VFVEˆB¬WFFVEˆBê¢d≈TU2ÉÚ¬Ú¬Ú¬Ú¬wVWVVBr¬wVWVVBr¬Ú¬Ú¬Ú¬Úí"""¿¢Üg¬6ˆÁFVÁE˜6Ü#Sb¬7G"áFÇí¬˜&ñvñÊ≈ˆÊ÷R¬7G"Ü¶ˆ%ˆFó"í¬Ê˜&÷∆ó¶U˜7V∂W%ˆ6˜VÁBá7V∂W%ˆ6˜VÁBí¬Ê˜rÇí¬Ê˜rÇíí¿¢ê¢F"Ê6ˆ÷÷óBÇê¢w&óFU˜7FGW5˜6Ê6Ü˜BÜF"ê¢¶ˆ%ˆñB“7W'6˜"Ê∆7G&˜vñ@¢w&óFUˆß6ˆ‚Ü¶ˆ%ˆFó"Ú&¶ˆ"Êß6ˆ‚"¬≤&ñB#¢¶ˆ%ˆñB¬&fñÊvW'&ñÁB#¢g¬&6ˆÁFVÁE˜6Ü#Sb#¢6ˆÁFVÁE˜6Ü#Sb¬'6˜W&6R#¢7G"áFÇí¬&7&VFVEˆB#¢Ê˜rÇó“ê¢&ñÁBÇ-	MÌ-Ω]›‚"Ì}]]M√¢¶ˆ"∑“(	B∑“"Êf˜&÷BÜ¶ˆ%ˆñB¬˜&ñvñÊ≈ˆÊ÷Ríê¢ñb6ˆÊfñrÇíÊvWBÇ&˜VÂˆF6Ü&ˆ&EˆˆÂˆ¶ˆ""¬G'VRì†¢˜VÂˆF6Ü&ˆ&BÇê¢&WGW&‚¶ˆ%ˆñ@††¶FVbWFFUˆ¶ˆ"ÜF"¬¶ˆ%ˆñB¬¢ßf«VW2ì†¢ñbf«VW2ÊvWBÇ'7FGW2"í”“''VÊÊñÊr"˜"'&ˆw&W72"ñ‚f«VW3†¢f«VW2Á6WFFVfV«BÇ&∆V6U˜VÁFñ¬"¬ÜFFWFñ÷RÊÊ˜ráFñ÷W¶ˆÊRÁWF2í≤Fñ÷VFV«FÜÜ˜W'3”bííÊó6ˆf˜&÷BáFñ÷W7V3“'6V6ˆÊG2"íê¢f«VW5≤'WFFVEˆB%““Ê˜rÇê¢VW'í“%UDDR¶ˆ'24UB∑“tÑU$RñB“Ú"Êf˜&÷BÇ"¬"Ê¶ˆñ‚Ç'∑““Ú"Êf˜&÷BÜ∂Wííf˜"∂Wíñ‚f«VW2íê¢F"ÊWÜV7WFRáVW'í¬GW∆Ráf«VW2Áf«VW2Çíí≤Ü¶ˆ%ˆñB¬íê¢F"Ê6ˆ÷÷óBÇê¢w&óFU˜7FGW5˜6Ê6Ü˜BÜF"ê††¶FVb7FGW5˜&˜w2ÜF"ì†¢&WGW&‚F"ÊWÜV7WFRÄ¢%4TƒT5BñB¬˜&ñvñÊ≈ˆÊ÷R¬7FGW2¬7FvR¬&ˆw&W72¬FWFñ¬¬W'&˜"¬˜WGWEˆFó"¬7V∂W%ˆ6˜VÁB¬7&VFVEˆB¬7F'FVEˆB¬fñÊó6ÜVEˆB¬WFFVEˆB¬7V÷÷'ï˜7FGW2¬7V÷÷'ï˜7FvR¬7V÷÷'ï˜&ˆw&W72¬7V÷÷'ïˆFWFñ¬¬7V÷÷'ïˆW'&˜"¬7V÷÷'ï˜7F'FVEˆB¬7V÷÷'ïˆfñÊó6ÜVEˆBe$Ù“¶ˆ'2ı$DU"%íñBDU42ƒî‘ïBS ¢íÊfWF6Ü∆¬Çê††¶FVbw&óFU˜7FGW5˜6Ê6Ü˜BÜF"ì†¢ñ∆ˆB“≤&¶ˆ'2#¢∂Fñ7Bá&˜ríf˜"&˜rñ‚7FGW5˜&˜w2ÜF"ï“¬&ñÊ&˜Ç#¢7G"Ñî‰$ıÇí¬&˜WGWG2#¢7G"ÑıUEUE2í¬'WFFVEˆB#¢Ê˜rÇó–¢w&óFUˆß6ˆ‚Ö5DDRÚ'&ˆw&W72Êß6ˆ‚"¬ñ∆ˆBê††¶FVb'VÂˆ6ˆ÷÷ÊBÜ6ˆ÷÷ÊB¬∆ˆu˜FÇ¬VÁc‘ÊˆÊR¬&ˆw&W75ˆ6∆∆&6≥‘ÊˆÊRì†¢∆ˆu˜FÇÁ&VÁBÊ÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥’G'VRê¢vóFÇ∆ˆu˜FÇÊ˜V‚Ç&"¬VÊ6ˆFñÊs“'WFb”Ç"í2∆ˆs†¢∆ˆrÁw&óFRÇ%∆Â∑∑’“∑’∆‚"Êf˜&÷BÜÊ˜rÇí¬""Ê¶ˆñ‚Ü÷á7G"¬6ˆ÷÷ÊBíííê¢∆ˆrÊf«W6ÇÇê¢&ˆ6W72“7V'&ˆ6W72Â˜V‚Ü6ˆ÷÷ÊB¬7FF˜WC◊7V'&ˆ6W72ÂïR¬7FFW'#◊7V'&ˆ6W72Â5DDıUB¬FWáC’G'VR¬VÁc÷VÁb¬'Vg6ó¶S”ê¢76W'B&ˆ6W72Á7FF˜WBó2Ê˜BÊˆÊP¢f˜"∆ñÊRñ‚&ˆ6W72Á7FF˜WC†¢∆ˆrÁw&óFRÜ∆ñÊRê¢∆ˆrÊf«W6ÇÇê¢ñb&ˆw&W75ˆ6∆∆&6≥†¢&ˆw&W75ˆ6∆∆&6≤Ü∆ñÊRÁ7G&óÇíê¢&ˆ6W72ÁvóBÇê¢ñb&ˆ6W72Á&WGW&Ê6ˆFS†¢&ó6R'VÁFñ÷TW'&˜"Ç-	≠ÌÕ›M}-]ççΩ¬≠ÌMÌ¬∑“‚
+¬‚∑“"Êf˜&÷Bá&ˆ6W72Á&WGW&Ê6ˆFR¬∆ˆu˜FÇíê††¶FVbf∆ñFFUˆ÷VFñá6˜W&6Rì†¢&W7V«B“7V'&ˆ6W72Á'V‚Ä¢≤&fg&ˆ&R"¬"◊b"¬&W'&˜""¬"◊6Ü˜uˆVÁG&ñW2"¬&f˜&÷C÷GW&Fñˆ‚"¬"÷ˆb"¬&FVfV«C÷Ás”¶Ê≥”"¬7G"á6˜W&6Rï“¿¢6GW&Uˆ˜WGWC’G'VR¿¢FWáC’G'VR¿¢ê¢ñb&W7V«BÁ&WGW&Ê6ˆFR˜"Ê˜B&W7V«BÁ7FF˜WBÁ7G&óÇì†¢&ó6R'VÁFñ÷TW'&˜"Ç$dg&ˆ&R›RÕÌ2˝Ì}ç--¬Õ]MçMù≥¢∑“"Êf˜&÷Bá&W7V«BÁ7FFW'"Á7G&óÇííê¢&WGW&‚f∆ˆBá&W7V«BÁ7FF˜WBÁ7G&óÇíê††¶FVbWáG&7EˆVFñÚá6˜W&6R¬FW7FñÊFñˆ‚¬G&6≤¬∆ˆrì†¢'VÂˆ6ˆ÷÷ÊBÄ¢∞¢&ff◊Vr"¬"÷Ê˜7FFñ‚"¬"÷ÜñFUˆ&ÊÊW""¬"◊í"¬"÷í"¬7G"á6˜W&6Rí¿¢"÷÷"¬#¶ß∑“"Êf˜&÷BáG&6≤í¬"◊f‚"¬"÷2"¬#"¬"÷""¬#c"¿¢"÷3¶"¬'6’˜3f∆R"¬7G"ÜFW7FñÊFñˆ‚í¿¢“¿¢∆ˆr¿¢ê††¶FVb∆ˆEˆß6ˆ‚áFÇì†¢&WGW&‚ß6ˆ‚Ê∆ˆG2ÖFÇáFÇíÁ&VE˜FWáBÜVÊ6ˆFñÊs“'WFb”Ç"íê††¶FVb&ˆfñ∆U˜FÇá&ˆfñ∆UˆñBì†¢ñbÊ˜B&ˆfñ∆UˆñB˜"ÁíÜ6Ü&7FW"Ê˜Bñ‚##3CScsÉñ&6FVb"f˜"6Ü&7FW"ñ‚&ˆfñ∆UˆñBí˜"∆V‚á&ˆfñ∆UˆñBí“3#†¢&ó6Rf«VTW'&˜"Ç-	˝ÌMçΩ¬›R›ùM]“"ê¢&WGW&‚dÙî4Uı$ÙdîƒU2Ú&ˆfñ∆UˆñBÚ'&ˆfñ∆RÊß6ˆ‚ ††¶FVb∆ˆE˜fˆñ6U˜&ˆfñ∆W2Çì†¢&ˆfñ∆W2“µ–¢ñbÊ˜BdÙî4Uı$ÙdîƒU2ÊWÜó7G2Çì†¢&WGW&‚&ˆfñ∆W0¢f˜"FÇñ‚dÙî4Uı$ÙdîƒU2Êv∆ˆ"Ç"¢˜&ˆfñ∆RÊß6ˆ‚"ì†¢G'ì†¢&ˆfñ∆R“∆ˆEˆß6ˆ‚áFÇê¢6◊∆W2“&ˆfñ∆RÊvWBÇ'6◊∆W2"¬µ“ê¢&ˆfñ∆U≤'6◊∆Uˆ6˜VÁB%““∆V‚á6◊∆W2ê¢&ˆfñ∆U≤&GW&FñˆÂ˜6V6ˆÊG2%““&˜VÊBá7V“Üf∆ˆBá6◊∆RÊvWBÇ&GW&FñˆÂ˜6V6ˆÊG2"¬ííf˜"6◊∆Rñ‚6◊∆W2í¬ê¢&ˆfñ∆U≤'&VGí%““&ˆfñ∆U≤'6◊∆Uˆ6˜VÁB%“„“"ÊB&ˆfñ∆U≤&GW&FñˆÂ˜6V6ˆÊG2%“„“3 ¢&ˆfñ∆W2ÊVÊBá&ˆfñ∆Rê¢WÜ6WBÑı4W'&˜"¬f«VTW'&˜"¬∂WîW'&˜"¬ß6ˆ‚‰•4Ù‰FV6ˆFTW'&˜"ì†¢6ˆÁFñÁVP¢&WGW&‚6˜'FVBá&ˆfñ∆W2¬∂Wì÷∆÷&FóFV”¢ÜóFV“ÊvWBÇ&Ê÷R"¬""íÊ66Vfˆ∆BÇí¬óFV“ÊvWBÇ&7&VFVEˆB"¬""ííê††¶FVbV&∆ñ5˜&ˆfñ∆Rá&ˆfñ∆Rì†¢6◊∆W2“&ˆfñ∆RÊvWBÇ'6◊∆W2"¬µ“ê¢6◊∆Uˆ6˜VÁB“&ˆfñ∆RÊvWBÇ'6◊∆Uˆ6˜VÁB"¬∆V‚á6◊∆W2íê¢GW&FñˆÂ˜6V6ˆÊG2“&ˆfñ∆RÊvWBÇ&GW&FñˆÂ˜6V6ˆÊG2"¬&˜VÊBá7V“Üf∆ˆBá6◊∆RÊvWBÇ&GW&FñˆÂ˜6V6ˆÊG2"¬ííf˜"6◊∆Rñ‚6◊∆W2í¬íê¢&WGW&‚∞¢&ñB#¢&ˆfñ∆U≤&ñB%“¿¢&Ê÷R#¢&ˆfñ∆U≤&Ê÷R%“¿¢'6◊∆Uˆ6˜VÁB#¢6◊∆Uˆ6˜VÁB¿¢&GW&FñˆÂ˜6V6ˆÊG2#¢GW&FñˆÂ˜6V6ˆÊG2¿¢'&VGí#¢&ˆfñ∆RÊvWBÇ'&VGí"¬6◊∆Uˆ6˜VÁB„“"ÊBGW&FñˆÂ˜6V6ˆÊG2„“3í¿¢'6◊∆W2#¢∞¢∞¢&ñB#¢6◊∆U≤&ñB%“¿¢&Ê÷R#¢6◊∆RÊvWBÇ&Ê÷R"¬-	Ì}]b"í¿¢&GW&FñˆÂ˜6V6ˆÊG2#¢6◊∆RÊvWBÇ&GW&FñˆÂ˜6V6ˆÊG2"¬í¿¢&7&VFVEˆB#¢6◊∆RÊvWBÇ&7&VFVEˆB"í¿¢–¢f˜"6◊∆Rñ‚&ˆfñ∆RÊvWBÇ'6◊∆W2"¬µ“ê¢“¿¢–††¶FVb&˜vFU˜&ˆfñ∆UˆÊ÷Rá&ˆfñ∆UˆñB¬Ê÷Rì†¢""$∂VW∆&V«276ñvÊVBg&ˆ“FÜó2fˆñ6R&ˆfñ∆Rñ‚fñÊó6ÜVBWá˜'G2ñ‚7ñÊ2‚"" ¢F"“6ˆÊÊV7BÇê¢¶ˆ'2“F"ÊWÜV7WFRÇ%4TƒT5BñB¬˜WGWEˆFó"e$Ù“¶ˆ'2tÑU$R7FGW2“vFˆÊRr‰B˜WGWEˆFó"ï2‰ıBÂTƒ¬"íÊfWF6Ü∆¬Çê¢WFFVB“ ¢f˜"¶ˆ"ñ‚¶ˆ'3†¢7V∂W'5˜FÇ“FÇÜ¶ˆ%≤&˜WGWEˆFó"%“íÚ'7V∂W'2Êß6ˆ‚ ¢ñbÊ˜B7V∂W'5˜FÇÊó5ˆfñ∆RÇì†¢6ˆÁFñÁVP¢G'ì†¢7V∂W%ˆFF“∆ˆEˆß6ˆ‚á7V∂W'5˜FÇê¢∆&V«2“7V∂W%ˆFFÊvWBÇ&∆&V«2"¬∑“ê¢6˜W&6W2“7V∂W%ˆFFÊvWBÇ&∆&V≈˜6˜W&6W2"¬∑“ê¢÷F6ÜW2“7V∂W%ˆFFÊvWBÇ'fˆñ6Uˆ÷F6ÜW2"¬∑“ê¢6ÜÊvVB“f«6P¢f˜"7V∂W"¬÷F6Çñ‚÷F6ÜW2ÊóFV◊2Çì†¢ñb÷F6ÇÊvWBÇ'&ˆfñ∆UˆñB"í“&ˆfñ∆UˆñC†¢6ˆÁFñÁVP¢÷F6Ö≤&Ê÷R%““Ê÷P¢ñb6˜W&6W2ÊvWBá7V∂W"í”“'fˆñ6U˜&ˆfñ∆R#†¢∆&V«5∑7V∂W%““Ê÷P¢6ÜÊvVB“G'VP¢&ˆfñ∆U˜7V∂W"“'&ˆfñ∆S¢"≤&ˆfñ∆Uˆñ@¢ñb6˜W&6W2ÊvWBá&ˆfñ∆U˜7V∂W"í”“'fˆñ6U˜&ˆfñ∆R"ÊB&ˆfñ∆U˜7V∂W"ñ‚∆&V«3†¢∆&V«5∑&ˆfñ∆U˜7V∂W%““Ê÷P¢6ÜÊvVB“G'VP¢fˆñ6U˜6Vv÷VÁG5˜FÇ“FÇÜ¶ˆ%≤&˜WGWEˆFó"%“íÚ'fˆñ6U˜6Vv÷VÁG2Êß6ˆ‚ ¢ñbfˆñ6U˜6Vv÷VÁG5˜FÇÊó5ˆfñ∆RÇì†¢fˆñ6U˜6Vv÷VÁG2“∆ˆEˆß6ˆ‚áfˆñ6U˜6Vv÷VÁG5˜FÇê¢6Vv÷VÁEˆ6ÜÊvVB“f«6P¢f˜"6Vv÷VÁBñ‚fˆñ6U˜6Vv÷VÁG2ÊvWBÇ'6Vv÷VÁG2"¬µ“ì†¢ñb6Vv÷VÁBÊvWBÇ'&ˆfñ∆UˆñB"í”“&ˆfñ∆UˆñC†¢6Vv÷VÁE≤&Ê÷R%““Ê÷P¢6Vv÷VÁEˆ6ÜÊvVB“G'VP¢ñb6Vv÷VÁEˆ6ÜÊvVC†¢w&óFUˆß6ˆ‚áfˆñ6U˜6Vv÷VÁG5˜FÇ¬fˆñ6U˜6Vv÷VÁG2ê¢6ÜÊvVB“G'VP¢ñb6ÜÊvVC†¢w&óFUˆß6ˆ‚á7V∂W'5˜FÇ¬7V∂W%ˆFFê¢&VÊ÷UˆWá˜'BÜ¶ˆ%≤&ñB%“ê¢WFFVB≥“¢WÜ6WBÑı4W'&˜"¬f«VTW'&˜"¬∂WîW'&˜"¬ß6ˆ‚‰•4Ù‰FV6ˆFTW'&˜"ì†¢6ˆÁFñÁVP¢&WGW&‚WFFV@††¶FVbfˆñ6UˆV÷&VFFñÊuˆ÷ˆFV≈˜FÇÇì†¢÷F6ÜW2“6˜'FVBÇÖ$ÙıBÚ'v˜&≤"Ú&66ÜR"Ú&áVvvñÊvf6R"Ú&áV""Ú&÷ˆFV«2“◊ñÊÊ˜FR“◊vW7V∂W"◊f˜Ü6V∆V"◊&W6ÊWC3B‘ƒ“"Ú'6Ê6Ü˜G2"íÊv∆ˆ"Ç"¢˜óF˜&6Öˆ÷ˆFV¬Ê&ñ‚"íê¢ñbÊ˜B÷F6ÜW3†¢&ó6Rfñ∆TÊ˜Df˜VÊDW'&˜"Ç-	ÕÌM]Ω¬=ÌΩÌÌ-ΩRÌ-˝]}-≠Ì"›R=-›Ì-Ω]›"ê¢&WGW&‚÷F6ÜW5≤”–††¶FVbÊ˜&÷∆ó¶VEˆ÷V‚áfV7F˜'2ì†¢ñbÊ˜BfV7F˜'3†¢&WGW&‚ÊˆÊP¢Fñ÷VÁ6ñˆ‚“∆V‚áfV7F˜'5≥“ê¢ñbÊ˜BFñ÷VÁ6ñˆ‚˜"ÁíÜ∆V‚áfV7F˜"í“Fñ÷VÁ6ñˆ‚f˜"fV7F˜"ñ‚fV7F˜'2ì†¢&WGW&‚ÊˆÊP¢÷V‚“∑7V“Üf∆ˆBáfV7F˜%∂ñÊFWÖ“íf˜"fV7F˜"ñ‚fV7F˜'2íÚ∆V‚áfV7F˜'2íf˜"ñÊFWÇñ‚&ÊvRÜFñ÷VÁ6ñˆ‚ï–¢∆VÊwFÇ“7V“áf«VR¢f«VRf˜"f«VRñ‚÷V‚í¢¢„P¢&WGW&‚∑f«VRÚ∆VÊwFÇf˜"f«VRñ‚÷VÂ“ñb∆VÊwFÇ‚R”ÇV«6RÊˆÊP††¶FVb6˜6ñÊU˜6ñ÷ñ∆&óGíÜ∆VgB¬&ñváBì†¢ñbÊ˜B∆VgB˜"Ê˜B&ñváB˜"∆V‚Ü∆VgBí“∆V‚á&ñváBì†¢&WGW&‚”„ ¢&WGW&‚7V“Üf∆ˆBÜí¢f∆ˆBÜ"íf˜"¬"ñ‚¶óÜ∆VgB¬&ñváBíê††¶FVbWáG&7E˜fˆñ6UˆV÷&VFFñÊw2Üw&˜W2¬FW7FñÊFñˆ‚¬∆ˆr¬6Vv÷VÁG3‘ÊˆÊRì†¢÷ÊñfW7B“FW7FñÊFñˆ‚ÁvóFÖ˜7VffóÇÇ"Ê÷ÊñfW7BÊß6ˆ‚"ê¢w&óFUˆß6ˆ‚Ü÷ÊñfW7B¬∞¢&w&˜W2#¢∑7G"Ü∂Wíì¢∑7G"áFÇíf˜"FÇñ‚Fá5“f˜"∂Wí¬Fá2ñ‚w&˜W2ÊóFV◊2Çó“¿¢'6Vv÷VÁG2#¢∞¢7G"Ü∂Wíì¢∂Fñ7BÜóFV“¬FÉ◊7G"ÜóFV’≤'FÇ%“ííf˜"óFV“ñ‚óFV◊5–¢f˜"∂Wí¬óFV◊2ñ‚á6Vv÷VÁG2˜"∑“íÊóFV◊2Çê¢“¿¢“ê¢G'ì†¢'VÂˆ6ˆ÷÷ÊBÖ∞¢7G"Ö$ÙıBÚ"ÁfVÁb÷Fñ&ó¶V‚"Ú&&ñ‚"Ú'óFÜˆ‚"í¿¢7G"Ö$ÙıBÚ'67&óG2"Ú'fˆñ6UˆV÷&VFFñÊu˜v˜&∂W"Áí"í¿¢"“÷÷ÊñfW7B"¬7G"Ü÷ÊñfW7Bí¿¢"“÷˜WGWB"¬7G"ÜFW7FñÊFñˆ‚í¿¢"“÷÷ˆFV¬"¬7G"áfˆñ6UˆV÷&VFFñÊuˆ÷ˆFV≈˜FÇÇíí¿¢"“÷FWfñ6R"¬7G"Ü6ˆÊfñrÇíÊvWBÇ'fˆñ6UˆV÷&VFFñÊuˆFWfñ6R"¬&WFÚ"íí¿¢“¬∆ˆrê¢fñÊ∆«ì†¢÷ÊñfW7BÁVÊ∆ñÊ≤Ü÷ó76ñÊuˆˆ≥’G'VRê¢&WGW&‚∆ˆEˆß6ˆ‚ÜFW7FñÊFñˆ‚íÊvWBÇ&w&˜W2"¬∑“ê††¶FVb˜fW&∆Ü˜7F'B¬ˆVÊB¬%˜7F'B¬%ˆVÊBì†¢&WGW&‚÷ÇÉ„¬÷ñ‚ÜˆVÊB¬%ˆVÊBí“÷ÇÜ˜7F'B¬%˜7F'Bíê††¶FVbFñ÷W7F◊á6V6ˆÊG2¬7'C‘f«6Rì†¢÷ñ∆∆ó2“÷ÇÉ¬ñÁBá&˜VÊBá6V6ˆÊG2¢ííê¢Ü˜W'2¬&V÷ñÊFW"“Fóf÷ˆBÜ÷ñ∆∆ó2¬5ÛcÛê¢÷ñÁWFW2¬&V÷ñÊFW"“Fóf÷ˆBá&V÷ñÊFW"¬cÛê¢6V72¬◊2“Fóf÷ˆBá&V÷ñÊFW"¬ê¢6W&F˜"“"¬"ñb7'BV«6R"‚ ¢&WGW&‚'≥£&G”ß≥£&G”ß≥£&G◊∑◊≥£6G“"Êf˜&÷BÜÜ˜W'2¬÷ñÁWFW2¬6V72¬6W&F˜"¬◊2ê††¶FVb76ñvÂ˜7V∂W'2áv˜&G2¬ñÁFW'f«2¬6frì†¢76ñvÊVB“µ–¢f˜"v˜&Bñ‚v˜&G3†¢7F'B¬VÊB“f∆ˆBáv˜&E≤'7F'B%“í¬f∆ˆBáv˜&E≤&VÊB%“ê¢GW&Fñˆ‚“÷ÇÉ„B¬VÊB“7F'Bê¢66˜&W2“∑–¢7FófR“6WBÇê¢WfñFVÊ6Uˆ6ˆÊfñFVÊ6R“µ–¢f˜"ñÁFW'f¬ñ‚ñÁFW'f«3†¢÷˜VÁB“˜fW&∆á7F'B¬VÊB¬ñÁFW'f≈≤'7F'B%“¬ñÁFW'f≈≤&VÊB%“ê¢ñb÷˜VÁB‚†¢66˜&W5∂ñÁFW'f≈≤'7V∂W"%’““66˜&W2ÊvWBÜñÁFW'f≈≤'7V∂W"%“¬„í≤÷˜VÁ@¢7FófRÊFBÜñÁFW'f≈≤'7V∂W"%“ê¢ñbñÁFW'f¬ÊvWBÇ&6ˆÊfñFVÊ6R"íó2Ê˜BÊˆÊS†¢WfñFVÊ6Uˆ6ˆÊfñFVÊ6RÊVÊBÜf∆ˆBÜñÁFW'f≈≤&6ˆÊfñFVÊ6R%“íê¢&Ê∂VB“6˜'FVBá66˜&W2ÊóFV◊2Çí¬∂Wì÷∆÷&FóFV”¢óFV’≥“¬&WfW'6S’G'VRê¢&W7B“&Ê∂VE≥“ñb&Ê∂VBV«6RÑÊˆÊR¬„ê¢6V6ˆÊB“&Ê∂VE≥’≥“ñb∆V‚á&Ê∂VBí‚V«6R„ ¢6ˆÊfñFVÊ6R“&W7E≥“ÚGW&Fñˆ‡¢6∆V"“6ˆÊfñFVÊ6R„“6fu≤'7V∂W%ˆ÷F6Öˆ÷ñÂˆ˜fW&∆%“ÊBÜ&W7E≥““6V6ˆÊBíÚGW&Fñˆ‚„“6fu≤'7V∂W%ˆ÷F6Öˆ÷&vñ‚%–¢7V∂W"“&W7E≥“ñb6∆V"V«6RÊˆÊP¢f∆w2“∆ó7Báv˜&BÊvWBÇ&f∆w2"¬µ“íê¢ñb∆V‚Ü7FófRí‚†¢f∆w2ÊVÊBÇ&˜fW&∆"ê¢ñbÊ˜B6∆V#†¢f∆w2ÊVÊBÇ&÷&ñwV˜W2"ñb&Ê∂VBV«6R&ÊıˆFñ&ó¶Fñˆ‚"ê¢ñbWfñFVÊ6Uˆ6ˆÊfñFVÊ6RÊB÷ÇÜWfñFVÊ6Uˆ6ˆÊfñFVÊ6Rí¬„s†¢f∆w2ÊVÊBÇ&∆˜uˆ6ˆÊfñFVÊ6R"ê¢WfñFVÊ6R“∑≤'7V∂W"#¢f«VR¬&˜fW&∆˜6V6ˆÊG2#¢&˜VÊBÜ÷˜VÁB¬Bí¬'6˜W&6R#¢&Fñ&ó¶Fñˆ‚'“f˜"f«VR¬÷˜VÁBñ‚&Ê∂VE–¢óFV““Fñ7Báv˜&B¬7V∂W#◊7V∂W"¬7V∂W%ˆ6ˆÊfñFVÊ6S◊&˜VÊBÜ6ˆÊfñFVÊ6R¬2í¬f∆w3◊6˜'FVBá6WBÜf∆w2íí¬7V∂W%ˆWfñFVÊ6S÷WfñFVÊ6Rê¢óFV’≤'&W6ˆ«WFñˆ‚%““≤'6V∆V7FVB#¢7V∂W"¬&÷WFÜˆB#¢&6˜W7Fñ5ˆ˜fW&∆"ñb6∆V"V«6R'VÁ&W6ˆ«fVB"¬'&ó6≤#¢&∆˜r"ñb6∆V"V«6R&ÜñvÇ'–¢óFV’≤'7V∂W%˜&W6ˆ«WFñˆÂˆÜó7F˜'í%““∑≤'7V∂W"#¢7V∂W"¬'&V6ˆ‚#¢óFV’≤'&W6ˆ«WFñˆ‚%’≤&÷WFÜˆB%◊’–¢76ñvÊVBÊVÊBÜóFV“ê†¢25"ˆgFV‚7F'G2fW'í6Ü˜'Bv˜&G2fWr÷ñ∆∆ó6V6ˆÊG2&Vf˜&RFñ&ó¶Fñˆ‚‡¢2&V6˜fW"FÜV“g&ˆ“FÜRñ÷÷VFñFV«íF¶6VÁB¬VÊ÷&ñwV˜W27V∂W"6ˆÁFWáB‡¢f˜"ñÊFWÇ¬v˜&Bñ‚VÁV÷W&FRÜ76ñvÊVBì†¢ñbv˜&E≤'7V∂W"%“ó2Ê˜BÊˆÊR˜"f∆ˆBáv˜&E≤&VÊB%“í“f∆ˆBáv˜&E≤'7F'B%“í‚„3S†¢6ˆÁFñÁVP¢&Wfñ˜W2“ÊWáBÇÜ76ñvÊVE∂ï“f˜"íñ‚&ÊvRÜñÊFWÇ“¬”¬”íñb76ñvÊVE∂ï’≤'7V∂W"%“ó2Ê˜BÊˆÊRí¬ÊˆÊRê¢fˆ∆∆˜vñÊr“ÊWáBÇÜ76ñvÊVE∂ï“f˜"íñ‚&ÊvRÜñÊFWÇ≤¬∆V‚Ü76ñvÊVBííñb76ñvÊVE∂ï’≤'7V∂W"%“ó2Ê˜BÊˆÊRí¬ÊˆÊRê¢6ÊFñFFW2“µ–¢ñb&Wfñ˜W2ó2Ê˜BÊˆÊS†¢6ÊFñFFW2ÊVÊBÇÜ÷ÇÉ„¬f∆ˆBáv˜&E≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“íí¬&Wfñ˜W5≤'7V∂W"%“íê¢ñbfˆ∆∆˜vñÊró2Ê˜BÊˆÊS†¢6ÊFñFFW2ÊVÊBÇÜ÷ÇÉ„¬f∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBáv˜&E≤&VÊB%“íí¬fˆ∆∆˜vñÊu≤'7V∂W"%“íê¢6ÊFñFFW2Á6˜'BÇê¢ñb6ÊFñFFW2ÊB6ÊFñFFW5≥’≥“√“f∆ˆBÜ6frÊvWBÇ'v˜&Eˆ&˜VÊF'ïˆ6ˆÁFWáE˜6V6ˆÊG2"¬„Bíì†¢ÊV&W7B“6ÊFñFFW5≥’≥–¢ñb∆V‚Ü6ÊFñFFW2í”“˜"6ÊFñFFW5≥’≥“”“ÊV&W7B˜"6ÊFñFFW5≥’≥“≤„"¬6ÊFñFFW5≥’≥”†¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬ÊV&W7B¬&6ˆÁFWáEˆÊV&W7B"¬„sR¬&÷VFóV“"ê¢v˜&E≤&f∆w2%““6˜'FVBá6WBáv˜&E≤&f∆w2%“≤≤'7V∂W%ˆ6ˆÁFWáB%“íê¢v˜&E≤'7V∂W%ˆñÊfW'&VEˆg&ˆ’ˆ6ˆÁFWáB%““G'VP†¢2'&ñFvR6Ü˜'B÷&ñwV˜W26WVVÊ6W2vÜV‚FÜR6÷R6ˆÊfñFVÁF«í76ñvÊV@¢27V∂W"6ˆÁFñÁVW2ˆ‚&˜FÇ6ñFW2‚Fñ&ó¶Fñˆ‚ÊB5"&˜VÊF&ñW2ˆgFV‡¢2Fó6w&VR6∆ñváF«í¬W7V6ñ∆«ívÜW&Rfˆñ6W2˜fW&∆‡¢ñÊFWÇ“ ¢vÜñ∆RñÊFWÇ¬∆V‚Ü76ñvÊVBì†¢ñb76ñvÊVE∂ñÊFWÖ’≤'7V∂W"%“ó2Ê˜BÊˆÊS†¢ñÊFWÇ≥“¢6ˆÁFñÁVP¢7F'EˆñÊFWÇ“ñÊFWÄ¢vÜñ∆RñÊFWÇ¬∆V‚Ü76ñvÊVBíÊB76ñvÊVE∂ñÊFWÖ’≤'7V∂W"%“ó2ÊˆÊS†¢ñÊFWÇ≥“¢VÊEˆñÊFWÇ“ñÊFWÄ¢&Wfñ˜W2“76ñvÊVE∑7F'EˆñÊFWÇ““ñb7F'EˆñÊFWÇ‚V«6RÊˆÊP¢fˆ∆∆˜vñÊr“76ñvÊVE∂VÊEˆñÊFWÖ“ñbVÊEˆñÊFWÇ¬∆V‚Ü76ñvÊVBíV«6RÊˆÊP¢ñb&Wfñ˜W2ó2ÊˆÊR˜"fˆ∆∆˜vñÊró2ÊˆÊR˜"&Wfñ˜W5≤'7V∂W"%““fˆ∆∆˜vñÊu≤'7V∂W"%”†¢6ˆÁFñÁVP¢6WVVÊ6R“76ñvÊVE∑7F'EˆñÊFWÉ¶VÊEˆñÊFWÖ–¢6WVVÊ6UˆGW&Fñˆ‚“f∆ˆBá6WVVÊ6U≤”’≤&VÊB%“í“f∆ˆBá6WVVÊ6U≥’≤'7F'B%“ê¢∆VgEˆv“÷ÇÉ„¬f∆ˆBá6WVVÊ6U≥’≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“íê¢&ñváEˆv“÷ÇÉ„¬f∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBá6WVVÊ6U≤”’≤&VÊB%“íê¢'&ñFvUˆv“÷ñ‚É„Ç¬f∆ˆBÜ6frÊvWBÇ'WGFW&Ê6Uˆv˜6V6ˆÊG2"¬„"ííê¢ñb∆V‚á6WVVÊ6Rí√“RÊB6WVVÊ6UˆGW&Fñˆ‚√“"„ÊB∆VgEˆv√“'&ñFvUˆvÊB&ñváEˆv√“'&ñFvUˆv†¢f˜"v˜&Bñ‚6WVVÊ6S†¢66˜&R“÷ÇÉ„cR¬÷ñ‚É„Ç¬f∆ˆBáv˜&E≤'7V∂W%ˆ6ˆÊfñFVÊ6R%“ííê¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬&Wfñ˜W5≤'7V∂W"%“¬&6ˆÁFWáEˆ'&ñFvR"¬66˜&R¬&÷VFóV“"ê¢v˜&E≤&f∆w2%““6˜'FVBá6WBáv˜&E≤&f∆w2%“≤≤'7V∂W%ˆ6ˆÁFWáB%“íê¢v˜&E≤'7V∂W%ˆñÊfW'&VEˆg&ˆ’ˆ6ˆÁFWáB%““G'VP¢&WGW&‚76ñvÊV@††¶FVbá&6U˜VÊóG2áv˜&G2¬6frì†¢""%7∆óB5"v˜&G2ñÁFÚ6Ü˜'B∆ñÊwVó7Fñ2VÊóG27VóF&∆Rf˜"fˆñ6RîB‚"" ¢VÊóG2“µ–¢7W'&VÁB“µ–¢÷ÖˆGW&Fñˆ‚“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ÷Ö˜á&6U˜6V6ˆÊG2"¬„íê¢W6R“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜á&6Uˆv˜6V6ˆÊG2"¬„cRíê¢FW&÷ñÊ¬“Ç"‚"¬#Ú"¬""¬.(
+b"ê¢f˜"ñÊFWÇ¬v˜&Bñ‚VÁV÷W&FRáv˜&G2ì†¢ñb7W'&VÁC†¢&Wfñ˜W2“7W'&VÁE≤”’≥–¢v“÷ÇÉ„¬f∆ˆBáv˜&E≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“íê¢&Wfñ˜W5˜FWáB“7G"á&Wfñ˜W2ÊvWBÇ'FWáB"¬""ííÁ'7G&óÇr%¬|+æ(	“ï◊“rê¢Fˆıˆ∆ˆÊr“f∆ˆBáv˜&E≤&VÊB%“í“f∆ˆBÜ7W'&VÁE≥’≥’≤'7F'B%“í‚÷ÖˆGW&Fñˆ‡¢ñbv„“W6R˜"&Wfñ˜W5˜FWáBÊVÊG7vóFÇáFW&÷ñÊ¬í˜"Fˆıˆ∆ˆÊs†¢VÊóG2ÊVÊBÜ7W'&VÁBê¢7W'&VÁB“µ–¢7W'&VÁBÊVÊBÇÜñÊFWÇ¬v˜&Bíê¢ñb7W'&VÁC†¢VÊóG2ÊVÊBÜ7W'&VÁBê¢&WGW&‚VÊóG0††¶FVb6∆W6U˜VÊóG2áv˜&G2¬6frì†¢""$¶ˆñ‚W6R◊7∆óB5"VÊóG2vÜñ∆RVÊ7GVFñˆ‚6ó2FÜR6∆W6R6ˆÁFñÁVW2‚"" ¢6∆W6W2“µ–¢6ˆÁFñÁVFñˆÂˆv“f∆ˆBÜ6frÊvWBÇ&6∆W6Uˆ6ˆÜW&VÊ6Uˆv˜6V6ˆÊG2"¬"„Ríê¢f˜"VÊóBñ‚á&6U˜VÊóG2áv˜&G2¬6frì†¢ñb6∆W6W3†¢&Wfñ˜W5˜v˜&B“6∆W6W5≤”’≤”’≥–¢7W'&VÁE˜v˜&B“VÊóE≥’≥–¢v“f∆ˆBÜ7W'&VÁE˜v˜&E≤'7F'B%“í“f∆ˆBá&Wfñ˜W5˜v˜&E≤&VÊB%“ê¢&Wfñ˜W5˜FWáB“7G"á&Wfñ˜W5˜v˜&BÊvWBÇ'FWáB"¬""ííÁ'7G&óÇê¢ñbv√“6ˆÁFñÁVFñˆÂˆvÊBÊ˜B&Wfñ˜W5˜FWáBÊVÊG7vóFÇÇÇ"‚"¬#Ú"¬""¬.(
+b"íì†¢6∆W6W5≤”“ÊWáFVÊBáVÊóBê¢6ˆÁFñÁVP¢6∆W6W2ÊVÊBÜ∆ó7BáVÊóBíê¢&WGW&‚6∆W6W0††¶FVb«ïˆFˆ÷ñÂ˜fˆ6'V∆'íáv˜&G2¬6frì†¢""$«íWá∆ñ6óB¬VÊ7GVFñˆ‚◊&W6W'fñÊrv˜&BÊBá&6R6˜'&V7FñˆÁ2‚"" ¢fˆ6'V∆'í“∆ˆEˆß6ˆ‚ÖdÙ4%Tƒ%ïıDÇíñbdÙ4%Tƒ%ïıDÇÊó5ˆfñ∆RÇíV«6R∑–¢&W∆6V÷VÁG2“∞¢7G"á6˜W&6RíÊ66Vfˆ∆BÇì¢7G"áF&vWBê¢f˜"6˜W&6R¬F&vWBñ‚∞¢¢ßfˆ6'V∆'íÊvWBÇ'&W∆6V÷VÁG2"¬∑“í¿¢¢¶6frÊvWBÇ&Fˆ÷ñÂ˜fˆ6'V∆'í"¬∑“í¿¢“ÊóFV◊2Çê¢–¢á&6W2“∞¢GW∆Rá7G"á6˜W&6RíÊ66Vfˆ∆BÇíÁ7∆óBÇíì¢7G"áF&vWBê¢f˜"6˜W&6R¬F&vWBñ‚fˆ6'V∆'íÊvWBÇ'á&6W2"¬∑“íÊóFV◊2Çê¢–¢6˜'&V7FVB“µ–¢Fˆ∂VÂ˜GFW&‚“&RÊ6ˆ◊ñ∆Rá"%‚ÖµÂ«t“¢íÇ‚£ÚíÖµÂ«u“¢íB"¬&RÂT‰î4ÙDRê¢'6VB“µ–¢f˜"v˜&Bñ‚v˜&G3†¢÷F6Ç“Fˆ∂VÂ˜GFW&‚Ê÷F6Çá7G"áv˜&BÊvWBÇ'FWáB"¬""ííê¢'6VBÊVÊBÜ÷F6ÇÊw&˜W2Çíñb÷F6ÇV«6RÇ""¬7G"áv˜&BÊvWBÇ'FWáB"¬""íí¬""íê¢á&6Uˆ∆VÊwFá2“6˜'FVBá∂∆V‚Ü∂Wííf˜"∂Wíñ‚á&6W7“¬&WfW'6S’G'VRê¢ñÊFWÇ“ ¢vÜñ∆RñÊFWÇ¬∆V‚áv˜&G2ì†¢á&6Uˆ÷F6Ç“ÊˆÊP¢f˜"∆VÊwFÇñ‚á&6Uˆ∆VÊwFá3†¢ñbñÊFWÇ≤∆VÊwFÇ‚∆V‚áv˜&G2ì†¢6ˆÁFñÁVP¢∂Wí“GW∆Rá'6VE∑˜6óFñˆÂ’≥“Ê66Vfˆ∆BÇíf˜"˜6óFñˆ‚ñ‚&ÊvRÜñÊFWÇ¬ñÊFWÇ≤∆VÊwFÇíê¢ñb∂Wíñ‚á&6W3†¢á&6Uˆ÷F6Ç“Ü∆VÊwFÇ¬á&6W5∂∂Wï“ê¢'&V∞¢ñbá&6Uˆ÷F6É†¢∆VÊwFÇ¬6ÊˆÊñ6¬“á&6Uˆ÷F6Ä¢˜&ñvñÊ«2“∑7G"áv˜&G5∑˜6óFñˆÂ“ÊvWBÇ'FWáB"¬""ííf˜"˜6óFñˆ‚ñ‚&ÊvRÜñÊFWÇ¬ñÊFWÇ≤∆VÊwFÇï–¢óFV““Fñ7Báv˜&G5∂ñÊFWÖ“ê¢óFV’≤&VÊB%““v˜&G5∂ñÊFWÇ≤∆VÊwFÇ“’≤&VÊB%–¢óFV’≤'FWáB%““'6VE∂ñÊFWÖ’≥“≤6ÊˆÊñ6¬≤'6VE∂ñÊFWÇ≤∆VÊwFÇ“’≥%–¢óFV’≤&7%˜FWáB%““""Ê¶ˆñ‚Ü˜&ñvñÊ«2ê¢óFV’≤'6˜W&6U˜v˜&EˆñG2%““∑v˜&G5∑˜6óFñˆÂ’≤'v˜&EˆñB%“f˜"˜6óFñˆ‚ñ‚&ÊvRÜñÊFWÇ¬ñÊFWÇ≤∆VÊwFÇï–¢óFV’≤'fˆ6'V∆'ïˆ6˜'&V7FVB%““G'VP¢6˜'&V7FVBÊVÊBÜóFV“ê¢ñÊFWÇ≥“∆VÊwFÄ¢6ˆÁFñÁVP¢v˜&B“v˜&G5∂ñÊFWÖ–¢óFV““Fñ7Báv˜&Bê¢FWáB“7G"ÜóFV“ÊvWBÇ'FWáB"¬""íê¢∆VFñÊr¬Fˆ∂V‚¬G&ñ∆ñÊr“'6VE∂ñÊFWÖ–¢6ÊˆÊñ6¬“&W∆6V÷VÁG2ÊvWBáFˆ∂V‚Ê66Vfˆ∆BÇíê¢ñb6ÊˆÊñ6¬ó2Ê˜BÊˆÊS†¢óFV’≤'FWáB%““∆VFñÊr≤6ÊˆÊñ6¬≤G&ñ∆ñÊp¢óFV’≤&7%˜FWáB%““FWá@¢óFV’≤'fˆ6'V∆'ïˆ6˜'&V7FVB%““G'VP¢6˜'&V7FVBÊVÊBÜóFV“ê¢ñÊFWÇ≥“¢&WGW&‚6˜'&V7FV@††¶FVbñFVÁFóGï˜VÊóG2Ü7%˜v˜&G2¬Fñ&ó¶Fñˆ‚¬6frì†¢""$'Vñ∆Bn(	3"6V6ˆÊBfˆñ6R‘îBvñÊF˜w2vóFÜ˜WB7&˜76ñÊrFñ&ó¶VB7V∂W"6ÜÊvR‚"" ¢76ñvÊVB“76ñvÂ˜7V∂W'2Ü7%˜v˜&G2¬Fñ&ó¶Fñˆ‚ÊvWBÇ&ñÁFW'f«2"¬µ“í¬6frê¢&6R“µ–¢f˜"VÊóBñ‚á&6U˜VÊóG2Ü76ñvÊVB¬6frì†¢vVñváG2“∑–¢f˜"Ú¬v˜&Bñ‚VÊóC†¢7V∂W"“v˜&BÊvWBÇ'7V∂W""ê¢ñb7V∂W"ó2ÊˆÊS†¢6ˆÁFñÁVP¢vVñváG5∑7V∂W%““vVñváG2ÊvWBá7V∂W"¬„í≤÷ÇÉ„B¬f∆ˆBáv˜&E≤&VÊB%“í“f∆ˆBáv˜&E≤'7F'B%“íê¢7V∂W"“÷ÇávVñváG2¬∂Wì◊vVñváG2ÊvWBíñbvVñváG2V«6RÊˆÊP¢&6RÊVÊBá≤'7V∂W"#¢7V∂W"¬'v˜&G2#¢VÊóG“ê†¢÷W&vVB“µ–¢÷ÖˆGW&Fñˆ‚“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ÷Ö˜vñÊF˜u˜6V6ˆÊG2"¬"„íê¢÷W&vUˆv“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ÷W&vUˆv˜6V6ˆÊG2"¬„Ríê¢f˜"óFV“ñ‚&6S†¢ñb÷W&vVC†¢&Wfñ˜W2“÷W&vVE≤”–¢7F'B“f∆ˆBá&Wfñ˜W5≤'v˜&G2%’≥’≥’≤'7F'B%“ê¢v“÷ÇÉ„¬f∆ˆBÜóFV’≤'v˜&G2%’≥’≥’≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤'v˜&G2%’≤”’≥’≤&VÊB%“íê¢6ˆ÷&ñÊVB“f∆ˆBÜóFV’≤'v˜&G2%’≤”’≥’≤&VÊB%“í“7F'@¢ñbóFV’≤'7V∂W"%“ó2Ê˜BÊˆÊRÊBóFV’≤'7V∂W"%“”“&Wfñ˜W5≤'7V∂W"%“ÊBv√“÷W&vUˆvÊB6ˆ÷&ñÊVB√“÷ÖˆGW&Fñˆ„†¢&Wfñ˜W5≤'v˜&G2%“ÊWáFVÊBÜóFV’≤'v˜&G2%“ê¢6ˆÁFñÁVP¢÷W&vVBÊVÊBÜóFV“ê¢&WGW&‚∂óFV’≤'v˜&G2%“f˜"óFV“ñ‚÷W&vVE–††¶FVb«ï˜fˆñ6U˜6Vv÷VÁG2áv˜&G2¬fˆñ6U˜6Vv÷VÁG2ì†¢ñbÊ˜Bfˆñ6U˜6Vv÷VÁG3†¢&WGW&‚v˜&G0¢f˜"v˜&Bñ‚v˜&G3†¢7F'B¬VÊB“f∆ˆBáv˜&E≤'7F'B%“í¬f∆ˆBáv˜&E≤&VÊB%“ê¢GW&Fñˆ‚“÷ÇÉ„B¬VÊB“7F'Bê¢&Ê∂VB“6˜'FVBÄ¢ÇÜ˜fW&∆á7F'B¬VÊB¬6Vv÷VÁE≤'7F'B%“¬6Vv÷VÁE≤&VÊB%“í¬6Vv÷VÁBíf˜"6Vv÷VÁBñ‚fˆñ6U˜6Vv÷VÁG2í¿¢∂Wì÷∆÷&FóFV”¢óFV’≥“¿¢&WfW'6S’G'VR¿¢ê¢ñbÊ˜B&Ê∂VB˜"&Ê∂VE≥’≥“ÚGW&Fñˆ‚¬„SS†¢6ˆÁFñÁVP¢6Vv÷VÁB“&Ê∂VE≥’≥–¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬'&ˆfñ∆S¢"≤6Vv÷VÁE≤'&ˆfñ∆UˆñB%“¬'&VFñ÷ÊWE˜á&6R"¬6Vv÷VÁE≤'66˜&R%“¬&∆˜r"ê¢v˜&E≤&f∆w2%““∆ó7Báv˜&BÊvWBÇ&f∆w2"¬µ“íê¢ñb'fˆñ6U˜&ˆfñ∆R"Ê˜Bñ‚v˜&E≤&f∆w2%”†¢v˜&E≤&f∆w2%“ÊVÊBÇ'fˆñ6U˜&ˆfñ∆R"ê¢&WGW&‚v˜&G0††¶FVb6÷ˆ˜FÖ˜á&6U˜7V∂W'2áv˜&G2¬6frì†¢""%&V÷˜fR6Ü˜'B7V∂W"ó6∆ÊG2ñÁ6ñFRˆÊR5"á&6RvóFÜ˜WBÜñFñÊr&V¬GW&Á2‚"" ¢÷Öˆó6∆ÊB“f∆ˆBÜ6frÊvWBÇ'7V∂W%ˆó6∆ÊEˆ÷Ö˜6V6ˆÊG2"¬"„"íê¢Fˆ÷ñÊÊ6R“f∆ˆBÜ6frÊvWBÇ'7V∂W%˜á&6UˆFˆ÷ñÊÊ6R"¬„cÇíê¢f˜"VÊóBñ‚á&6U˜VÊóG2áv˜&G2¬6frì†¢ñb∆V‚áVÊóBí¬#†¢6ˆÁFñÁVP¢vVñváG2“∑–¢f˜"Ú¬v˜&Bñ‚VÊóC†¢ñbv˜&BÊvWBÇ'7V∂W""íó2ÊˆÊS†¢6ˆÁFñÁVP¢GW&Fñˆ‚“÷ÇÉ„B¬f∆ˆBáv˜&E≤&VÊB%“í“f∆ˆBáv˜&E≤'7F'B%“íê¢vVñváG5∑v˜&E≤'7V∂W"%’““vVñváG2ÊvWBáv˜&E≤'7V∂W"%“¬„í≤GW&Fñˆ‡¢ñbÊ˜BvVñváG3†¢6ˆÁFñÁVP¢&Ê∂VB“6˜'FVBávVñváG2ÊóFV◊2Çí¬∂Wì÷∆÷&FóFV”¢óFV’≥“¬&WfW'6S’G'VRê¢Fˆ÷ñÊÁB¬Fˆ÷ñÊÁE˜vVñváB“&Ê∂VE≥–¢Fˆ÷ñÊÁE˜&FñÚ“Fˆ÷ñÊÁE˜vVñváBÚ÷ÇÉ„B¬7V“ávVñváG2Áf«VW2Çííê¢ñbFˆ÷ñÊÁE˜&FñÚ¬f∆ˆBÜ6frÊvWBÇ'7V∂W%˜á&6Uˆ∆˜uˆ6ˆÊfñFVÊ6UˆFˆ÷ñÊÊ6R"¬„SRíì†¢6ˆÁFñÁVP¢˜6óFñˆ‚“ ¢vÜñ∆R˜6óFñˆ‚¬∆V‚áVÊóBì†¢ñbVÊóE∑˜6óFñˆÂ’≥“ÊvWBÇ'7V∂W""í”“Fˆ÷ñÊÁC†¢˜6óFñˆ‚≥“¢6ˆÁFñÁVP¢7F'B“˜6óFñˆ‡¢vÜñ∆R˜6óFñˆ‚¬∆V‚áVÊóBíÊBVÊóE∑˜6óFñˆÂ’≥“ÊvWBÇ'7V∂W""í“Fˆ÷ñÊÁC†¢˜6óFñˆ‚≥“¢ó6∆ÊB“VÊóE∑7F'Cß˜6óFñˆÂ–¢ó6∆ÊEˆGW&Fñˆ‚“f∆ˆBÜó6∆ÊE≤”’≥’≤&VÊB%“í“f∆ˆBÜó6∆ÊE≥’≥’≤'7F'B%“ê¢∆˜uˆWfñFVÊ6R“∆¬Ç&∆˜uˆ6ˆÊfñFVÊ6R"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“íf˜"Ú¬v˜&Bñ‚ó6∆ÊBê¢2Fó&V7B&TFñ‘ÊWBá&6RñFVÁFóGíó27G&ˆÊvW"WfñFVÊ6RFÜ‚FÜP¢2GW&Fñˆ‚÷÷¶˜&óGíÜWW&ó7Fñ2W6VB'íFÜó26∆VÁW72‡¢ñbÁíÇ'fˆñ6U˜&ˆfñ∆R"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“íf˜"Ú¬v˜&Bñ‚ó6∆ÊBì†¢6ˆÁFñÁVP¢ñbó6∆ÊEˆGW&Fñˆ‚‚÷Öˆó6∆ÊB˜"ÜFˆ÷ñÊÁE˜&FñÚ¬Fˆ÷ñÊÊ6RÊBÊ˜B∆˜uˆWfñFVÊ6Rì†¢6ˆÁFñÁVP¢f˜"Ú¬v˜&Bñ‚ó6∆ÊC†¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬Fˆ÷ñÊÁB¬'á&6U˜6÷ˆ˜FÜñÊr"¬÷ÇÉ„r¬f∆ˆBáv˜&BÊvWBÇ'7V∂W%ˆ6ˆÊfñFVÊ6R"¬ííí¬&÷VFóV“"ê¢v˜&E≤&f∆w2%““∆ó7Báv˜&BÊvWBÇ&f∆w2"¬µ“íê¢ñb'7V∂W%˜6÷ˆ˜FÜVB"Ê˜Bñ‚v˜&E≤&f∆w2%”†¢v˜&E≤&f∆w2%“ÊVÊBÇ'7V∂W%˜6÷ˆ˜FÜVB"ê¢&WGW&‚v˜&G0††¶FVb6ˆÜW&Uˆ6∆W6U˜7V∂W'2áv˜&G2¬6frì†¢""%&V÷˜fRˆÊ«ívV≤7V∂W"ó6∆ÊG2ñÁ6ñFR6ˆÁFñÁV˜W25"6∆W6R‡†¢VÊ7GVFñˆ‚ó2Ê˜B6˜W7Fñ2WfñFVÊ6R‚ñ‚'Fñ7V∆"‚VÊfñÊó6ÜVBá&6P¢÷í&RñÁFW''WFVB'íÊ˜FÜW"W'6ˆ‚¬6ÚFÜó272◊W7BÊWfW"˜fW'w&óFR¢7W˜'FVBñFVÁFóGí÷W&V«í&V6W6RFÜRFWáB∆ˆˆ∑27ñÁF7Fñ6∆«í6ˆÁFñÁV˜W2‡¢"" ¢ñbÊ˜Bv˜&G3†¢&WGW&‚v˜&G0¢vˆ∆ñ÷óB“f∆ˆBÜ6frÊvWBÇ&6∆W6Uˆ6ˆÜW&VÊ6Uˆv˜6V6ˆÊG2"¬"„Ríê¢6Ü˜'Eˆ∆ñ÷óB“f∆ˆBÜ6frÊvWBÇ&6∆W6Uˆ6ˆÜW&VÊ6U˜6Ü˜'E˜6V6ˆÊG2"¬2„íê¢f˜"6∆W6Rñ‚6∆W6U˜VÊóG2áv˜&G2¬6frì†¢'VÁ2“µ–¢f˜"ñÊFWÇ¬v˜&Bñ‚6∆W6S†¢ñbÊ˜B'VÁ2˜"'VÁ5≤”’≤'7V∂W"%““v˜&BÊvWBÇ'7V∂W""ì†¢'VÁ2ÊVÊBá≤'7V∂W"#¢v˜&BÊvWBÇ'7V∂W""í¬&óFV◊2#¢≤ÜñÊFWÇ¬v˜&Bï◊“ê¢V«6S†¢'VÁ5≤”’≤&óFV◊2%“ÊVÊBÇÜñÊFWÇ¬v˜&Bíê¢f˜"∆VgB¬&ñváBñ‚¶óá'VÁ2¬'VÁ5≥•“ì†¢ñb∆VgE≤'7V∂W"%“ó2ÊˆÊR˜"&ñváE≤'7V∂W"%“ó2ÊˆÊR˜"∆VgE≤'7V∂W"%“”“&ñváE≤'7V∂W"%”†¢6ˆÁFñÁVP¢∆VgEˆfó'7B¬∆VgEˆ∆7B“∆VgE≤&óFV◊2%’≥’≥“¬∆VgE≤&óFV◊2%’≤”’≥–¢&ñváEˆfó'7B¬&ñváEˆ∆7B“&ñváE≤&óFV◊2%’≥’≥“¬&ñváE≤&óFV◊2%’≤”’≥–¢ñbf∆ˆBá&ñváEˆfó'7E≤'7F'B%“í“f∆ˆBÜ∆VgEˆ∆7E≤&VÊB%“í‚vˆ∆ñ÷óC†¢6ˆÁFñÁVP¢∆VgEˆGW&Fñˆ‚“f∆ˆBÜ∆VgEˆ∆7E≤&VÊB%“í“f∆ˆBÜ∆VgEˆfó'7E≤'7F'B%“ê¢&ñváEˆGW&Fñˆ‚“f∆ˆBá&ñváEˆ∆7E≤&VÊB%“í“f∆ˆBá&ñváEˆfó'7E≤'7F'B%“ê¢ñb÷ñ‚Ü∆VgEˆGW&Fñˆ‚¬&ñváEˆGW&Fñˆ‚í‚6Ü˜'Eˆ∆ñ÷óC†¢6ˆÁFñÁVP¢Fˆ÷ñÊÁB¬vV∂W"“Ü∆VgB¬&ñváBíñb∆VgEˆGW&Fñˆ‚„“&ñváEˆGW&Fñˆ‚V«6Rá&ñváB¬∆VgBê¢vVµ˜v˜&G2“∑v˜&Bf˜"Ú¬v˜&Bñ‚vV∂W%≤&óFV◊2%’–¢vVµˆWfñFVÊ6R“∆¬Ä¢&∆˜uˆ6ˆÊfñFVÊ6R"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“ê¢˜"&÷&ñwV˜W2"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“ê¢˜"v˜&BÊvWBÇ'7V∂W""íó2ÊˆÊP¢f˜"v˜&Bñ‚vVµ˜v˜&G0¢ê¢&˜VÊF'ïˆv“÷ÇÉ„¬f∆ˆBá&ñváEˆfó'7E≤'7F'B%“í“f∆ˆBÜ∆VgEˆ∆7E≤&VÊB%“íê¢6ˆÁFñÁVFñˆÂ˜FWáB“ÊWáBÇÄ¢7G"áv˜&BÊvWBÇ'FWáB"¬""ííÊ«7G&óÇ.(	N(	2“*µ¬"rÇ"ê¢f˜"Ú¬v˜&Bñ‚Fˆ÷ñÊÁE≤&óFV◊2%–¢ñb7G"áv˜&BÊvWBÇ'FWáB"¬""ííÊ«7G&óÇ.(	N(	2“*µ¬"rÇ"ê¢í¬""ê¢6ˆÁFñÁVFñˆÂ˜vóFÜ˜WE˜fˆñ6UˆÊ6Ü˜"“Ä¢vV∂W"ó2∆Vg@¢ÊB∆VgEˆGW&Fñˆ‚√“f∆ˆBÜ6frÊvWBÇ&6∆W6U˜VÊÊ6Ü˜&VE˜&VfóÖˆ÷Ö˜6V6ˆÊG2"¬„Ríê¢ÊBÊ˜BÁíÇ'fˆñ6U˜&ˆfñ∆R"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“íf˜"v˜&Bñ‚vVµ˜v˜&G2ê¢ÊBÁíÇ'fˆñ6U˜&ˆfñ∆R"ñ‚v˜&BÊvWBÇ&f∆w2"¬µ“íf˜"Ú¬v˜&Bñ‚Fˆ÷ñÊÁE≤&óFV◊2%“ê¢ÊB6ˆÁFñÁVFñˆÂ˜FWáE≥£“Êó6∆˜vW"Çê¢ÊB&˜VÊF'ïˆv√“f∆ˆBÜ6frÊvWBÇ&6∆W6U˜VÊÊ6Ü˜&VE˜&VfóÖˆv˜6V6ˆÊG2"¬"„íê¢ê¢2∂Ê˜v‚fˆñ6Rˆ‚V6Ç6ñFRó2&V¬6˜W7Fñ2&˜VÊF'íVÊ∆W72FÜP¢26Ü˜'FW"6ñFRv2Wá∆ñ6óF«í÷&∂VBvV≤ÊBFÜR&˜VÊF'íó2FñváB‡¢&˜FÖˆ∂Ê˜v‚“∆¬á7G"á'V‚ÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"íf˜"'V‚ñ‚Ü∆VgB¬&ñváBíê¢ñbÜ&˜FÖˆ∂Ê˜v‚ÊBÊ˜B6ˆÁFñÁVFñˆÂ˜vóFÜ˜WE˜fˆñ6UˆÊ6Ü˜ ¢ÊBÜÊ˜BvVµˆWfñFVÊ6R˜"&˜VÊF'ïˆv‚f∆ˆBÜ6frÊvWBÇ&6∆W6Uˆ6ˆÜW&VÊ6Uˆ6˜W7Fñ5ˆv˜6V6ˆÊG2"¬„3Ríííì†¢6ˆÁFñÁVP¢f˜"Ú¬v˜&Bñ‚vV∂W%≤&óFV◊2%”†¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬Fˆ÷ñÊÁE≤'7V∂W"%“¬&6∆W6Uˆ6ˆÜW&VÊ6R"¬÷ÇÉ„s"¬f∆ˆBáv˜&BÊvWBÇ'7V∂W%ˆ6ˆÊfñFVÊ6R"¬ííí¬&ÜñvÇ"ê¢v˜&E≤&f∆w2%““∆ó7Báv˜&BÊvWBÇ&f∆w2"¬µ“íê¢ñb&6∆W6Uˆ6ˆÜW&VÊ6R"Ê˜Bñ‚v˜&E≤&f∆w2%”†¢v˜&E≤&f∆w2%“ÊVÊBÇ&6∆W6Uˆ6ˆÜW&VÊ6R"ê¢&WGW&‚v˜&G0††¶FVb'&ñFvU˜6Ü˜'E˜&ˆfñ∆U˜á&6W2áv˜&G2¬6frì†¢""$GF6ÇfW'í6Ü˜'B6VÁFVÊ6RFÚ‚F¶6VÁB¬fW&ñfñVBfˆñ6RñFVÁFóGí‚"" ¢÷Üñ◊V““f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ6ˆÁFWáEˆ÷Ö˜6V6ˆÊG2"¬"„íê¢vˆ∆ñ÷óB“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ6ˆÁFWáEˆv˜6V6ˆÊG2"¬„2íê¢2fó'7B&Wó"6ñÊv∆R&˜VÊF'íFˆ∂VÁ2WfV‚vÜV‚FÜR7W'&˜VÊFñÊr5"á&6P¢26ˆÁFñÁ2&V¬7V∂W"6ÜÊvRÊBFÜW&Vf˜&R6ÊÊ˜B&R6÷ˆ˜FÜVBvÜˆ∆R‡¢f˜"ñÊFWÇ¬v˜&Bñ‚VÁV÷W&FRáv˜&G2ì†¢ñbv˜&BÊvWBÇ'7V∂W""íó2Ê˜BÊˆÊR˜"f∆ˆBáv˜&E≤&VÊB%“í“f∆ˆBáv˜&E≤'7F'B%“í‚„†¢6ˆÁFñÁVP¢&Wfñ˜W2“v˜&G5∂ñÊFWÇ““ñbñÊFWÇV«6RÊˆÊP¢fˆ∆∆˜vñÊr“v˜&G5∂ñÊFWÇ≤“ñbñÊFWÇ≤¬∆V‚áv˜&G2íV«6RÊˆÊP¢6Ü˜6V‚“ÊˆÊP¢ñb&Wfñ˜W2ÊBfˆ∆∆˜vñÊrÊB&Wfñ˜W2ÊvWBÇ'7V∂W""í”“fˆ∆∆˜vñÊrÊvWBÇ'7V∂W""íÊB7G"á&Wfñ˜W2ÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"ì†¢ñbf∆ˆBáv˜&E≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“í√“B„ÊBf∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBáv˜&E≤&VÊB%“í√“B„†¢6Ü˜6V‚“&Wfñ˜W5≤'7V∂W"%–¢ñb6Ü˜6V‚ó2ÊˆÊRÊB&Wfñ˜W2ÊB7G"á&Wfñ˜W2ÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"íÊB7G"áv˜&BÊvWBÇ'FWáB"¬""ííÁ'7G&óÇíÊVÊG7vóFÇÇÇ"‚"¬"¬"¬#¢"¬#≤"¬#Ú"¬""íì†¢ñbf∆ˆBáv˜&E≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“í√“"„†¢6Ü˜6V‚“&Wfñ˜W5≤'7V∂W"%–¢ñb6Ü˜6V‚ó2ÊˆÊRÊBfˆ∆∆˜vñÊrÊB7G"Üfˆ∆∆˜vñÊrÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"íÊB7G"Üfˆ∆∆˜vñÊrÊvWBÇ'FWáB"¬""íï≥£“Êó6∆˜vW"Çì†¢ñbf∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBáv˜&E≤&VÊB%“í√“„S†¢6Ü˜6V‚“fˆ∆∆˜vñÊu≤'7V∂W"%–¢ñb6Ü˜6V„†¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬6Ü˜6V‚¬'&ˆfñ∆Uˆ6ˆÁFWáB"¬÷ÇÉ„r¬f∆ˆBáv˜&BÊvWBÇ'7V∂W%ˆ6ˆÊfñFVÊ6R"¬ííí¬&ÜñvÇ"ê¢v˜&E≤&f∆w2%““6˜'FVBá6WBáv˜&BÊvWBÇ&f∆w2"¬µ“í≤≤'7V∂W%ˆ6ˆÁFWáB%“íê¢f˜"VÊóBñ‚á&6U˜VÊóG2áv˜&G2¬6frì†¢ñbÁíá7G"áv˜&BÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"íf˜"Ú¬v˜&Bñ‚VÊóBì†¢6ˆÁFñÁVP¢7F'EˆñÊFWÇ“VÊóE≥’≥–¢VÊEˆñÊFWÇ“VÊóE≤”’≥–¢GW&Fñˆ‚“f∆ˆBáVÊóE≤”’≥’≤&VÊB%“í“f∆ˆBáVÊóE≥’≥’≤'7F'B%“ê¢ñbGW&Fñˆ‚‚÷Üñ◊V”†¢6ˆÁFñÁVP¢&Wfñ˜W2“v˜&G5∑7F'EˆñÊFWÇ““ñb7F'EˆñÊFWÇ‚V«6RÊˆÊP¢fˆ∆∆˜vñÊr“v˜&G5∂VÊEˆñÊFWÇ≤“ñbVÊEˆñÊFWÇ≤¬∆V‚áv˜&G2íV«6RÊˆÊP¢6ÊFñFFW2“µ–¢ñb&Wfñ˜W2ó2Ê˜BÊˆÊRÊB7G"á&Wfñ˜W2ÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"ì†¢6ÊFñFFW2ÊVÊBÇÜ÷ÇÉ„¬f∆ˆBáVÊóE≥’≥’≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“íí¬&Wfñ˜W5≤'7V∂W"%“íê¢ñbfˆ∆∆˜vñÊró2Ê˜BÊˆÊRÊB7G"Üfˆ∆∆˜vñÊrÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"ì†¢6ÊFñFFW2ÊVÊBÇÜ÷ÇÉ„¬f∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBáVÊóE≤”’≥’≤&VÊB%“íí¬fˆ∆∆˜vñÊu≤'7V∂W"%“íê¢6ÊFñFFW2Á6˜'BÇê¢ñbÊ˜B6ÊFñFFW3†¢6ˆÁFñÁVP¢6Ü˜6V‚“ÊˆÊP¢ñb∆V‚Ü6ÊFñFFW2í‚ÊB6ÊFñFFW5≥’≥“”“6ÊFñFFW5≥’≥“ÊB÷ÇÜ6ÊFñFFW5≥’≥“¬6ÊFñFFW5≥’≥“í√“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜6÷Uˆ6ˆÁFWáEˆv˜6V6ˆÊG2"¬B„íì†¢6Ü˜6V‚“6ÊFñFFW5≥’≥–¢V∆ñb&Wfñ˜W2ó2Ê˜BÊˆÊRÊB7G"á&Wfñ˜W2ÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"ì†¢&Wfñ˜W5ˆv“÷ÇÉ„¬f∆ˆBáVÊóE≥’≥’≤'7F'B%“í“f∆ˆBá&Wfñ˜W5≤&VÊB%“íê¢fñÊ≈˜FWáB“7G"áVÊóE≤”’≥“ÊvWBÇ'FWáB"¬""ííÁ'7G&óÇê¢ñb&Wfñ˜W5ˆv√“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜VÊ7GVFñˆÂˆv˜6V6ˆÊG2"¬"„ííÊBfñÊ≈˜FWáBÊVÊG7vóFÇÇÇ"‚"¬"¬"¬#¢"¬#≤"¬#Ú"¬""íì†¢6Ü˜6V‚“&Wfñ˜W5≤'7V∂W"%–¢ñb6Ü˜6V‚ó2ÊˆÊRÊBfˆ∆∆˜vñÊró2Ê˜BÊˆÊRÊB7G"Üfˆ∆∆˜vñÊrÊvWBÇ'7V∂W""¬""ííÁ7F'G7vóFÇÇ'&ˆfñ∆S¢"ì†¢fˆ∆∆˜vñÊuˆv“÷ÇÉ„¬f∆ˆBÜfˆ∆∆˜vñÊu≤'7F'B%“í“f∆ˆBáVÊóE≤”’≥’≤&VÊB%“íê¢fˆ∆∆˜vñÊu˜FWáB“7G"Üfˆ∆∆˜vñÊrÊvWBÇ'FWáB"¬""íê¢ñbfˆ∆∆˜vñÊuˆv√“÷ÇÜvˆ∆ñ÷óB¬„RíÊBfˆ∆∆˜vñÊu˜FWáE≥£“Êó6∆˜vW"Çì†¢6Ü˜6V‚“fˆ∆∆˜vñÊu≤'7V∂W"%–¢ñb6Ü˜6V‚ó2ÊˆÊRÊB6ÊFñFFW5≥’≥“√“vˆ∆ñ÷óBÊBÜ∆V‚Ü6ÊFñFFW2í”“˜"6ÊFñFFW5≥’≥“”“6ÊFñFFW5≥’≥“˜"6ÊFñFFW5≥’≥“≤„"¬6ÊFñFFW5≥’≥“ì†¢6Ü˜6V‚“6ÊFñFFW5≥’≥–¢ñb6Ü˜6V‚ó2ÊˆÊS†¢6ˆÁFñÁVP¢f˜"Ú¬v˜&Bñ‚VÊóC†¢&V6˜&E˜&W6ˆ«WFñˆ‚áv˜&B¬6Ü˜6V‚¬'&ˆfñ∆U˜á&6Uˆ6ˆÁFWáB"¬÷ÇÉ„s"¬f∆ˆBáv˜&BÊvWBÇ'7V∂W%ˆ6ˆÊfñFVÊ6R"¬ííí¬&ÜñvÇ"ê¢v˜&E≤&f∆w2%““∆ó7Báv˜&BÊvWBÇ&f∆w2"¬µ“íê¢ñb'7V∂W%ˆ6ˆÁFWáB"Ê˜Bñ‚v˜&E≤&f∆w2%”†¢v˜&E≤&f∆w2%“ÊVÊBÇ'7V∂W%ˆ6ˆÁFWáB"ê¢&WGW&‚v˜&G0††¶FVb7V∂W%ˆFó7∆íá7V∂W"¬∆&V«2ì†¢ñb7V∂W"ó2ÊˆÊS†¢&WGW&‚-
+=}-›ç¢›RÌ˝]M]Ω“ ¢&WGW&‚∆&V«2ÊvWBá7V∂W"í˜"-
+˝ç≠]∑“"Êf˜&÷Bá7V∂W"ê††¶FVbGW&ÂˆÊVVG5˜7V∂W%˜&WfñWráGW&‚¬∆&V«2ì†¢""%6Ü˜rTív&ÊñÊrˆÊ«ívÜñ∆RFÜRFó7∆ñVBñFVÁFóGíó2VÁ&W6ˆ«fVB‡†¢6˜W7Fñ2&˜VÊF'íf∆w2&V÷ñ‚fñ∆&∆Rñ‚G&Á67&óBÊß6ˆ‚ÊB&WfñWrÊ77b¿¢'WBFÜWí◊W7BÊ˜B∂VWGW&‚&VBgFW"fˆñ6R&ˆfñ∆R˜"÷ÁV¬∆&V¬Ü0¢&W6ˆ«fVBFÜR7V∂W"‡¢"" ¢7V∂W"“GW&‚ÊvWBÇ'7V∂W""ê¢&WGW&‚7V∂W"ó2ÊˆÊR˜"Ê˜B7G"Ü∆&V«2ÊvWBá7V∂W"¬""ííÁ7G&óÇê††¶FVbWGFW&Ê6W2áv˜&G2¬vì†¢&W7V«B“µ–¢f˜"v˜&Bñ‚v˜&G3†¢&Wfñ˜W5˜FWáB“7G"á&W7V«E≤”’≤'v˜&G2%’≤”“ÊvWBÇ'FWáB"¬""ííÁ'7G&óÇíñb&W7V«BV«6R" ¢FFófUˆv“÷ÇÜv¬f∆ˆBÜ6ˆÊfñrÇíÊvWBÇ'WGFW&Ê6Uˆ6ˆÁFñÁVFñˆÂˆv˜6V6ˆÊG2"¬2„íííñb&W7V«BÊBÊ˜B&Wfñ˜W5˜FWáBÊVÊG7vóFÇÇÇ"‚"¬#Ú"¬""¬.(
+b"ííV«6Rv ¢ñbÊ˜B&W7V«B˜"v˜&E≤'7V∂W"%““&W7V«E≤”’≤'7V∂W"%“˜"v˜&E≤'7F'B%““&W7V«E≤”’≤&VÊB%“‚FFófUˆv†¢&W7V«BÊVÊBá≤'7F'B#¢v˜&E≤'7F'B%“¬&VÊB#¢v˜&E≤&VÊB%“¬'7V∂W"#¢v˜&E≤'7V∂W"%“¬'v˜&G2#¢∑v˜&E◊“ê¢V«6S†¢&W7V«E≤”’≤&VÊB%““v˜&E≤&VÊB%–¢&W7V«E≤”’≤'v˜&G2%“ÊVÊBáv˜&Bê¢f˜"óFV“ñ‚&W7V«C†¢óFV’≤'FWáB%““""Ê¶ˆñ‚áv˜&E≤'FWáB%“f˜"v˜&Bñ‚óFV’≤'v˜&G2%“íÁ7G&óÇê¢óFV’≤&f∆w2%““6˜'FVBá∂f∆rf˜"v˜&Bñ‚óFV’≤'v˜&G2%“f˜"f∆rñ‚v˜&E≤&f∆w2%◊“ê¢óFV’≤'VÊ6W'FñÁGí%““WGFW&Ê6U˜VÊ6W'FñÁGíÜóFV’≤'v˜&G2%“ê¢&WGW&‚&W7V«@††¶FVb7∆óE˜7'BÜóFV◊2¬÷ÖˆGW&Fñˆ„”Ç„¬÷Öˆ6Ü'3”ì"ì†¢&W7V«B“µ–¢f˜"óFV“ñ‚óFV◊3†¢7W'&VÁB“ÊˆÊP¢f˜"v˜&Bñ‚óFV’≤'v˜&G2%”†¢ñb7W'&VÁBó2ÊˆÊR˜"v˜&E≤&VÊB%““7W'&VÁE≤'7F'B%“‚÷ÖˆGW&Fñˆ‚˜"∆V‚Ü7W'&VÁE≤'FWáB%“í≤∆V‚áv˜&E≤'FWáB%“í≤‚÷Öˆ6Ü'3†¢7W'&VÁB“≤'7F'B#¢v˜&E≤'7F'B%“¬&VÊB#¢v˜&E≤&VÊB%“¬'7V∂W"#¢óFV’≤'7V∂W"%“¬'FWáB#¢v˜&E≤'FWáB%◊–¢&W7V«BÊVÊBÜ7W'&VÁBê¢V«6S†¢7W'&VÁE≤&VÊB%““v˜&E≤&VÊB%–¢7W'&VÁE≤'FWáB%“≥“""≤v˜&E≤'FWáB%–¢&WGW&‚&W7V«@††¶FVbWá˜'E˜&W7V«G2Ü¶ˆ"¬GW&Fñˆ‚¬Fñ&ó¶Fñˆ‚¬7"¬˜WGWEˆFó"¬6frì†¢˜WGWEˆFó"Ê÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥’G'VRê¢7V∂W'2“6˜'FVBá∂óFV’≤'7V∂W"%“f˜"óFV“ñ‚Fñ&ó¶FñˆÂ≤&ñÁFW'f«2%◊“ê¢7V∂W%˜FÇ“˜WGWEˆFó"Ú'7V∂W'2Êß6ˆ‚ ¢ñb7V∂W%˜FÇÊWÜó7G2Çì†¢7V∂W%ˆFF“∆ˆEˆß6ˆ‚á7V∂W%˜FÇê¢∆&V«2“7V∂W%ˆFFÊvWBÇ&∆&V«2"¬∑“ê¢V«6S†¢7V∂W%ˆFF“∑–¢∆&V«2“∑–¢7V∂W%ˆFFÁWFFRá≤&∆&V«2#¢∆&V«2¬&fñ∆&∆U˜7V∂W'2#¢7V∂W'2¬&ñÁ7G'V7FñˆÁ2#¢-	}Mù-RçÕÚ"∆&V«2Ç-Ω˝ÌΩ›ç-S¢‚˜óV∆ñÊR&VÊ÷R∆¶ˆ"÷ñC‚'“ê¢w&óFUˆß6ˆ‚á7V∂W%˜FÇ¬7V∂W%ˆFFê†¢&u˜v˜&G2“GF6Ö˜v˜&EˆñG2Ü7%≤'v˜&G2%“ê¢Ê˜&÷∆ó¶VE˜v˜&G2“«ïˆFˆ÷ñÂ˜fˆ6'V∆'íá&u˜v˜&G2¬6frê¢v˜&G2“76ñvÂ˜7V∂W'2ÜÊ˜&÷∆ó¶VE˜v˜&G2¬Fñ&ó¶FñˆÂ≤&ñÁFW'f«2%“¬6frê¢fˆñ6U˜6Vv÷VÁG5˜FÇ“˜WGWEˆFó"Ú'fˆñ6U˜6Vv÷VÁG2Êß6ˆ‚ ¢fˆñ6U˜6Vv÷VÁG2“∆ˆEˆß6ˆ‚áfˆñ6U˜6Vv÷VÁG5˜FÇíÊvWBÇ'6Vv÷VÁG2"¬µ“íñbfˆñ6U˜6Vv÷VÁG5˜FÇÊWÜó7G2ÇíV«6Rµ–¢v˜&G2“«ï˜fˆñ6U˜6Vv÷VÁG2áv˜&G2¬fˆñ6U˜6Vv÷VÁG2ê¢v˜&G2“'&ñFvU˜6Ü˜'E˜&ˆfñ∆U˜á&6W2áv˜&G2¬6frê¢v˜&G2“6÷ˆ˜FÖ˜á&6U˜7V∂W'2áv˜&G2¬6frê¢v˜&G2“6ˆÜW&Uˆ6∆W6U˜7V∂W'2áv˜&G2¬6frê¢GW&Á2“WGFW&Ê6W2áv˜&G2¬6fu≤'WGFW&Ê6Uˆv˜6V6ˆÊG2%“ê¢f˜"v˜&Bñ‚v˜&G3†¢v˜&E≤'VÊ6W'FñÁGí%““v˜&E˜VÊ6W'FñÁGíáv˜&Bê¢ñ∆ˆB“∞¢'66ÜV÷˜fW'6ñˆ‚#¢2¿¢'6˜W&6R#¢¶ˆ%≤&˜&ñvñÊ≈ˆÊ÷R%“¿¢&GW&FñˆÂ˜6V6ˆÊG2#¢&˜VÊBÜGW&Fñˆ‚¬2í¿¢&÷ˆFV«2#¢≤&Fñ&ó¶Fñˆ‚#¢Fñ&ó¶Fñˆ‚ÊvWBÇ&÷ˆFV¬"í¬&7"#¢7"ÊvWBÇ&÷ˆFV¬"í¬'fB#¢7"ÊvWBÇ'fB"ó“¿¢'7V∂W'2#¢∆&V«2¿¢&Fñ&ó¶Fñˆ‚#¢Fñ&ó¶FñˆÂ≤&ñÁFW'f«2%“¿¢'v˜&G2#¢v˜&G2¿¢'WGFW&Ê6W2#¢∑∂≥¢bf˜"≤¬bñ‚óFV“ÊóFV◊2Çíñb≤“'v˜&G2'“f˜"óFV“ñ‚GW&Á5“¿¢'VÊ6W'FñÁGï˜66ÜV÷#¢∞¢'fW'6ñˆ‚#¢¿¢'&V6ˆvÊóFñˆÂˆ6ˆÊfñFVÊ6R#¢&÷ˆFV¬f«VRvÜV‚fñ∆&∆S≤˜FÜW'vó6RÁV∆¬"¿¢'7V∂W%ˆ6ˆÊfñFVÊ6R#¢'óV∆ñÊRÜWW&ó7Fñ2¬Ê˜B6∆ñ'&FVB&ˆ&&ñ∆óGí"¿¢&ÊVVG5˜&WfñWr#¢'G'VRvÜV‚FÜR6˜W&6R6ˆÁFñÁ2‚Wá∆ñ6óB&ó6≤f∆r˜"ñÊfW'&VB7V∂W""¿¢“¿¢–¢w&óFUˆß6ˆ‚Ü˜WGWEˆFó"Ú'G&Á67&óBÊß6ˆ‚"¬ñ∆ˆBê¢∆VFvW"“∆VFvW%ˆFˆ7V÷VÁBá&u˜v˜&G2¬v˜&G2¬GW&Á2ê¢w&óFUˆß6ˆ‚Ü˜WGWEˆFó"Ú'G&Á67&óB"Ú'v˜&G2Êß6ˆ‚"¬≤'66ÜV÷˜fW'6ñˆ‚#¢¬'v˜&G2#¢∆VFvW%≤'v˜&G2%◊“ê¢w&óFUˆß6ˆ‚Ü˜WGWEˆFó"Ú'G&Á67&óB"Ú&Ê˜&÷∆ó¶Fñˆ‚Êß6ˆ‚"¬≤'66ÜV÷˜fW'6ñˆ‚#¢¬'Fˆ∂VÁ2#¢∆VFvW%≤&Ê˜&÷∆ó¶VE˜Fˆ∂VÁ2%◊“ê¢w&óFUˆß6ˆ‚Ü˜WGWEˆFó"Ú'6V÷ÁFñ72"Ú&WfñFVÊ6U˜7Á2Êß6ˆ‚"¬≤'66ÜV÷˜fW'6ñˆ‚#¢¬'7Á2#¢∆VFvW%≤&WfñFVÊ6U˜7Á2%◊“ê†¢÷B“≤"2∑“"Êf˜&÷BÖFÇÜ¶ˆ%≤&˜&ñvñÊ≈ˆÊ÷R%“íÁ7FV“í¬"%–¢GáB“µ–¢f˜"óFV“ñ‚GW&Á3†¢∆&V¬“7V∂W%ˆFó7∆íÜóFV’≤'7V∂W"%“¬∆&V«2ê¢÷&∂W"“")™"ñbGW&ÂˆÊVVG5˜7V∂W%˜&WfñWrÜóFV“¬∆&V«2íV«6R" ¢÷BÊVÊBÇ"¢•∑∑’“∑◊∑”¢¢¢∑“"Êf˜&÷BáFñ÷W7F◊ÜóFV’≤'7F'B%“í¬∆&V¬¬÷&∂W"¬óFV’≤'FWáB%“íê¢÷BÊVÊBÇ""ê¢GáBÊVÊBÇ%∑∑’“∑◊∑”¢∑“"Êf˜&÷BáFñ÷W7F◊ÜóFV’≤'7F'B%“í¬∆&V¬¬÷&∂W"¬óFV’≤'FWáB%“íê¢Ü˜WGWEˆFó"Ú'G&Á67&óBÊ÷B"íÁw&óFU˜FWáBÇ%∆‚"Ê¶ˆñ‚Ü÷BíÁ'7G&óÇí≤%∆‚"¬VÊ6ˆFñÊs“'WFb”Ç"ê¢Ü˜WGWEˆFó"Ú'G&Á67&óBÁGáB"íÁw&óFU˜FWáBÇ%∆‚"Ê¶ˆñ‚áGáBí≤%∆‚"¬VÊ6ˆFñÊs“'WFb”Ç"ê†¢7'Eˆ∆ñÊW2“µ–¢f˜"ñÊFWÇ¬óFV“ñ‚VÁV÷W&FRá7∆óE˜7'BáGW&Á2í¬ì†¢7'Eˆ∆ñÊW2ÊWáFVÊBÖ∞¢7G"ÜñÊFWÇí¿¢'∑““”‚∑“"Êf˜&÷BáFñ÷W7F◊ÜóFV’≤'7F'B%“¬G'VRí¬Fñ÷W7F◊ÜóFV’≤&VÊB%“¬G'VRíí¿¢'∑”¢∑“"Êf˜&÷Bá7V∂W%ˆFó7∆íÜóFV’≤'7V∂W"%“¬∆&V«2í¬óFV’≤'FWáB%“í¿¢""¿¢“ê¢Ü˜WGWEˆFó"Ú'7V'FóF∆W2Á7'B"íÁw&óFU˜FWáBÇ%∆‚"Ê¶ˆñ‚á7'Eˆ∆ñÊW2í¬VÊ6ˆFñÊs“'WFb”Ç"ê†¢vóFÇÜ˜WGWEˆFó"Ú'&WfñWrÊ77b"íÊ˜V‚Ç'r"¬VÊ6ˆFñÊs“'WFb”Ç"¬ÊWv∆ñÊS“""í27G&V”†¢w&óFW"“77bÁw&óFW"á7G&V“ê¢w&óFW"Áw&óFW&˜rÖ≤'7F'B"¬&VÊB"¬'FWáB"¬'7V∂W""¬&f∆w2"¬'7V∂W%ˆ6ˆÊfñFVÊ6R%“ê¢f˜"v˜&Bñ‚v˜&G3†¢ñbv˜&E≤&f∆w2%”†¢w&óFW"Áw&óFW&˜rÖ∑Fñ÷W7F◊áv˜&E≤'7F'B%“í¬Fñ÷W7F◊áv˜&E≤&VÊB%“í¬v˜&E≤'FWáB%“¬v˜&E≤'7V∂W"%“˜"""¬#≤"Ê¶ˆñ‚áv˜&E≤&f∆w2%“í¬v˜&E≤'7V∂W%ˆ6ˆÊfñFVÊ6R%’“ê††¶FVb7&VFU˜7V∂W%˜6◊∆W2ÜVFñÚ¬ñÁFW'f«2¬˜WGWEˆFó"¬∆ˆrì†¢6◊∆W5ˆFó"“˜WGWEˆFó"Ú'7V∂W%˜6◊∆W2 ¢6◊∆W5ˆFó"Ê÷∂Fó"á&VÁG3’G'VR¬WÜó7Eˆˆ≥’G'VRê¢6ÊFñFFW2“µ–¢f˜"ñÁFW'f¬ñ‚ñÁFW'f«3†¢7F'B¬VÊB“f∆ˆBÜñÁFW'f≈≤'7F'B%“í¬f∆ˆBÜñÁFW'f≈≤&VÊB%“ê¢GW&Fñˆ‚“VÊB“7F'@¢ñbGW&Fñˆ‚¬„É†¢6ˆÁFñÁVP¢6ˆÁF÷ñÊFVB“ÁíÄ¢˜FÜW"ó2Ê˜BñÁFW'f¿¢ÊB˜FÜW%≤'7V∂W"%““ñÁFW'f≈≤'7V∂W"%–¢ÊB˜fW&∆á7F'B¬VÊB¬f∆ˆBÜ˜FÜW%≤'7F'B%“í¬f∆ˆBÜ˜FÜW%≤&VÊB%“íí‚„Ä¢f˜"˜FÜW"ñ‚ñÁFW'f«0¢ê¢ñbÊ˜B6ˆÁF÷ñÊFVC†¢6ÊFñFFW2ÊVÊBÇÜ÷ñ‚ÜGW&Fñˆ‚¬Ç„í¬7F'B¬ñÁFW'f≈≤'7V∂W"%“íê¢W%˜7V∂W"“∑–¢6◊∆Uˆ∆ñ÷óB“÷ÇÉ2¬ñÁBÜ6ˆÊfñrÇíÊvWBÇ'fˆñ6Uˆ÷VWFñÊu˜6◊∆W5˜W%˜7V∂W""¬Çííê¢f˜"GW&Fñˆ‚¬7F'B¬7V∂W"ñ‚6˜'FVBÜ6ÊFñFFW2¬&WfW'6S’G'VRì†¢6˜VÁB“W%˜7V∂W"ÊvWBá7V∂W"¬ê¢ñb6˜VÁB„“6◊∆Uˆ∆ñ÷óC†¢6ˆÁFñÁVP¢FW7FñÊFñˆ‚“6◊∆W5ˆFó"ÚÇ'7V∂W%˜∑’˜∑“Ávb"Êf˜&÷Bá7V∂W"¬6˜VÁB≤íê¢'VÂˆ6ˆ÷÷ÊBÖ∞¢&ff◊Vr"¬"÷Ê˜7FFñ‚"¬"÷ÜñFUˆ&ÊÊW""¬"÷∆ˆv∆WfV¬"¬&W'&˜""¬"◊í"¿¢"◊72"¬7G"á7F'Bí¬"◊B"¬7G"ÜGW&Fñˆ‚í¬"÷í"¬7G"ÜVFñÚí¬"÷3¶"¬'6’˜3f∆R"¬7G"ÜFW7FñÊFñˆ‚í¿¢“¬∆ˆrê¢W%˜7V∂W%∑7V∂W%““6˜VÁB≤††¶FVbñFVÁFñgï˜fˆñ6U˜á&6W2ÜVFñÚ¬7"¬Fñ&ó¶Fñˆ‚¬VÁ&ˆ∆∆VB¬˜WGWEˆFó"¬6fr¬∆ˆrì†¢VÊóG2“ñFVÁFóGï˜VÊóG2Ü7"ÊvWBÇ'v˜&G2"¬µ“í¬Fñ&ó¶Fñˆ‚¬6frê¢÷ñÊñ◊V““f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ÷ñÂ˜á&6U˜6V6ˆÊG2"¬"„íê¢6Vv÷VÁEˆw&˜W2“∑–¢÷WFFF“∑–¢f˜"ñÊFWÇ¬VÊóBñ‚VÁV÷W&FRáVÊóG2ì†¢7F'B“f∆ˆBáVÊóE≥’≥’≤'7F'B%“ê¢VÊB“f∆ˆBáVÊóE≤”’≥’≤&VÊB%“ê¢ñbVÊB“7F'B¬÷ñÊñ◊V”†¢6ˆÁFñÁVP¢∂Wí“'á&6U˜≥£VG“"Êf˜&÷BÜñÊFWÇê¢6Vv÷VÁEˆw&˜W5∂∂Wï““∑≤'FÇ#¢FÇÜVFñÚí¬'7F'B#¢7F'B¬&VÊB#¢VÊG’–¢÷WFFF∂∂Wï““∞¢'7F'B#¢&˜VÊBá7F'B¬2í¿¢&VÊB#¢&˜VÊBÜVÊB¬2í¿¢'FWáB#¢""Ê¶ˆñ‚á7G"áv˜&BÊvWBÇ'FWáB"¬""ííf˜"Ú¬v˜&Bñ‚VÊóBíÁ7G&óÇí¿¢–¢ñbÊ˜B6Vv÷VÁEˆw&˜W3†¢w&óFUˆß6ˆ‚ÖFÇÜ˜WGWEˆFó"íÚ'fˆñ6U˜6Vv÷VÁG2Êß6ˆ‚"¬≤'6Vv÷VÁG2#¢µ“¬&÷W76vR#¢-	›]"MÌ--Ì}›‚MΩç››ΩRMr'“ê¢&WGW&‚µ“¬∑“¬f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜Fá&W6Üˆ∆B"¬„Sbíê†¢V÷&VFFñÊu˜FÇ“FÇÜ˜WGWEˆFó"íÚ'fˆñ6U˜á&6UˆV÷&VFFñÊw2Êß6ˆ‚ ¢V÷&VFFñÊw2“WáG&7E˜fˆñ6UˆV÷&VFFñÊw2á∑“¬V÷&VFFñÊu˜FÇ¬∆ˆr¬6Vv÷VÁG3◊6Vv÷VÁEˆw&˜W2ê¢7&˜75˜&ˆfñ∆R“÷ÇÄ¢∂6˜6ñÊU˜6ñ÷ñ∆&óGíÜ∆VgE≤&V÷&VFFñÊr%“¬&ñváE≤&V÷&VFFñÊr%“íf˜"ñÊFWÇ¬∆VgBñ‚VÁV÷W&FRÜVÁ&ˆ∆∆VBíf˜"&ñváBñ‚VÁ&ˆ∆∆VE∂ñÊFWÇ≤•’–¢˜"≤”„–¢ê¢&6U˜Fá&W6Üˆ∆B“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜Fá&W6Üˆ∆B"¬„Sbíê¢Fá&W6Üˆ∆B“÷ÇÜ&6U˜Fá&W6Üˆ∆B¬7&˜75˜&ˆfñ∆R≤f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜&ˆfñ∆U˜6W&Fñˆ‚"¬„"ííê¢÷&vñ‚“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ÷&vñ‚"¬„"íê¢7G&ˆÊu˜Fá&W6Üˆ∆B“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜7G&ˆÊu˜Fá&W6Üˆ∆B"¬„s"íê¢7G&ˆÊuˆ÷&vñ‚“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜7G&ˆÊuˆ÷&vñ‚"¬„Çíê¢66WFVB“µ–¢66˜&W5˜&W˜'B“∑–¢f˜"∂Wí¬FFñ‚V÷&VFFñÊw2ÊóFV◊2Çì†¢66˜&W2“6˜'FVBÄ¢∞¢≤'&ˆfñ∆UˆñB#¢&ˆfñ∆U≤&ñB%“¬&Ê÷R#¢&ˆfñ∆U≤&Ê÷R%“¬'66˜&R#¢&˜VÊBÜ6˜6ñÊU˜6ñ÷ñ∆&óGíÜFFÊvWBÇ&V÷&VFFñÊr"í¬&ˆfñ∆U≤&V÷&VFFñÊr%“í¬Bó–¢f˜"&ˆfñ∆Rñ‚VÁ&ˆ∆∆V@¢“¿¢∂Wì÷∆÷&FóFV”¢óFV’≤'66˜&R%“¿¢&WfW'6S’G'VR¿¢ê¢66˜&W5˜&W˜'E∂∂Wï““66˜&W0¢ñbÊ˜B66˜&W3†¢6ˆÁFñÁVP¢'VÊÊW%˜W“66˜&W5≥’≤'66˜&R%“ñb∆V‚á66˜&W2í‚V«6R”„ ¢FñffW&VÊ6R“66˜&W5≥’≤'66˜&R%““'VÊÊW%˜W ¢GW&Fñˆ‚“÷WFFF∂∂Wï’≤&VÊB%““÷WFFF∂∂Wï’≤'7F'B%–¢6Ü˜'E˜vñÊF˜r“GW&Fñˆ‚¬f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜6Ü˜'E˜vñÊF˜u˜6V6ˆÊG2"¬B„íê¢6Ü˜'E˜Fá&W6Üˆ∆B“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜6Ü˜'E˜Fá&W6Üˆ∆B"¬„s"íê¢6Ü˜'Eˆ÷&vñ‚“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGï˜6Ü˜'Eˆ÷&vñ‚"¬„Bíê¢66WFVEˆ÷F6Ç“Ä¢66˜&W5≥’≤'66˜&R%“„“6Ü˜'E˜Fá&W6Üˆ∆BÊBFñffW&VÊ6R„“6Ü˜'Eˆ÷&vñ‡¢ñb6Ü˜'E˜vñÊF˜p¢V«6RÄ¢á66˜&W5≥’≤'66˜&R%“„“Fá&W6Üˆ∆BÊBFñffW&VÊ6R„“÷&vñ‚ê¢˜"á66˜&W5≥’≤'66˜&R%“„“7G&ˆÊu˜Fá&W6Üˆ∆BÊBFñffW&VÊ6R„“7G&ˆÊuˆ÷&vñ‚ê¢ê¢ê¢ñbÊ˜B66WFVEˆ÷F6É†¢6ˆÁFñÁVP¢66WFVBÊVÊBá∞¢¢¶÷WFFF∂∂Wï“¿¢'&ˆfñ∆UˆñB#¢66˜&W5≥’≤'&ˆfñ∆UˆñB%“¿¢&Ê÷R#¢66˜&W5≥’≤&Ê÷R%“¿¢'66˜&R#¢66˜&W5≥’≤'66˜&R%“¿¢&÷&vñ‚#¢&˜VÊBÜFñffW&VÊ6R¬Bí¿¢“ê¢ñ∆ˆB“∞¢&÷ˆFV¬#¢'ñÊÊ˜FR˜vW7V∂W"◊f˜Ü6V∆V"◊&W6ÊWC3B‘ƒ“"¿¢'Fá&W6Üˆ∆B#¢&˜VÊBáFá&W6Üˆ∆B¬Bí¿¢&÷&vñ‚#¢÷&vñ‚¿¢'6Vv÷VÁG2#¢66WFVB¿¢'66˜&W2#¢66˜&W5˜&W˜'B¿¢–¢w&óFUˆß6ˆ‚ÖFÇÜ˜WGWEˆFó"íÚ'fˆñ6U˜6Vv÷VÁG2Êß6ˆ‚"¬ñ∆ˆBê¢&WGW&‚66WFVB¬66˜&W5˜&W˜'B¬Fá&W6Üˆ∆@††•$TDî‘‰UEÙ‘ÙDT¬“%∆'&íı&TFñ‘ÊWC"‘#b◊f#"∑f˜É"∂6Ê3%˜c÷∆“ ††¶FVbˆß6ˆÂˆÜ6Çáf«VRì†¢&WGW&‚Ü6Ü∆ñ"Á6Ü#SbÜß6ˆ‚ÊGV◊2áf«VR¬VÁ7W&Uˆ66ñì‘f«6R¬6˜'Eˆ∂Wó3’G'VRíÊVÊ6ˆFRÇ'WFb”Ç"ííÊÜWÜFñvW7BÇê††¶FVbWáG&7E˜&VFñ÷ÊWEˆV÷&VFFñÊw2Üw&˜W2¬FW7FñÊFñˆ‚¬∆ˆr¬6frì†¢""%'V‚&TFñ‘ÊWBñ‚óG2ó6ˆ∆FVBVÁfó&ˆÊ÷VÁBÊB66ÜR'íWÜ7B÷ÊñfW7B‚"" ¢6W&ñ∆ó¶&∆R“∞¢7G"Üw&˜Wì¢∂Fñ7BÜóFV“¬FÉ◊7G"ÜóFV’≤'FÇ%“ííñbó6ñÁ7FÊ6RÜóFV“¬Fñ7BíV«6R7G"ÜóFV“íf˜"óFV“ñ‚óFV◊5–¢f˜"w&˜W¬óFV◊2ñ‚w&˜W2ÊóFV◊2Çê¢–¢∂Wí“ˆß6ˆÂˆÜ6Çá∞¢&÷ˆFV¬#¢$TDî‘‰UEÙ‘ÙDT¬¬'&W˜6óF˜'í#¢6fu≤'&VFñ÷ÊWE˜&W˜6óF˜'í%“¿¢'&Wfó6ñˆ‚#¢6fu≤'&VFñ÷ÊWE˜&Wfó6ñˆ‚%“¬&w&˜W2#¢6W&ñ∆ó¶&∆R¿¢“ê¢∂Wï˜FÇ“FÇá7G"ÜFW7FñÊFñˆ‚í≤"Ê∂Wí"ê¢ñbFÇÜFW7FñÊFñˆ‚íÊó5ˆfñ∆RÇíÊB∂Wï˜FÇÊó5ˆfñ∆RÇíÊB∂Wï˜FÇÁ&VE˜FWáBÇíÁ7G&óÇí”“∂Wì†¢&WGW&‚∆ˆEˆß6ˆ‚ÜFW7FñÊFñˆ‚íÊvWBÇ&w&˜W2"¬∑“ê¢÷ÊñfW7B“FÇá7G"ÜFW7FñÊFñˆ‚í≤"Ê÷ÊñfW7BÊß6ˆ‚"ê¢w&óFUˆß6ˆ‚Ü÷ÊñfW7B¬≤&w&˜W2#¢6W&ñ∆ó¶&∆W“ê¢G'ì†¢'VÂˆ6ˆ÷÷ÊBÖ∞¢7G"Ö$ÙıBÚ"ÁfVÁb÷gW6ñˆ‚"Ú&&ñ‚"Ú'óFÜˆ‚"í¿¢7G"Ö$ÙıBÚ'67&óG2"Ú'&VFñ÷ÊWE˜v˜&∂W"Áí"í¿¢"“÷÷ÊñfW7B"¬7G"Ü÷ÊñfW7Bí¬"“÷˜WGWB"¬7G"ÜFW7FñÊFñˆ‚í¿¢"“÷66ÜR"¬7G"Ö$ÙıBÚ'v˜&≤"Ú&66ÜR"í¿¢"“÷FWfñ6R"¬7G"Ü6frÊvWBÇ'&VFñ÷ÊWEˆFWfñ6R"¬&WFÚ"íí¿¢"“◊&W˜6óF˜'í"¬6fu≤'&VFñ÷ÊWE˜&W˜6óF˜'í%“¿¢"“◊&Wfó6ñˆ‚"¬6fu≤'&VFñ÷ÊWE˜&Wfó6ñˆ‚%“¿¢“¬∆ˆr¬VÁc÷Fñ7BÜ˜2ÊVÁfó&ˆ‚¬Dı$4ÖÙÑÙ‘S◊7G"Ö$ÙıBÚ'v˜&≤"Ú&66ÜR"Ú'F˜&6Ç"í¬ïDÑÙÂT‰%TddU$TC“#"íê¢∂Wï˜FÇÁw&óFU˜FWáBÜ∂Wí≤%∆‚"¬VÊ6ˆFñÊs“'WFb”Ç"ê¢fñÊ∆«ì†¢÷ÊñfW7BÁVÊ∆ñÊ≤Ü÷ó76ñÊuˆˆ≥’G'VRê¢&WGW&‚∆ˆEˆß6ˆ‚ÜFW7FñÊFñˆ‚íÊvWBÇ&w&˜W2"¬∑“ê††¶FVbVÁ&ˆ∆∆÷VÁE˜6ñvÊGW&Rá&ˆfñ∆W2ì†¢f«VW2“µ–¢f˜"&ˆfñ∆Rñ‚&ˆfñ∆W3†¢ñbÊ˜B&ˆfñ∆RÊvWBÇ'&VGí"ì†¢6ˆÁFñÁVP¢6◊∆W2“µ–¢f˜"6◊∆Rñ‚&ˆfñ∆RÊvWBÇ'6◊∆W2"¬µ“ì†¢FÇ“dÙî4Uı$ÙdîƒU2Ú&ˆfñ∆U≤&ñB%“Ú6◊∆RÊvWBÇ&VFñÚ"¬&÷ó76ñÊr"ê¢ñbFÇÊó5ˆfñ∆RÇì†¢7FB“FÇÁ7FBÇê¢6◊∆W2ÊVÊBÖ∑7G"áFÇí¬7FBÁ7E˜6ó¶R¬7FBÁ7Eˆ◊Fñ÷UˆÁ5“ê¢f«VW2ÊVÊBÖ∑&ˆfñ∆U≤&ñB%“¬6◊∆W5“ê¢&WGW&‚ˆß6ˆÂˆÜ6Çá≤&÷ˆFV¬#¢$TDî‘‰UEÙ‘ÙDT¬¬'&ˆfñ∆W2#¢f«VW7“ê††¶FVbVÁ7W&U˜&VFñ÷ÊWEˆVÁ&ˆ∆∆÷VÁBÜ6fr¬∆ˆrì†¢&ˆfñ∆W2“∑&ˆfñ∆Rf˜"&ˆfñ∆Rñ‚∆ˆE˜fˆñ6U˜&ˆfñ∆W2Çíñb&ˆfñ∆RÊvWBÇ'&VGí"ï–¢ñbÊ˜B&ˆfñ∆W3†¢&WGW&‚µ–¢FW7FñÊFñˆ‚“dÙî4Uı$ÙdîƒU2Ú%˜&VFñ÷ÊWC%ˆVÁ&ˆ∆∆÷VÁBÊß6ˆ‚ ¢6ñvÊGW&R“VÁ&ˆ∆∆÷VÁE˜6ñvÊGW&Rá&ˆfñ∆W2ê¢ñbFW7FñÊFñˆ‚Êó5ˆfñ∆RÇì†¢66ÜVB“∆ˆEˆß6ˆ‚ÜFW7FñÊFñˆ‚ê¢ñb66ÜVBÊvWBÇ'6ñvÊGW&R"í”“6ñvÊGW&S†¢Ê÷W2“∑&ˆfñ∆U≤&ñB%”¢&ˆfñ∆U≤&Ê÷R%“f˜"&ˆfñ∆Rñ‚&ˆfñ∆W7–¢&W7V«B“66ÜVBÊvWBÇ'&ˆfñ∆W2"¬µ“ê¢f˜"óFV“ñ‚&W7V«C†¢óFV’≤&Ê÷R%““Ê÷W2ÊvWBÜóFV’≤&ñB%“¬óFV“ÊvWBÇ&Ê÷R"¬óFV’≤&ñB%“íê¢&WGW&‚&W7V«@¢w&˜W2“∞¢&ˆfñ∆U≤&ñB%”¢µdÙî4Uı$ÙdîƒU2Ú&ˆfñ∆U≤&ñB%“Ú6◊∆U≤&VFñÚ%“f˜"6◊∆Rñ‚&ˆfñ∆RÊvWBÇ'6◊∆W2"¬µ“ï–¢f˜"&ˆfñ∆Rñ‚&ˆfñ∆W0¢–¢&u˜FÇ“dÙî4Uı$ÙdîƒU2Ú%˜&VFñ÷ÊWC%ˆVÁ&ˆ∆∆÷VÁBÁ&rÊß6ˆ‚ ¢w&˜W5˜&W7V«B“WáG&7E˜&VFñ÷ÊWEˆV÷&VFFñÊw2Üw&˜W2¬&u˜FÇ¬∆ˆr¬6frê¢&W7V«B“µ–¢'ïˆñB“∑&ˆfñ∆U≤&ñB%”¢&ˆfñ∆Rf˜"&ˆfñ∆Rñ‚&ˆfñ∆W7–¢f˜"&ˆfñ∆UˆñB¬FFñ‚w&˜W5˜&W7V«BÊóFV◊2Çì†¢ñb&ˆfñ∆UˆñBñ‚'ïˆñBÊBFFÊvWBÇ&V÷&VFFñÊr"ì†¢&W7V«BÊVÊBá≤&ñB#¢&ˆfñ∆UˆñB¬&Ê÷R#¢'ïˆñE∑&ˆfñ∆UˆñE’≤&Ê÷R%“¬¢¶FF“ê¢w&óFUˆß6ˆ‚ÜFW7FñÊFñˆ‚¬≤&÷ˆFV¬#¢$TDî‘‰UEÙ‘ÙDT¬¬'6ñvÊGW&R#¢6ñvÊGW&R¬'&ˆfñ∆W2#¢&W7V«G“ê¢&WGW&‚&W7V«@††¶FVb6«W7FW%ˆÊ6Ü˜%ˆw&˜W2ÜVFñÚ¬ñÁFW'f«2¬6fr¬6ˆÁ6VÁ7W3‘ÊˆÊRì†¢""$6ˆ∆∆V7B∆ˆÊr¬6∆V‚¬7&˜72÷Fñ&ó¶W"÷w&VVB7VV6ÇW"ÊˆÁñ÷˜W26«W7FW"‚"" ¢ñb6ˆÁ6VÁ7W3†¢2ñÊ6«VFRfW&ñfñW"÷ˆÊ«í6ÊFñFFW2g&ˆ“Fó7WFVB&VvñˆÁ2‚FÜWí&P¢2&V6ó6V«íFÜRG&6∑2FÜB6‚&WfV¬‚VÊFW"÷6«W7FW&VB&ñ÷'ê¢2&W7V«B‚&TFñ‘ÊWBvñ∆¬&V¶V7BFÜV“VÊ∆W72v∆ˆ&¬WfñFVÊ6Ró27G&ˆÊr‡¢6∆V‚“µ–¢f˜"óFV“ñ‚6ˆÁ6VÁ7W3†¢ñbóFV“ÊvWBÇ&˜fW&∆"ì†¢6ˆÁFñÁVP¢f˜"7V∂W"ñ‚óFV“ÊvWBÇ&6ÊFñFFW2"¬óFV“ÊvWBÇ&6«W7FW'2"¬µ“íì†¢6∆V‚ÊVÊBá≤'7V∂W"#¢7V∂W"¬'7F'B#¢óFV’≤'7F'B%“¬&VÊB#¢óFV’≤&VÊB%◊“ê¢V«6S†¢6∆V‚“∂óFV“f˜"óFV“ñ‚ñÁFW'f«2ñbÊ˜BóFV“ÊvWBÇ&˜fW&∆"íÊBf∆ˆBÜóFV“ÊvWBÇ&6ˆÁ6VÁ7W5ˆ6ˆÊfñFVÊ6R"¬íí„“„u–¢÷W&vVB“µ–¢f˜"óFV“ñ‚6˜'FVBÜ6∆V‚¬∂Wì÷∆÷&Ff«VS¢á7G"áf«VU≤'7V∂W"%“í¬f∆ˆBáf«VU≤'7F'B%“ííì†¢7W'&VÁB“≤'7V∂W"#¢7G"ÜóFV’≤'7V∂W"%“í¬'7F'B#¢f∆ˆBÜóFV’≤'7F'B%“í¬&VÊB#¢f∆ˆBÜóFV’≤&VÊB%“ó–¢ñb÷W&vVBÊB÷W&vVE≤”’≤'7V∂W"%“”“7W'&VÁE≤'7V∂W"%“ÊB7W'&VÁE≤'7F'B%““÷W&vVE≤”’≤&VÊB%“√“„3S†¢÷W&vVE≤”’≤&VÊB%““÷ÇÜ÷W&vVE≤”’≤&VÊB%“¬7W'&VÁE≤&VÊB%“ê¢V«6S†¢÷W&vVBÊVÊBÜ7W'&VÁBê¢w&˜W2“∑–¢÷ñÊñ◊V““f∆ˆBÜ6frÊvWBÇ'&VFñ÷ÊWEˆÊ6Ü˜%ˆ÷ñÂ˜6V6ˆÊG2"¬2„íê¢F&vWB“f∆ˆBÜ6frÊvWBÇ'&VFñ÷ÊWEˆÊ6Ü˜%˜F&vWE˜6V6ˆÊG2"¬3„íê¢'ï˜7V∂W"“∑–¢f˜"óFV“ñ‚÷W&vVC†¢ñbóFV’≤&VÊB%““óFV’≤'7F'B%“„“÷ñÊñ◊V”†¢'ï˜7V∂W"Á6WFFVfV«BÜóFV’≤'7V∂W"%“¬µ“íÊVÊBÜóFV“ê¢f˜"7V∂W"¬óFV◊2ñ‚'ï˜7V∂W"ÊóFV◊2Çì†¢F˜F¬“„ ¢f˜"óFV“ñ‚6˜'FVBÜóFV◊2¬∂Wì÷∆÷&Ff«VS¢f«VU≤&VÊB%““f«VU≤'7F'B%“¬&WfW'6S’G'VRì†¢ñbF˜F¬„“F&vWC†¢'&V∞¢GW&Fñˆ‚“÷ñ‚ÜóFV’≤&VÊB%““óFV’≤'7F'B%“¬F&vWB“F˜F¬¬"„ê¢ñbGW&Fñˆ‚„“÷ñÊñ◊V”†¢w&˜W2Á6WFFVfV«Bá7V∂W"¬µ“íÊVÊBá≤'FÇ#¢FÇÜVFñÚí¬'7F'B#¢óFV’≤'7F'B%“≤„¬&VÊB#¢óFV’≤'7F'B%“≤GW&Fñˆ‚“„“ê¢F˜F¬≥“GW&Fñˆ‡¢&WGW&‚w&˜W0††¶FVb˜&ˆfñ∆U˜7W˜'Bá7F'B¬VÊB¬Fñ÷V∆ñÊR¬÷F6ÜW2¬6˜W&6S“'fW&ñfñW%ˆ÷VB"ì†¢""%&WGW&‚GW&Fñˆ‚7W˜'BW"∂Ê˜v‚&ˆfñ∆Rf˜"ˆÊRFñ&ó¶W"6˜W&6R‚"" ¢7W˜'B“∑–¢f˜"óFV“ñ‚Fñ÷V∆ñÊR˜"µ”†¢GW&Fñˆ‚“˜fW&∆á7F'B¬VÊB¬f∆ˆBÜóFV’≤'7F'B%“í¬f∆ˆBÜóFV’≤&VÊB%“íê¢ñbGW&Fñˆ‚√“˜"óFV“ÊvWBÇ&˜fW&∆"ì†¢6ˆÁFñÁVP¢f˜"6«W7FW"ñ‚óFV“ÊvWBá6˜W&6R¬µ“ì†¢÷F6Ç“÷F6ÜW2ÊvWBá7G"Ü6«W7FW"íí˜"÷F6ÜW2ÊvWBÜ6«W7FW"ê¢ñb÷F6É†¢&ˆfñ∆UˆñB“÷F6Ö≤'&ˆfñ∆UˆñB%–¢7W˜'E∑&ˆfñ∆UˆñE““7W˜'BÊvWBá&ˆfñ∆UˆñB¬„í≤GW&Fñˆ‡¢&WGW&‚7W˜'@††¶FVb˜G&6µ˜7W˜'Bá7F'B¬VÊB¬Fñ÷V∆ñÊR¬6˜W&6S“'fW&ñfñW%ˆ÷VB"ì†¢""%&WGW&‚&rFñ&ó¶W"◊G&6≤7W˜'BvóFÜ˜WB&WVó&ñÊr∂Ê˜v‚ñFVÁFóGí‚"" ¢7W˜'B“∑–¢f˜"óFV“ñ‚Fñ÷V∆ñÊR˜"µ”†¢GW&Fñˆ‚“˜fW&∆á7F'B¬VÊB¬f∆ˆBÜóFV’≤'7F'B%“í¬f∆ˆBÜóFV’≤&VÊB%“íê¢ñbGW&Fñˆ‚√“†¢6ˆÁFñÁVP¢f˜"G&6≤ñ‚óFV“ÊvWBá6˜W&6R¬µ“ì†¢7W˜'E∑7G"áG&6≤ï““7W˜'BÊvWBá7G"áG&6≤í¬„í≤GW&Fñˆ‡¢&WGW&‚7W˜'@††¶FVbFñ&ó¶FñˆÂˆv&Uˆ6∆W6U˜VÊóG2áv˜&G2¬6fr¬Fñ÷V∆ñÊS‘ÊˆÊR¬÷F6ÜW3‘ÊˆÊRì†¢""%7∆óBFWáGV¬6∆W6W2BñÊFWVÊFVÁF«ífW&ñfñVB6˜W7Fñ2ñFVÁFóFñW2‚"" ¢ñbÊ˜BFñ÷V∆ñÊR˜"Ê˜B÷F6ÜW3†¢&WGW&‚6∆W6U˜VÊóG2áv˜&G2¬6frê¢&W7V«B“µ–¢÷ñÊñ◊V’ˆ&˜VÊF'ïˆv“f∆ˆBÜ6frÊvWBÇ'fˆñ6UˆñFVÁFóGïˆ&˜VÊF'ïˆv˜6V6ˆÊG2"¬„#Ríê¢f˜"6∆W6Rñ‚6∆W6U˜VÊóG2áv˜&G2¬6frì†¢7W'&VÁB¬&Wfñ˜W5˜&ˆfñ∆R¬&Wfñ˜W5˜G&6∑2“µ“¬ÊˆÊR¬6WBÇê¢f˜"ó"ñ‚6∆W6S†¢Ú¬v˜&B“ó ¢7F'B¬VÊB“f∆ˆBáv˜&E≤'7F'B%“í¬f∆ˆBáv˜&E≤&VÊB%“ê¢7W˜'B“˜&ˆfñ∆U˜7W˜'Bá7F'B¬VÊB¬Fñ÷V∆ñÊR¬÷F6ÜW2¬'fW&ñfñW%ˆ÷VB"ê¢&ˆfñ∆R“÷Çá7W˜'B¬∂Wì◊7W˜'BÊvWBíñb7W˜'BV«6RÊˆÊP¢&u˜7W˜'B“˜G&6µ˜7W˜'Bá7F'B¬VÊB¬Fñ÷V∆ñÊR¬'fW&ñfñW%ˆ÷VB"ê¢G&6∑2“∑G&6≤f˜"G&6≤¬÷˜VÁBñ‚&u˜7W˜'BÊóFV◊2Çíñb÷˜VÁB‚–¢ñFVÁFóGïˆ6ÜÊvVB“&ˆfñ∆RÊB&Wfñ˜W5˜&ˆfñ∆RÊB&ˆfñ∆R“&Wfñ˜W5˜&ˆfñ∆P¢G&6µˆ6ÜÊvVB“G&6∑2ÊB&Wfñ˜W5˜G&6∑2ÊBG&6∑2“&Wfñ˜W5˜G&6∑0¢ñb7W'&VÁBÊBÜñFVÁFóGïˆ6ÜÊvVB˜"G&6µˆ6ÜÊvVBì†¢v“÷ÇÉ„¬7F'B“f∆ˆBÜ7W'&VÁE≤”’≥’≤&VÊB%“íê¢2WfV‚6Ü˜'B6ñ∆VÊ6Ró2÷VÊñÊvgV¬vÜV‚ñÊFWVÊFVÁBG&6∑0¢27vóF6ÇñFVÁFóFñW2‚¶W&Ú÷vv˜&B&˜VÊF&ñW2&V÷ñ‚FˆvWFÜW ¢2FÚfˆñB7∆óGFñÊrˆ‚yﬂªhëÈÏ∂ªßq´^vn
                 update_job(db, job_id, progress=round(progress, 1), detail=detail)
             diarization_command = [
                 str(ROOT / ".venv-diarizen" / "bin" / "python"), str(ROOT / "scripts" / "diarize_worker.py"),
@@ -2367,10 +842,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 label = html.escape(speaker_display(speaker, labels))
                 text = html.escape(item.get("text", ""))
                 timecode = timestamp(float(item.get("start", 0)))
-                needs_review = speaker is None or any(
-                    flag in {"ambiguous", "no_diarization"}
-                    for flag in item.get("flags", [])
-                )
+                needs_review = turn_needs_speaker_review(item, labels)
                 speaker_class = "unknown" if speaker is None else "speaker-{}".format(sum(ord(character) for character in str(speaker)) % 6)
                 warning = '<span class="warning">–ü—Ä–æ–≤–µ—Ä–∏—Ç—å</span>' if needs_review else ""
                 rendered_turns.append(

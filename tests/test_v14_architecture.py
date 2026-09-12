@@ -70,6 +70,14 @@ class V14ArchitectureTests(unittest.TestCase):
                 row = migrated.execute("SELECT content_sha256 FROM jobs").fetchone()
                 self.assertEqual(row["content_sha256"], "a" * 64)
 
+    def test_resolved_profile_is_not_marked_for_review_by_stale_boundary_flags(self):
+        turn = {"speaker": "profile:known", "flags": ["ambiguous", "no_diarization"]}
+        self.assertFalse(pipeline.turn_needs_speaker_review(turn, {"profile:known": "@Misha"}))
+
+    def test_unresolved_speaker_still_requires_review(self):
+        self.assertTrue(pipeline.turn_needs_speaker_review({"speaker": None, "flags": []}, {}))
+        self.assertTrue(pipeline.turn_needs_speaker_review({"speaker": "UNKNOWN_1", "flags": []}, {}))
+
 
 if __name__ == "__main__":
     unittest.main()
