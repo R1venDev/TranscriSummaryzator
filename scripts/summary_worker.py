@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -17,12 +18,14 @@ import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from quality_schema import evidence_uncertainty, meeting_state, normalize_semantic_record, task_records
+from quality_schema import adaptive_compute_plan, evidence_uncertainty, meeting_state, normalize_semantic_record, task_records
+from semantic_contracts import json_schema as contract_schema, validate_response
 from evidence_ledger import risk_level, semantic_risks
+from evidence_repair import reconcile_repairs, repair_requests
 from config_schema import load_config
 
 
-PIPELINE_VERSION = "summary-evidence-v14-ledger"
+PIPELINE_VERSION = "summary-state-v15"
 FACT_TYPES = {
     "current_state", "observation", "problem", "hypothesis", "proposal",
     "decision", "action", "question", "metric", "schedule", "goal",
@@ -79,6 +82,7 @@ def normalize_space(value) -> str:
 
 def transcript_utterances(document):
     labels = document.get("speakers", {})
+    words = document.get("words", [])
     utterances = []
     for index, item in enumerate(document.get("utterances", []), 1):
         text = normalize_space(item.get("text"))
@@ -104,6 +108,15 @@ def transcript_utterances(document):
             "text": text,
             "flags": list(item.get("flags", [])),
             "uncertainty": uncertainty,
+            "source_word_ids": list(dict.fromkeys(
+                word_id
+                for word in words
+                if float(word.get("end", 0)) >= float(item.get("start", 0))
+                and float(word.get("start", 0)) <= float(item.get("end", item.get("start", 0)))
+                and word.get("speaker") == speaker_id
+                for word_id in word.get("source_word_ids", [word.get("word_id")])
+                if word_id
+            )),
         })
     if not utterances:
         raise ValueError("В transcript.json нет реплик")
@@ -423,8 +436,9 @@ def apply_resolution_response(response, focused, targets, facts, rejected_dir):
     return deduplicate(facts + accepted), resolved_by_fact, reviewed_non_facts
 
 
-def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3, progress=None, num_predict=5000, num_ctx=16384):
-    request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx})
+def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3, progress=None, num_predict=5000, num_ctx=16384, contract=None):
+    schema = contract_schema(contract) if contract else None
+    request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx, "schema": schema})
     if cache_path.is_file():
         cached = load_json(cache_path)
         if cached.get("request_key") == request_key:
@@ -433,13 +447,59 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     for attempt in range(1, attempts + 1):
         try:
             suffix = "" if attempt == 1 else f"\n\nПовтор {attempt}: предыдущий ответ был пустым или невалидным. Обязательно верни полный JSON."
-            text, metrics = client.chat(model, system, prompt + suffix, json_mode=True, temperature=0.0, progress=progress, num_predict=num_predict, num_ctx=num_ctx)
+            text, metrics = client.chat(model, system, prompt + suffix, json_mode=True, json_schema=schema, temperature=0.0, progress=progress, num_predict=num_predict, num_ctx=num_ctx)
             parsed = parse_json_response(text)
+            if contract:
+                parsed = validate_response(parsed, contract)
             atomic_json(cache_path, {"request_key": request_key, "response": parsed, "metrics": metrics, "attempt": attempt})
             return load_json(cache_path)
         except Exception as exc:
             errors.append(str(exc))
     raise RuntimeError("; ".join(errors))
+
+
+def run_evidence_repair(facts, cache_root, cfg):
+    """Re-listen to CRITICAL evidence with an independent segmentation pass."""
+    requests = repair_requests(
+        facts,
+        float(cfg.get("summary_repair_padding_before_seconds", 2.0)),
+        float(cfg.get("summary_repair_padding_after_seconds", 4.0)),
+        int(cfg.get("summary_repair_max_windows", 24)),
+    )
+    audio = Path(cache_root).parent / "audio.wav"
+    if not cfg.get("summary_audio_repair_enabled", True) or not requests or not audio.is_file():
+        return facts, {"enabled": bool(cfg.get("summary_audio_repair_enabled", True)), "requested": len(requests), "status": "skipped", "reason": "no_requests_or_audio"}
+    directory = Path(cache_root) / "evidence-repair"
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = directory / "manifest.json"
+    output = directory / "repairs.json"
+    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "audio_size": audio.stat().st_size})
+    if output.is_file():
+        cached = load_json(output)
+        if cached.get("request_key") == request_key:
+            repaired, report = reconcile_repairs(facts, cached.get("repairs", []))
+            report.update({"enabled": True, "status": "cached", "method": "second_pass_no_vad_full_window"})
+            return repaired, report
+    atomic_json(manifest, {"schema_version": 1, "request_key": request_key, "requests": requests})
+    application_root = Path(cache_root).parents[3]
+    command = [
+        str(application_root / ".venv-gigaam" / "bin" / "python"),
+        str(Path(__file__).with_name("asr_repair_worker.py")),
+        "--audio", str(audio), "--manifest", str(manifest), "--output", str(output),
+        "--model", str(cfg.get("gigaam_model", "v3_e2e_rnnt")),
+        "--cache", str(application_root / "work" / "cache" / "gigaam"),
+        "--device", str(cfg.get("asr_device", "auto")),
+    ]
+    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).parent), PYTHONUNBUFFERED="1")
+    completed = subprocess.run(command, text=True, capture_output=True, env=environment)
+    if completed.returncode:
+        raise RuntimeError("Evidence repair ASR failed: " + completed.stderr[-1000:])
+    payload = load_json(output)
+    payload["request_key"] = request_key
+    atomic_json(output, payload)
+    repaired, report = reconcile_repairs(facts, payload.get("repairs", []))
+    report.update({"enabled": True, "status": "completed", "method": "second_pass_no_vad_full_window"})
+    return repaired, report
 
 
 def output_limit_error(exc):
@@ -485,13 +545,14 @@ def normalize_fact(raw, chunk, sequence):
         "start": min(item["start"] for item in evidence),
         "end": max(item["end"] for item in evidence),
         "evidence": [
-            {"id": item["id"], "start": item["start"], "end": item["end"], "speaker": item["speaker"], "text": item["text"], "flags": item.get("flags", []), "uncertainty": item.get("uncertainty", {})}
+            {"id": item["id"], "start": item["start"], "end": item["end"], "speaker": item["speaker"], "text": item["text"], "flags": item.get("flags", []), "uncertainty": item.get("uncertainty", {}), "source_word_ids": item.get("source_word_ids", [])}
             for item in evidence
         ],
         "source_chunks": [chunk["index"]],
         "uncertainty": evidence_uncertainty(evidence),
         "semantic_risks": risks,
         "risk_level": risk_level(risks, fact_type),
+        "prompt_version": PIPELINE_VERSION + ":extract-v1",
     }
 
 
@@ -724,8 +785,11 @@ def compact_fact(fact, include_evidence=True):
     result = {key: fact[key] for key in ("fact_id", "type", "topic", "statement", "certainty", "evidence_ids")}
     result["speaker_refs"] = list(fact.get("speaker_refs", []))
     result["uncertainty"] = dict(fact.get("uncertainty", {}))
+    result["claim_id"] = fact.get("claim_id")
+    result["allowed_relations"] = list(fact.get("allowed_relations", []))
     if include_evidence:
         result["evidence"] = fact["evidence"]
+        result["audio_repairs"] = list(fact.get("audio_repairs", []))
     return result
 
 
@@ -1067,6 +1131,7 @@ def sanitize_structured(document, facts):
     fact_map = {item["fact_id"]: item for item in facts}
     allowed_by_section = {"objective": {"goal"}, "decisions": {"decision"}, "actions": {"action"}, "open_questions": {"question", "problem", "hypothesis", "proposal"}}
     rejected = []
+    relation_words = re.compile(r"(?iu)\b(?:потому\s+что|поэтому|из-за|вследствие|привел[ао]?|сначала|затем|после)\b")
 
     def clean_item(item, section):
         text = normalize_space(item.get("text"))
@@ -1082,7 +1147,14 @@ def sanitize_structured(document, facts):
         if missing_numbers or (alphanumeric_technical_tokens(text) - alphanumeric_technical_tokens(evidence_text)):
             rejected.append({"section": section, "item": item, "reason": "неподтверждённые числа или технические маркеры"})
             return None
-        return {"text": text, "fact_ids": ids}
+        allowed_relations = list(dict.fromkeys(
+            relation_id for value in ids for relation_id in fact_map[value].get("allowed_relations", [])
+        ))
+        canonical = " ".join(terminate_sentence(fact_map[value]["statement"]) for value in ids)
+        if relation_words.search(text) and not allowed_relations and normalize_space(text).casefold() != normalize_space(canonical).casefold():
+            rejected.append({"section": section, "item": item, "reason": "writer создал неподтверждённую смысловую связь"})
+            text = canonical
+        return {"text": text, "fact_ids": ids, "relation_ids": allowed_relations}
 
     clean = {"main_topic": None, "objective": None, "overview": [], "chronology": [], "topics": [], "decisions": [], "actions": [], "open_questions": []}
     for key in ("main_topic", "objective"):
@@ -2813,7 +2885,7 @@ def build_semantic_registry(client, model, facts, run_dir):
             response = call_json_with_retries(
                 client, model, SEMANTIC_SYSTEM, prompt,
                 run_dir / "semantic" / f"facts-{first:05d}-{last:05d}.json",
-                attempts=2, num_predict=4200,
+                attempts=2, num_predict=4200, contract="semantic_records",
             )
         except RuntimeError as exc:
             if len(batch) <= 1 or not output_limit_error(exc):
@@ -2981,6 +3053,37 @@ def build_document(client, settings, cfg, run_dir, final_facts, generation_suffi
     return document, {"structure": final_report, "chapter_repairs": repaired}
 
 
+def canonical_facts_from_state(state, facts):
+    """Project canonical MeetingState back to writer-safe compatibility facts."""
+    by_record = {item["fact_id"]: item for item in facts}
+    relations_by_event = {}
+    for relation in state.get("relations", []):
+        for event_id in (relation.get("source_event"), relation.get("target_event")):
+            relations_by_event.setdefault(event_id, []).append(relation["relation_id"])
+    result = []
+    for event in state.get("views", {}).get("summary", []):
+        source = by_record.get(event.get("source_record_id"))
+        if not source:
+            continue
+        item = dict(source)
+        item["claim_id"] = event["claim_id"]
+        item["event_id"] = event["event_id"]
+        item["allowed_relations"] = sorted(set(relations_by_event.get(event["event_id"], [])))
+        item["components"] = event.get("components", [])
+        item["compute_plan"] = event.get("compute_plan", item.get("compute_plan", {}))
+        result.append(item)
+    return sorted(result, key=lambda item: (float(item.get("start", 0)), item["fact_id"]))
+
+
+def provenance_report(state):
+    missing = []
+    for event in state.get("events", []):
+        provenance = event.get("provenance", {})
+        if not provenance.get("audio_sha256") or not provenance.get("source_word_ids") or not event.get("evidence_ids"):
+            missing.append(event.get("claim_id"))
+    return {"traceable_claims": len(state.get("events", [])) - len(missing), "total_claims": len(state.get("events", [])), "untraceable_claim_ids": missing, "passed": not missing}
+
+
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
     total_seconds = float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0)
@@ -3011,8 +3114,15 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         semantic_registry, final_facts, run_dir,
     )
     semantic_counts = semantic_metrics(semantic_registry, final_facts)
-    state = meeting_state(semantic_registry.get("records", []))
+    source_manifest = load_json(output_dir / "source.manifest.json") if (output_dir / "source.manifest.json").is_file() else {}
+    state = meeting_state(semantic_registry.get("records", []), provenance={"audio_sha256": source_manifest.get("audio_sha256")})
     atomic_json(run_dir / "meeting_state.json", state)
+    provenance = provenance_report(state)
+    if cfg.get("summary_require_immutable_provenance", True) and not provenance["passed"]:
+        raise RuntimeError("Публикация остановлена: claims без трассировки до audio/word evidence: " + ", ".join(provenance["untraceable_claim_ids"][:10]))
+    final_facts = canonical_facts_from_state(state, final_facts)
+    if not final_facts:
+        raise RuntimeError("Canonical MeetingState не содержит публикуемых claims")
     coverage = dict(
         coverage,
         facts=len(final_facts),
@@ -3088,6 +3198,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "public_surface_audit": surface_audit,
         "semantic": semantic_counts,
         "navigation": navigation_audit,
+        "provenance": provenance,
     })
 
     if stable_hash(load_json(output_dir / "transcript.json")) != settings["transcript"]:
@@ -3109,8 +3220,10 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "semantics" / "meeting_state.json", state)
     atomic_json(output_dir / "views" / "decisions.json", {"schema_version": 1, "decisions": state["views"]["decisions"]})
     atomic_json(output_dir / "views" / "questions.json", {"schema_version": 1, "questions": state["views"]["questions"]})
-    safe_tasks = [item for item in semantic_registry["tasks"] if item.get("automation_eligible")]
-    review_candidates = [item for item in semantic_registry["tasks"] if not item.get("automation_eligible")]
+    atomic_json(output_dir / "views" / "timeline.json", {"schema_version": 1, "timeline": state["views"]["timeline"]})
+    atomic_json(output_dir / "views" / "summary.json", {"schema_version": 1, "claims": state["views"]["summary"]})
+    safe_tasks = [item for item in state["views"]["tasks"] if item.get("automation_eligible")]
+    review_candidates = [item for item in state["views"]["tasks"] if not item.get("automation_eligible")]
     atomic_json(output_dir / "tasks.json", {
         "schema_version": semantic_registry["schema_version"],
         "tasks": safe_tasks,
@@ -3138,11 +3251,16 @@ def main():
         "config": {k: v for k, v in cfg.items() if k.startswith("summary_")},
         "worker_hash": stable_hash({
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (Path(__file__), Path(__file__).with_name("quality_schema.py"), Path(__file__).with_name("evidence_ledger.py"))
+            for path in (
+                Path(__file__), Path(__file__).with_name("quality_schema.py"),
+                Path(__file__).with_name("evidence_ledger.py"), Path(__file__).with_name("evidence_repair.py"),
+                Path(__file__).with_name("semantic_contracts.py"),
+            )
         }),
         "transcript": stable_hash(transcript),
         "extractor": cfg.get("summary_extractor_model", "qwen3.5:9b-q4_K_M"),
         "arbitrator": cfg["summary_arbitrator_model"],
+        "high_risk_verifier": cfg.get("summary_high_risk_verifier_model", cfg["summary_arbitrator_model"]),
         "writer": cfg["summary_writer_model"],
         "auditor": cfg.get("summary_auditor_model", "qwen3.5:9b-q4_K_M"),
         "public_auditor": cfg.get("summary_public_auditor_model", "qwen3.8:27b-q4_K_M"),
@@ -3157,7 +3275,7 @@ def main():
     atomic_json(run_dir / "manifest.json", settings)
     client = Ollama(cfg.get("ollama_url", "http://127.0.0.1:11434"))
     model_names = {
-        settings["extractor"], settings["arbitrator"], settings["writer"],
+        settings["extractor"], settings["arbitrator"], settings["high_risk_verifier"], settings["writer"],
         settings["auditor"], settings["public_auditor"],
     }
     atexit.register(lambda: [client.unload(model) for model in model_names])
@@ -3195,6 +3313,7 @@ def main():
             client, settings["extractor"], EXTRACT_SYSTEM, extraction_prompt(chunk), cache_path,
             attempts=int(cfg.get("summary_extract_attempts", 3)),
             progress=lambda count, a=start_progress, b=end_progress, p=position: emit(a + (b-a)*min(.9, count/1800), "summary_extract", f"Факты: часть {p} из {len(chunks)}"),
+            contract="extraction",
         )
         response = report.get("response", {})
         raw_facts = response.get("facts", []) if isinstance(response, dict) else []
@@ -3321,13 +3440,21 @@ def main():
             "reviewed_non_fact_ids": sorted(reviewed_non_facts),
         },
     )
-    emit(38, "summary_validate", f"Проверяю {len(facts)} фактов по цитатам")
-    validated, rejected = [], []
+    emit(37.5, "summary_evidence_repair", "Повторно слушаю критические фрагменты аудио")
+    facts, repair_report = run_evidence_repair(facts, args.cache, cfg)
+    atomic_json(run_dir / "evidence-repair-report.json", repair_report)
+    for fact in facts:
+        fact["compute_plan"] = adaptive_compute_plan({"risk_level": fact.get("risk_level"), "kind": fact.get("type")})
+        fact["model_provenance"] = {"extractor": settings["extractor"], "pipeline": PIPELINE_VERSION}
+    deterministic = [dict(item, confidence=1.0, validation="deterministic") for item in facts if item["compute_plan"]["tier"] == "LOW"]
+    to_validate = [item for item in facts if item["compute_plan"]["tier"] != "LOW"]
+    emit(38, "summary_validate", f"Адаптивно проверяю {len(to_validate)} из {len(facts)} фактов")
+    validated, rejected = list(deterministic), []
     batch_size = int(cfg.get("summary_validation_batch_size", 18))
-    for offset in range(0, len(facts), batch_size):
-        batch = facts[offset:offset + batch_size]
+    for offset in range(0, len(to_validate), batch_size):
+        batch = to_validate[offset:offset + batch_size]
         batch_index = offset // batch_size + 1
-        total_batches = max(1, math.ceil(len(facts) / batch_size))
+        total_batches = max(1, math.ceil(len(to_validate) / batch_size))
         accepted, denied = validate_facts_adaptive(
             client, settings["extractor"], batch, run_dir / "validate", offset
         )
@@ -3335,7 +3462,7 @@ def main():
         rejected.extend(denied)
         emit(38 + 15 * batch_index / total_batches, "summary_validate", f"Проверка фактов: пакет {batch_index} из {total_batches}")
 
-    critical = [item for item in validated if item.get("risk_level") in {"HIGH", "CRITICAL"} or item["type"] in CRITICAL_TYPES]
+    critical = [item for item in validated if item.get("compute_plan", {}).get("tier") in {"HIGH", "CRITICAL"}]
     ordinary_ids = {item["fact_id"] for item in validated} - {item["fact_id"] for item in critical}
     ordinary = [item for item in validated if item["fact_id"] in ordinary_ids]
     arbitrated, arbitration_rejected = [], []
@@ -3347,7 +3474,7 @@ def main():
         begin = 54 + 14 * (batch_index - 1) / total_batches
         finish = 54 + 14 * batch_index / total_batches
         accepted, denied = arbitrate(
-            client, settings["arbitrator"], batch, run_dir / "arbitrate" / f"batch-{batch_index:03d}.json",
+            client, settings["high_risk_verifier"], batch, run_dir / "arbitrate" / f"batch-{batch_index:03d}.json",
             progress=lambda count, a=begin, b=finish, p=batch_index: emit(a + (b-a)*min(.92, count/1800), "summary_arbitrate", f"Qwen 3.8: спорные факты, пакет {p} из {total_batches}"),
         )
         arbitrated.extend(accepted)
