@@ -21,6 +21,13 @@ class EvidenceRepairTests(unittest.TestCase):
         self.assertTrue(facts[0]["uncertainty"]["needs_review"])
         self.assertIn("repair_disagreement", facts[0]["semantic_risks"])
 
+    def test_long_audio_window_is_split_below_gigaam_limit(self):
+        ranges = repair.audio_chunk_ranges(90 * 16000, 16000)
+        self.assertEqual(ranges[0][0], 0)
+        self.assertEqual(ranges[-1][1], 90 * 16000)
+        self.assertTrue(all(right - left <= 20 * 16000 for left, right in ranges))
+        self.assertTrue(all(ranges[index][1] == ranges[index + 1][0] for index in range(len(ranges) - 1)))
+
 
 if __name__ == "__main__":
     unittest.main()
