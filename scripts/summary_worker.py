@@ -230,6 +230,14 @@ class Ollama:
         except Exception:
             pass
 
+    def available_models(self):
+        try:
+            with urllib.request.urlopen(self.url + "/api/tags", timeout=30) as response:
+                payload = json.loads(response.read())
+            return {item.get("name") for item in payload.get("models", []) if item.get("name")}
+        except Exception:
+            return set()
+
 
 def parse_json_response(text):
     return json.loads(text.strip())
@@ -3274,6 +3282,16 @@ def main():
     generation_suffix = ("-" + time.strftime("%Y%m%d-%H%M%S")) if args.force else ""
     atomic_json(run_dir / "manifest.json", settings)
     client = Ollama(cfg.get("ollama_url", "http://127.0.0.1:11434"))
+    available_models = client.available_models()
+    if available_models and settings["high_risk_verifier"] not in available_models:
+        fallback = settings["public_auditor"] if settings["public_auditor"] in available_models else settings["arbitrator"]
+        settings["high_risk_verifier_requested"] = settings["high_risk_verifier"]
+        settings["high_risk_verifier"] = fallback
+        settings["independent_model_degraded"] = True
+        atomic_json(run_dir / "model-role-fallback.json", {
+            "requested": settings["high_risk_verifier_requested"], "selected": fallback,
+            "reason": "requested independent model is not installed",
+        })
     model_names = {
         settings["extractor"], settings["arbitrator"], settings["high_risk_verifier"], settings["writer"],
         settings["auditor"], settings["public_auditor"],
