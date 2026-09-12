@@ -9,6 +9,7 @@ from pathlib import Path
 
 from model_common import choose_torch_device, write_json
 from asr_worker import load_model
+from evidence_repair import audio_chunk_ranges
 
 
 def main():
@@ -35,13 +36,25 @@ def main():
         start = max(0.0, float(request["start"])); end = min(len(audio) / rate, float(request["end"]))
         clip = audio[int(start * rate):int(end * rate)]
         clip_hash = hashlib.sha256(clip.tobytes()).hexdigest()
+        texts, words = [], []
+        ranges = audio_chunk_ranges(len(clip), rate)
         with __import__("tempfile").TemporaryDirectory(prefix="evidence-repair-") as directory:
-            path = Path(directory) / "window.wav"
-            sf.write(path, clip, rate, subtype="PCM_16")
-            result = model.transcribe(str(path), word_timestamps=True)
+            for part_index, (left, right) in enumerate(ranges, 1):
+                path = Path(directory) / f"window-{part_index:03d}.wav"
+                sf.write(path, clip[left:right], rate, subtype="PCM_16")
+                result = model.transcribe(str(path), word_timestamps=True)
+                if str(result.text or "").strip():
+                    texts.append(str(result.text).strip())
+                for word in getattr(result, "words", None) or []:
+                    words.append({
+                        "text": str(word.text),
+                        "start": round(start + left / rate + float(word.start), 3),
+                        "end": round(start + left / rate + float(word.end), 3),
+                    })
         repairs.append({
-            **request, "text": str(result.text or "").strip(), "audio_clip_sha256": clip_hash,
-            "model": args.model, "device": device, "method": "second_pass_no_vad_full_window",
+            **request, "text": " ".join(texts), "words": words, "audio_clip_sha256": clip_hash,
+            "model": args.model, "device": device,
+            "method": "second_pass_no_vad_fixed_chunks", "chunk_count": len(ranges),
         })
         print("REPAIR_PROGRESS " + json.dumps({"current": index, "total": len(requests)}), flush=True)
     write_json(args.output, {"schema_version": 1, "repairs": repairs})
