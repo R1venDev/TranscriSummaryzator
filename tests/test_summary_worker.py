@@ -638,7 +638,7 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(clean["main_topic"]["text"], document["main_topic"]["text"])
         self.assertEqual(clean["overview"][0]["text"], document["overview"][0]["text"])
 
-    def test_conflicting_percent_facts_do_not_collapse_broad_chronology(self):
+    def test_writer_temporal_links_without_relation_are_replaced_by_claims(self):
         facts = []
         statements = [
             ("hypothesis", "При одной свече качество проседает на 8%"),
@@ -663,7 +663,8 @@ class SummaryWorkerTests(unittest.TestCase):
         clean, _ = summary.sanitize_structured({
             "chronology": [{"text": text, "fact_ids": [item["fact_id"] for item in facts]}],
         }, facts)
-        self.assertEqual(clean["chronology"][0]["text"], text)
+        self.assertNotEqual(clean["chronology"][0]["text"], text)
+        self.assertIn("При одной свече качество проседает на 8%.", clean["chronology"][0]["text"])
 
     def test_evidence_containment_does_not_remove_additional_action(self):
         first = fact(kind="action", statement="Параллельно размечать Order Block")
