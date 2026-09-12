@@ -179,6 +179,14 @@ def submission_fingerprint(content_sha256, original_name):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def find_existing_job(db, content_sha256, original_name):
+    submission = submission_fingerprint(content_sha256, original_name)
+    return db.execute(
+        "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
+        (submission, content_sha256, Path(original_name).name),
+    ).fetchone()
+
+
 def safe_name(path):
     cleaned = "".join(c if c.isalnum() or c in "-_." else "_" for c in Path(path).stem).strip("._")
     return cleaned[:100] or "recording"
@@ -196,17 +204,15 @@ def normalize_speaker_count(value):
     return count
 
 
-def enqueue(path, known_fingerprint=None, speaker_count=None):
+def enqueue(path, known_fingerprint=None, speaker_count=None, original_name=None):
     path = Path(path).expanduser().resolve()
     if not path.is_file() or path.suffix.casefold() not in MEDIA_EXTENSIONS:
         raise ValueError("Это не поддерживаемый медиафайл: {}".format(path))
+    original_name = Path(original_name or path.name).name
     content_sha256 = known_fingerprint or fingerprint(path)
-    fp = submission_fingerprint(content_sha256, path.name)
+    fp = submission_fingerprint(content_sha256, original_name)
     db = connect()
-    existing = db.execute(
-        "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
-        (fp, content_sha256, path.name),
-    ).fetchone()
+    existing = find_existing_job(db, content_sha256, original_name)
     if existing:
         print("Уже в очереди: job {} ({})".format(existing["id"], existing["status"]))
         return existing["id"]
@@ -217,13 +223,13 @@ def enqueue(path, known_fingerprint=None, speaker_count=None):
         """INSERT INTO jobs
         (fingerprint, content_sha256, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at)
         VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)""",
-        (fp, content_sha256, str(path), path.name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
+        (fp, content_sha256, str(path), original_name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
     )
     db.commit()
     write_status_snapshot(db)
     job_id = cursor.lastrowid
     write_json(job_dir / "job.json", {"id": job_id, "fingerprint": fp, "content_sha256": content_sha256, "source": str(path), "created_at": now()})
-    print("Добавлено в очередь: job {} — {}".format(job_id, path.name))
+    print("Добавлено в очередь: job {} — {}".format(job_id, original_name))
     if config().get("open_dashboard_on_job", True):
         open_dashboard()
     return job_id
@@ -2201,9 +2207,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 os.fsync(stream.fileno())
             fp = fingerprint(partial)
             db = connect()
-            existing = db.execute(
-                "SELECT id, status, output_dir FROM jobs WHERE fingerprint = ?", (fp,)
-            ).fetchone()
+            existing = find_existing_job(db, fp, name)
             if existing:
                 duplicates = INBOX / "duplicates"
                 duplicates.mkdir(parents=True, exist_ok=True)
@@ -2228,7 +2232,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
 
             os.replace(partial, destination)
-            job_id = enqueue(destination, known_fingerprint=fp, speaker_count=speaker_count)
+            job_id = enqueue(destination, known_fingerprint=fp, speaker_count=speaker_count, original_name=name)
             metadata_path.unlink(missing_ok=True)
             self.send_json(
                 {"ok": True, "duplicate": False, "name": destination.name, "job_id": job_id},

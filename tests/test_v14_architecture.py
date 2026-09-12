@@ -44,6 +44,16 @@ class V14ArchitectureTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(first, pipeline.submission_fingerprint(digest, "meeting-one.wav"))
 
+    def test_early_upload_lookup_uses_content_and_name(self):
+        import sqlite3
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute("create table jobs (id integer, fingerprint text, content_sha256 text, original_name text)")
+        digest = "b" * 64
+        db.execute("insert into jobs values (2, ?, ?, ?)", (pipeline.submission_fingerprint(digest, "old.mkv"), digest, "old.mkv"))
+        self.assertIsNotNone(pipeline.find_existing_job(db, digest, "old.mkv"))
+        self.assertIsNone(pipeline.find_existing_job(db, digest, "renamed.mkv"))
+
     def test_legacy_job_is_backfilled_and_same_name_remains_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
