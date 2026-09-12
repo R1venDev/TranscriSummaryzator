@@ -486,7 +486,7 @@ def run_evidence_repair(facts, cache_root, cfg):
         cached = load_json(output)
         if cached.get("request_key") == request_key:
             repaired, report = reconcile_repairs(facts, cached.get("repairs", []))
-            report.update({"enabled": True, "status": "cached", "method": "second_pass_no_vad_full_window"})
+            report.update({"enabled": True, "status": "cached", "method": "second_pass_no_vad_fixed_chunks"})
             return repaired, report
     atomic_json(manifest, {"schema_version": 1, "request_key": request_key, "requests": requests})
     application_root = Path(cache_root).parents[3]
@@ -506,7 +506,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     payload["request_key"] = request_key
     atomic_json(output, payload)
     repaired, report = reconcile_repairs(facts, payload.get("repairs", []))
-    report.update({"enabled": True, "status": "completed", "method": "second_pass_no_vad_full_window"})
+    report.update({"enabled": True, "status": "completed", "method": "second_pass_no_vad_fixed_chunks"})
     return repaired, report
 
 
