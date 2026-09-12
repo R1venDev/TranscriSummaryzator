@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Голосовые профили</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:#0c0e13;color:#f5f7fb}
+    main{width:min(1180px,calc(100% - 32px));margin:40px auto 64px}
+    .page-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:24px}
+    h1{margin:0;font-size:30px;letter-spacing:-.03em}
+    h2{font-size:16px;margin:28px 0 12px;color:#aeb6c6}
+    .back{color:#b8d9ff;text-decoration:none;font-size:14px;font-weight:650;white-space:nowrap}.back:hover{color:white}
+    .card{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:22px;box-shadow:0 16px 50px #0005}
+    .create{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:12px}
+    .field{display:grid;gap:7px;min-width:0;color:#aeb6c6;font-size:13px}
+    input[type=text]{width:100%;height:44px;border:1px solid #3a4353;border-radius:11px;padding:0 13px;background:#202530;color:#f5f7fb;font:16px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+    input:focus-visible,.button:focus-visible{outline:2px solid #72d5ff;outline-offset:2px}
+    .button{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:0;border-radius:11px;padding:10px 15px;background:#2d75e8;color:white;cursor:pointer;font:650 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;white-space:nowrap;text-decoration:none}
+    .button:hover{background:#3983f7}.button:disabled{opacity:.55;cursor:wait}
+    .button.secondary{background:#282e3a;color:#dce3ee}.button.secondary:hover{background:#343c4a}
+    .button.danger{background:#3d252b;color:#ffb9c0}.button.danger:hover{background:#572e37;color:#ffe5e7}
+    .guide{margin-top:14px;color:#929db0;font-size:14px;line-height:1.55}
+    .profiles{display:grid;gap:14px}
+    .profile{display:grid;grid-template-columns:56px minmax(0,1fr);gap:14px 16px;align-items:start}
+    .avatar{width:56px;height:56px;display:grid;place-items:center;border-radius:17px;background:linear-gradient(145deg,#285b91,#514b9b);font-size:20px;font-weight:750}
+    .profile-main{min-width:0}.profile-name{font-size:19px;font-weight:700;overflow-wrap:anywhere}.profile-meta{margin-top:5px;color:#8f99ab;font-size:13px;line-height:1.4}
+    .status{display:inline-flex;margin-top:11px;padding:5px 9px;border-radius:99px;background:#292f3a;color:#b9c3d4;font-size:12px;font-weight:650}.status.ready{background:#173c2d;color:#77dfaa}
+    .samples{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:4px}.sample{display:grid;grid-template-columns:minmax(0,1fr) 30px;gap:10px;padding:12px;border-radius:12px;background:#12151c;color:#d7dce6;font-size:13px}.sample-info{min-width:0;padding-right:4px}.sample-name{font-size:14px;line-height:1.35;overflow-wrap:anywhere}.sample-time{margin-top:4px;color:#7f899b}.sample audio{grid-column:1/-1;width:100%;height:32px}.remove{grid-column:2;grid-row:1;width:30px;height:30px;border:0;border-radius:8px;background:#282d37;color:#aeb7c6;cursor:pointer;font-size:17px}.remove:hover{background:#533039;color:#ffd5d9}
+    .profile-actions{grid-column:2;display:flex;align-items:center;justify-content:flex-start;gap:10px;flex-wrap:wrap}
+    .progress{grid-column:1/-1;margin-top:2px}.track{height:9px;border-radius:99px;overflow:hidden;background:#292e3b}.bar{height:100%;width:0;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .25s}.progress-text{margin-top:7px;color:#9ca6b8;font-size:13px}.progress-text.error{color:#ff838c}
+    .empty{padding:28px 18px;text-align:center;color:#8e98aa}
+    dialog{width:min(440px,calc(100% - 32px));border:1px solid #353b49;border-radius:18px;padding:0;background:#171a22;color:#f5f7fb;box-shadow:0 24px 90px #000b}dialog::backdrop{background:#05060aab;backdrop-filter:blur(4px)}.dialog-body{display:grid;gap:18px;padding:22px}.dialog-title{margin:0;font-size:21px}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+    footer{margin:18px 4px;color:#656e7e;font-size:13px}
+    @media(max-width:650px){main{margin:24px auto}.page-head{align-items:flex-start}.create{grid-template-columns:1fr}.create .button{width:100%}.profile{grid-template-columns:46px minmax(0,1fr)}.avatar{width:46px;height:46px}.profile-actions{grid-column:1/-1}.profile-actions .button{flex:1 1 150px}.card{padding:18px}.samples{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <header class="page-head"><h1>Голосовые профили</h1><a class="back" href="/">← К записям</a></header>
+  <section class="card">
+    <form class="create" id="createForm"><label class="field" for="profileName"><span>Имя человека</span><input id="profileName" type="text" maxlength="80" autocomplete="off" placeholder="Например, Михаил" required></label><button class="button" id="createButton" type="submit">Создать профиль</button></form>
+    <div class="guide">Добавьте 2–5 чистых образцов общей длительностью от 30 секунд. Лучше использовать разные созвоны или микрофоны; в одном файле должен говорить только этот человек.</div>
+  </section>
+  <h2>Люди</h2>
+  <section class="profiles" id="profiles"><div class="card empty">Загружаю профили…</div></section>
+  <footer>Голосовые образцы и отпечатки хранятся только на вашем сервере.</footer>
+</main>
+<dialog id="editDialog"><form class="dialog-body" id="editForm"><h3 class="dialog-title">Переименовать профиль</h3><label class="field" for="editName"><span>Имя человека</span><input id="editName" type="text" maxlength="80" autocomplete="off" required></label><div class="dialog-actions"><button class="button secondary" id="editCancel" type="button">Отмена</button><button class="button" id="editSave" type="submit">Сохранить</button></div></form></dialog>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const list=document.querySelector('#profiles'),form=document.querySelector('#createForm'),nameInput=document.querySelector('#profileName'),createButton=document.querySelector('#createButton'),editDialog=document.querySelector('#editDialog'),editForm=document.querySelector('#editForm'),editName=document.querySelector('#editName'),editSave=document.querySelector('#editSave');
+let editingProfile=null;
+const duration=s=>{s=Math.round(Number(s)||0);return s<60?`${s} сек`:`${Math.floor(s/60)} мин ${s%60} сек`};
+const sampleWord=n=>n%10===1&&n%100!==11?'образец':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'образца':'образцов';
+function render(profiles){
+  if(!profiles.length){list.innerHTML='<div class="card empty">Профилей пока нет. Создайте первого человека и добавьте образцы его голоса.</div>';return}
+  list.innerHTML=profiles.map(p=>`<article class="card profile" data-profile="${p.id}" data-name="${esc(p.name)}"><div class="avatar">${esc((p.name||'?').trim().charAt(0).toUpperCase())}</div><div class="profile-main"><div class="profile-name">${esc(p.name)}</div><div class="profile-meta">${p.sample_count} ${sampleWord(p.sample_count)} · ${duration(p.duration_seconds)}</div><div class="status ${p.ready?'ready':''}">${p.ready?'Профиль готов':'Нужно минимум 2 образца и 30 секунд'}</div></div><div class="profile-actions"><input type="file" accept="video/*,audio/*,.mkv,.m4v,.webm,.flac,.ogg" data-file="${p.id}" hidden><button class="button secondary" type="button" data-edit="${p.id}">Переименовать</button><button class="button" type="button" data-add="${p.id}">Добавить образец</button><button class="button danger" type="button" data-delete="${p.id}">Удалить профиль</button></div>${p.samples.length?`<div class="samples">${p.samples.map(s=>`<div class="sample"><div class="sample-info"><div class="sample-name">${esc(s.name)}</div><div class="sample-time">${duration(s.duration_seconds)}</div></div><button class="remove" type="button" title="Удалить образец" aria-label="Удалить образец ${esc(s.name)}" data-remove="${s.id}" data-owner="${p.id}">×</button><audio controls preload="none" src="/api/profiles/audio?id=${p.id}&sample=${s.id}"></audio></div>`).join('')}</div>`:''}<div class="progress" data-progress="${p.id}" hidden><div class="track"><div class="bar"></div></div><div class="progress-text">Подготовка…</div></div></article>`).join('')
+}
+async function refresh(){try{const data=await fetch('/api/profiles',{cache:'no-store'}).then(r=>r.json());render(data.profiles||[])}catch(e){list.innerHTML='<div class="card empty">Не удалось загрузить профили.</div>'}}
+form.addEventListener('submit',async event=>{event.preventDefault();const name=nameInput.value.trim();if(!name)return;createButton.disabled=true;createButton.textContent='Создаю…';try{const response=await fetch('/api/profiles/create?name='+encodeURIComponent(name),{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'Не удалось создать профиль');nameInput.value='';await refresh()}catch(error){createButton.textContent=error.message;setTimeout(()=>createButton.textContent='Создать профиль',3000)}finally{createButton.disabled=false}});
+list.addEventListener('click',async event=>{
+  const add=event.target.closest('[data-add]');if(add){document.querySelector(`[data-file="${add.dataset.add}"]`).click();return}
+  const edit=event.target.closest('[data-edit]');if(edit){const card=edit.closest('[data-profile]');editingProfile=edit.dataset.edit;editName.value=card.dataset.name;editDialog.showModal();editName.focus();editName.select();return}
+  const remove=event.target.closest('[data-remove]');if(remove){if(!confirm('Удалить этот голосовой образец?'))return;remove.disabled=true;try{const response=await fetch(`/api/profiles/sample/delete?id=${remove.dataset.owner}&sample=${remove.dataset.remove}`,{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'Не удалось удалить образец');await refresh()}catch(error){remove.disabled=false;alert(error.message)}return}
+  const del=event.target.closest('[data-delete]');if(!del)return;const card=del.closest('[data-profile]'),name=card.dataset.name;if(!confirm(`Удалить профиль «${name}» вместе со всеми образцами? Профиль попадёт в серверную корзину и при необходимости может быть восстановлен.`))return;del.disabled=true;del.textContent='Удаляю…';try{const response=await fetch(`/api/profiles/delete?id=${del.dataset.delete}`,{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'Не удалось удалить профиль');await refresh()}catch(error){del.disabled=false;del.textContent='Удалить профиль';alert(error.message)}
+});
+document.querySelector('#editCancel').addEventListener('click',()=>editDialog.close());
+editForm.addEventListener('submit',async event=>{event.preventDefault();const name=editName.value.trim();if(!editingProfile||!name)return;editSave.disabled=true;editSave.textContent='Сохраняю…';try{const response=await fetch(`/api/profiles/rename?id=${editingProfile}&name=${encodeURIComponent(name)}`,{method:'POST'}),data=await response.json();if(!response.ok)throw new Error(data.error||'Не удалось переименовать профиль');editDialog.close();await refresh()}catch(error){alert(error.message)}finally{editSave.disabled=false;editSave.textContent='Сохранить'}});
+list.addEventListener('change',event=>{const input=event.target.closest('[data-file]');if(input&&input.files[0])uploadSample(input.dataset.file,input.files[0])});
+function uploadSample(profileId,file){
+  const card=document.querySelector(`[data-profile="${profileId}"]`),button=card.querySelector('[data-add]'),progress=card.querySelector('[data-progress]'),bar=progress.querySelector('.bar'),text=progress.querySelector('.progress-text'),xhr=new XMLHttpRequest();
+  button.disabled=true;button.textContent='Загружаю…';progress.hidden=false;text.className='progress-text';text.textContent='Передаю файл на сервер';bar.style.width='0%';
+  xhr.open('POST',`/api/profiles/sample?id=${profileId}&name=${encodeURIComponent(file.name)}`);xhr.setRequestHeader('Content-Type','application/octet-stream');
+  xhr.upload.onprogress=e=>{if(!e.lengthComputable)return;const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';text.textContent=p<100?`Загрузка: ${p}%`:'ReDimNet2: проверяю голос…'};
+  xhr.onload=async()=>{let data={};try{data=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300){bar.style.width='100%';text.textContent='Образец добавлен';await refresh()}else{text.className='progress-text error';text.textContent=data.error||'Не удалось обработать образец';button.disabled=false;button.textContent='Добавить образец'}};
+  xhr.onerror=()=>{text.className='progress-text error';text.textContent='Связь прервалась';button.disabled=false;button.textContent='Добавить образец'};
+  xhr.send(file);
+}
+refresh();
+</script></body></html>

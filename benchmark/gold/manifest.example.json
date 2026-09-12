@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "meeting-pipeline-gold-v1",
+  "baseline": "before",
+  "candidate": "after",
+  "cases": [
+    {
+      "id": "meeting-001",
+      "reference_status": "gold",
+      "reference": {
+        "transcript": "meeting-001/reference.transcript.json",
+        "rttm": "meeting-001/reference.rttm",
+        "semantics": "meeting-001/reference.semantic_records.json"
+      },
+      "systems": {
+        "before": {
+          "transcript": "meeting-001/before.transcript.json",
+          "rttm": "meeting-001/before.rttm",
+          "semantics": "meeting-001/before.semantic_records.json",
+          "semantic_alignment": "meeting-001/before.alignment.json"
+        },
+        "after": {
+          "transcript": "meeting-001/after.transcript.json",
+          "rttm": "meeting-001/after.rttm",
+          "semantics": "meeting-001/after.semantic_records.json",
+          "semantic_alignment": "meeting-001/after.alignment.json"
+        }
+      }
+    }
+  ]
+}

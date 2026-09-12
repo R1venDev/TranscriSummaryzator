@@ -1,0 +1,19 @@
+[Unit]
+Description=Meeting Transcript queue and dashboard
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=transcript
+Group=transcript
+WorkingDirectory=/srv/meeting-transcript
+Environment=PATH=/srv/meeting-transcript/.venv-gigaam/bin:/srv/meeting-transcript/.venv-diarizen/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /srv/meeting-transcript/pipeline.py watch
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

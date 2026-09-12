@@ -1,0 +1,18 @@
+# Runtime-only subset of DiariZen requirements for macOS arm64.
+# onnxruntime-gpu and training/evaluation packages are intentionally excluded.
+accelerate==1.6.0
+einops
+h5py
+huggingface-hub
+joblib
+librosa
+numpy==1.26.4
+pandas
+pyyaml
+scipy
+soundfile
+tabulate
+toml
+torchinfo
+tqdm
+thop

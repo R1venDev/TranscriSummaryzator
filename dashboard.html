@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Расшифровка встреч</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;background:#0c0e13;color:#f5f7fb}
+    main{width:min(980px,calc(100% - 32px));margin:40px auto}
+    .page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}
+    h1{font-size:30px;margin:0 0 24px;letter-spacing:-.03em}
+    .page-head h1{margin:0}
+    .nav-link{color:#b8d9ff;text-decoration:none;font-size:14px;font-weight:650;white-space:nowrap}
+    .nav-link:hover{color:white}
+    h2{font-size:16px;margin:28px 0 12px;color:#aeb6c6}
+    .card{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}
+    .upload{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:24px;border:1px dashed #46526a;transition:border-color .2s,background .2s}
+    .upload.drag{border-color:#72d5ff;background:#172333}
+    .upload-copy,.top>div:first-child,.job-main{min-width:0}
+    .upload-title{font-size:19px;font-weight:650}
+    .upload-help{margin-top:6px;color:#929db0;font-size:14px;line-height:1.45}
+    .upload-controls,.job-controls{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+    .upload-controls{justify-content:flex-end}
+    .upload-state{margin-top:16px}
+    .hidden{display:none}
+    .field{display:grid;gap:5px;color:#929db0;font-size:12px;white-space:nowrap}
+    select{height:42px;min-width:116px;border:1px solid #3a4353;border-radius:10px;padding:0 32px 0 11px;background:#202530;color:#f5f7fb;font:600 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;cursor:pointer}
+    select:focus-visible,.action:focus-visible{outline:2px solid #72d5ff;outline-offset:2px}
+    select:disabled{opacity:.5;cursor:not-allowed}
+    .top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+    .name,.job-name{font-weight:650;overflow-wrap:anywhere;word-break:break-word}
+    .name{font-size:19px}
+    .job-name{font-size:15px;line-height:1.35}
+    .percent{flex:0 0 auto;font-size:28px;font-weight:750;color:#a9d2ff;font-variant-numeric:tabular-nums}
+    .track{height:15px;margin:20px 0 14px;border-radius:99px;overflow:hidden;background:#292e3b}
+    .bar{height:100%;width:0;border-radius:inherit;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .35s ease;position:relative}
+    .bar.running::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 25%,#fff5 50%,transparent 75%);animation:shine 1.5s infinite}
+    @keyframes shine{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+    .detail{font-size:16px;color:#cbd2df}
+    .meta{margin-top:8px;color:#858fa2;font-size:14px}
+    .ready{color:#62d69a}.failed{color:#ff7d86}
+    .job{display:grid;grid-template-columns:54px minmax(0,1fr) auto;gap:14px;padding:16px 4px;border-top:1px solid #292e3b;align-items:center}
+    .job:first-child{border-top:0}
+    .badge{padding:5px 8px;border-radius:99px;background:#252a35;font-size:12px;text-align:center;font-variant-numeric:tabular-nums}
+    .small{color:#8e98aa;font-size:13px;line-height:1.4;margin-top:4px}
+    .job-controls{justify-content:flex-end;flex:0 0 auto}
+    .job-controls select{min-width:92px}
+    .action{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:0;border-radius:10px;padding:10px 14px;background:#2d75e8;color:white;cursor:pointer;font:600 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;text-decoration:none;white-space:nowrap;flex:0 0 auto}
+    .action.secondary{background:#252b37;color:#dce8f8;border:1px solid #394354}
+    .action:hover{background:#3983f7}.action.secondary:hover{background:#303949}
+    .action:active{transform:translateY(1px)}.action:disabled{opacity:.5;cursor:wait;transform:none}
+    .empty{color:#8e98aa;padding:12px 0}
+    footer{margin:18px 4px;color:#656e7e;font-size:13px}
+    iframe{display:none}
+    @media(max-width:780px){
+      main{margin:24px auto}.upload{grid-template-columns:1fr;align-items:stretch}.upload-controls{justify-content:flex-start}
+      .job{grid-template-columns:48px minmax(0,1fr)}.job-controls{grid-column:2;justify-content:flex-start}
+    }
+    @media(max-width:520px){
+      .card{padding:18px}.upload-controls{display:grid;grid-template-columns:1fr}.upload-controls .field,.upload-controls select,.upload-controls .action{width:100%}
+      .job{grid-template-columns:1fr}.badge{justify-self:start}.job-controls{grid-column:1;display:grid;grid-template-columns:1fr 1fr;width:100%}.job-controls .field{grid-column:1/-1}.job-controls select{width:100%}
+      .top{gap:10px}.percent{font-size:24px}
+    }
+  </style>
+</head>
+<body><main><header class="page-head"><h1>Расшифровка встреч</h1><a class="nav-link" href="/profiles">Голосовые профили →</a></header><section class="card upload" id="uploadBox"><div class="upload-copy"><div class="upload-title">Загрузить запись</div><div class="upload-help">Выберите видео или аудио либо перетащите файл сюда. Количество спикеров можно задать сейчас или изменить позже.</div><div class="upload-state hidden" id="uploadState"></div></div><div class="upload-controls"><label class="field" for="uploadSpeakers"><span>Спикеров</span><select id="uploadSpeakers"><option value="auto">Авто, до 8</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select></label><input id="fileInput" type="file" accept="video/*,audio/*,.mkv,.m4v,.webm,.flac,.ogg" hidden><button class="action" id="chooseButton" type="button">Выбрать файл</button></div></section><h2>Текущая обработка</h2><section class="card" id="current"><div class="empty">Загружаю состояние…</div></section><h2>Последние записи</h2><section class="card" id="history"></section><footer>Защищённая страница сервера · доступна через Tailscale · обновляется автоматически.</footer></main>
+<script>
+const labels={queued:'В очереди',validate:'Проверка записи',extract_audio:'Подготовка аудио',diarization:'DiariZen: основная разметка',ultra_diarization:'Ultra: независимая проверка',consensus:'Сопоставление двух разметок',transcription:'Распознавание речи',speaker_identification:'ReDimNet2: определение имён',export:'Создание файлов',done:'Готово'};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function elapsed(j){const s=j.started_at||j.created_at;if(!s)return '';const e=j.finished_at?new Date(j.finished_at):new Date();const n=Math.max(0,Math.round((e-new Date(s))/1000));return `${Math.floor(n/60)} мин ${n%60} сек`}
+let lastKey='';
+const input=document.querySelector('#fileInput'),button=document.querySelector('#chooseButton'),box=document.querySelector('#uploadBox'),uploadState=document.querySelector('#uploadState'),uploadSpeakers=document.querySelector('#uploadSpeakers'),history=document.querySelector('#history');
+button.addEventListener('click',()=>input.click());
+input.addEventListener('change',()=>{if(input.files[0])upload(input.files[0])});
+for(const eventName of ['dragenter','dragover'])box.addEventListener(eventName,event=>{event.preventDefault();box.classList.add('drag')});
+for(const eventName of ['dragleave','drop'])box.addEventListener(eventName,event=>{event.preventDefault();box.classList.remove('drag')});
+box.addEventListener('drop',event=>{const file=event.dataTransfer.files[0];if(file)upload(file)});
+function upload(file){
+  const xhr=new XMLHttpRequest();button.disabled=true;button.textContent='Загрузка…';uploadState.classList.remove('hidden');
+  uploadState.innerHTML=`<div class="top"><div><div class="name">${esc(file.name)}</div><div class="meta" id="uploadBytes">Подготовка передачи</div></div><div class="percent" id="uploadPercent">0%</div></div><div class="track"><div class="bar running" id="uploadBar" style="width:0"></div></div><div class="detail" id="uploadDetail">Передаю файл на сервер</div>`;
+  xhr.open('POST','/api/upload?name='+encodeURIComponent(file.name)+'&speakers='+encodeURIComponent(uploadSpeakers.value));
+  xhr.setRequestHeader('Content-Type','application/octet-stream');
+  xhr.upload.onprogress=event=>{if(!event.lengthComputable)return;const p=Math.min(100,event.loaded/event.total*100);document.querySelector('#uploadPercent').textContent=Math.round(p)+'%';document.querySelector('#uploadBar').style.width=p+'%';document.querySelector('#uploadBytes').textContent=`${(event.loaded/1048576).toFixed(0)} из ${(event.total/1048576).toFixed(0)} МБ`};
+  xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText)}catch(e){}if(xhr.status>=200&&xhr.status<300){document.querySelector('#uploadPercent').textContent='100%';document.querySelector('#uploadBar').style.width='100%';document.querySelector('#uploadBar').classList.remove('running');const detail=document.querySelector('#uploadDetail');detail.className='detail ready';if(data.duplicate){detail.innerHTML=data.result_url?`Эта запись уже обработана как задание №${Number(data.job_id)}. <a href="${esc(data.result_url)}">Открыть результат</a>`:`Эта запись уже есть в очереди как задание №${Number(data.job_id)}.`}else{detail.textContent=`Файл загружен и поставлен в очередь как задание №${Number(data.job_id)}`}input.value='';lastKey='';refresh()}else{uploadError(data.error||`Ошибка сервера (${xhr.status})`)}};
+  xhr.onerror=()=>uploadError('Связь прервалась. Проверьте Tailscale и повторите загрузку.');
+  xhr.onabort=()=>uploadError('Загрузка отменена.');
+  xhr.onloadend=()=>{button.disabled=false;button.textContent='Выбрать файл'};
+  xhr.send(file);
+}
+function uploadError(message){const detail=document.querySelector('#uploadDetail');if(detail){detail.className='detail failed';detail.textContent=message}}
+function speakerLabel(value){return value==null?'авто, до 8':String(value)}
+function speakerOptions(selected){return [['auto','Авто, до 8'],['1','1'],['2','2'],['3','3'],['4','4'],['5','5'],['6','6'],['7','7'],['8','8']].map(([value,label])=>`<option value="${value}" ${(selected==null?'auto':String(selected))===value?'selected':''}>${label}</option>`).join('')}
+async function rerunSpeakers(button){
+  const id=Number(button.dataset.id),select=document.querySelector(`#speakers-${id}`),previous=button.textContent;
+  button.disabled=true;select.disabled=true;button.textContent='Ставлю в очередь…';
+  try{
+    const response=await fetch(`/api/speakers?id=${id}&count=${encodeURIComponent(select.value)}`,{method:'POST'}),data=await response.json();
+    if(!response.ok)throw new Error(data.error||'Не удалось изменить число спикеров');
+    button.textContent='В очереди';lastKey='';await refresh();
+  }catch(error){button.textContent='Ошибка';button.title=error.message;select.disabled=false;setTimeout(()=>{button.textContent=previous;button.disabled=false;button.title=''},2500)}
+}
+history.addEventListener('click',event=>{const retry=event.target.closest('[data-rerun-speakers]');if(retry)rerunSpeakers(retry)});
+async function refresh(){try{
+  const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),jobs=d.jobs||[],uploads=d.uploads||[];
+  const key=JSON.stringify([d.processing_enabled,uploads,jobs.map(j=>[j.id,j.status,j.stage,j.progress,j.detail,j.error,j.output_dir,j.speaker_count,j.summary_status,j.summary_progress,j.summary_detail,j.summary_error])]);
+  if(key===lastKey)return;lastKey=key;
+  const u=uploads[0],a=jobs.find(j=>j.status==='running'||j.status==='queued')||jobs[0];
+  if(u){
+    const p=Math.max(0,Math.min(100,Number(u.progress)||0));
+    document.querySelector('#current').innerHTML=`<div class="top"><div><div class="name">${esc(u.name)}</div><div class="meta">Передача с Mac · ${(u.received/1048576).toFixed(0)} из ${(u.size/1048576).toFixed(0)} МБ</div></div><div class="percent">${Math.round(p)}%</div></div><div class="track"><div class="bar running" style="width:${p}%"></div></div><div class="detail">Загружаю запись на сервер</div>`;
+  }else if(!a){
+    document.querySelector('#current').innerHTML='<div class="empty">Очередь пуста. Новая запись OBS появится здесь автоматически.</div>';
+  }else{
+    const p=Math.max(0,Math.min(100,Number(a.progress)||0)),cls=a.status==='done'?'ready':a.status==='failed'?'failed':'';
+    document.querySelector('#current').innerHTML=`<div class="top"><div><div class="name">${esc(a.original_name)}</div><div class="meta">Задание №${a.id} · спикеров: ${speakerLabel(a.speaker_count)} · ${elapsed(a)}</div></div><div class="percent ${cls}">${Math.round(p)}%</div></div><div class="track"><div class="bar ${a.status==='running'?'running':''}" style="width:${p}%"></div></div><div class="detail ${cls}">${esc(a.detail||labels[a.stage]||a.stage)}${a.error?' — '+esc(a.error):''}</div>`;
+  }
+  history.innerHTML=jobs.length?jobs.slice(0,12).map(j=>{const busy=j.status==='running'||j.status==='queued',summaryActive=j.summary_status==='running'||j.summary_status==='queued'||j.summary_status==='queued_force',summaryText=j.summary_status==='done'?'Саммари готово':summaryActive?`${esc(j.summary_detail||'Создаю саммари')} · ${Math.round(Number(j.summary_progress)||0)}%`:j.summary_status==='failed'?`Ошибка саммари: ${esc(j.summary_error||'неизвестная ошибка')}`:'Саммари ещё не создано';return `<div class="job"><div class="badge">${Math.round(Number(j.progress)||0)}%</div><div class="job-main"><div class="job-name">${esc(j.original_name)}</div><div class="small">${esc(j.detail||labels[j.stage]||j.stage)} · ${elapsed(j)}</div><div class="small ${j.summary_status==='failed'?'failed':''}">${summaryText}</div></div><div class="job-controls"><label class="field" for="speakers-${j.id}"><span>Спикеров</span><select id="speakers-${j.id}" ${busy?'disabled':''}>${speakerOptions(j.speaker_count)}</select></label><button class="action secondary" type="button" data-rerun-speakers data-id="${j.id}" ${busy?'disabled':''}>Переразметить</button>${j.output_dir?`<a class="action secondary" href="/summary?id=${j.id}">Саммари</a><a class="action" href="/result?id=${j.id}">Расшифровка</a>`:''}</div></div>`}).join(''):'<div class="empty">Пока нет записей.</div>';
+}catch(e){document.querySelector('#current').innerHTML='<div class="empty">Нет связи с сервером. Проверьте Tailscale.</div>'}}
+refresh();setInterval(refresh,2000);
+</script></body></html>
