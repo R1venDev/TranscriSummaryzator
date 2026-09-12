@@ -1138,6 +1138,37 @@ class SummaryWorkerTests(unittest.TestCase):
             registry = summary.build_semantic_registry(Client(), "model", facts, Path(directory))
         self.assertEqual([item["record_id"] for item in registry["records"]], ["F00001", "F00002"])
 
+    def test_critical_consensus_accepts_two_matching_supported_verdicts(self):
+        original = dict(fact(kind="decision"), confidence=.8)
+        primary = dict(original, validation="supported", confidence=.91)
+        secondary = dict(original, validation="supported", confidence=.84)
+        accepted, rejected = summary.critical_verifier_consensus(
+            [original], [primary], [secondary], "ministral", "gemma"
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(accepted[0]["validation"], "dual_supported")
+        self.assertEqual(accepted[0]["confidence"], .84)
+        self.assertEqual(accepted[0]["critical_consensus"]["models"], ["ministral", "gemma"])
+
+    def test_critical_consensus_fails_closed_on_disagreement(self):
+        original = dict(fact(kind="decision"), confidence=.8)
+        primary = dict(original, validation="supported", confidence=.91)
+        accepted, rejected = summary.critical_verifier_consensus(
+            [original], [primary], [], "ministral", "gemma"
+        )
+        self.assertEqual(accepted, [])
+        self.assertEqual(rejected[0]["reason"], "critical_verifier_disagreement")
+
+    def test_critical_consensus_requires_identical_corrections(self):
+        original = dict(fact(kind="decision"), confidence=.8)
+        primary = dict(original, validation="corrected", statement="Предложено проверить BOS", confidence=.9)
+        secondary = dict(original, validation="corrected", statement="Решено проверить BOS", confidence=.9)
+        accepted, rejected = summary.critical_verifier_consensus(
+            [original], [primary], [secondary], "ministral", "gemma"
+        )
+        self.assertEqual(accepted, [])
+        self.assertEqual(rejected[0]["reason"], "critical_correction_mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()
