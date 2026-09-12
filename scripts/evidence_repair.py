@@ -9,6 +9,16 @@ NUMBER = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?(?!\w)")
 NEGATION = re.compile(r"(?iu)(?:^|\W)(?:не|нет|нельзя|никогда|без)(?:\W|$)")
 
 
+def audio_chunk_ranges(total_samples, sample_rate, max_seconds=20.0):
+    """Return contiguous chunks that stay below GigaAM's 25-second limit."""
+    total_samples = max(0, int(total_samples))
+    chunk_samples = max(1, int(float(sample_rate) * float(max_seconds)))
+    return [
+        (offset, min(total_samples, offset + chunk_samples))
+        for offset in range(0, total_samples, chunk_samples)
+    ]
+
+
 def repair_requests(facts, padding_before=2.0, padding_after=4.0, limit=24):
     result, by_evidence = [], {}
     ranked = sorted(facts, key=lambda item: (item.get("risk_level") != "CRITICAL", float(item.get("start", 0))))
