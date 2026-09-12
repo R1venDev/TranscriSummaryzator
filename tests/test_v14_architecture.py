@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.config_schema import PipelineConfig, load_config
 from scripts.evidence_ledger import attach_word_ids, ledger_document, risk_level, semantic_risks
@@ -42,6 +43,22 @@ class V14ArchitectureTests(unittest.TestCase):
         second = pipeline.submission_fingerprint(digest, "meeting-two.wav")
         self.assertNotEqual(first, second)
         self.assertEqual(first, pipeline.submission_fingerprint(digest, "meeting-one.wav"))
+
+    def test_legacy_job_is_backfilled_and_same_name_remains_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(pipeline, "STATE", root / "state"), patch.object(pipeline, "DB_PATH", root / "state/jobs.sqlite3"):
+                db = pipeline.connect()
+                db.execute(
+                    "INSERT INTO jobs (fingerprint,source_path,original_name,status,stage,job_dir,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                    ("a" * 64, "/tmp/old.wav", "old.wav", "done", "done", "/tmp/job", "now", "now"),
+                )
+                db.commit()
+                db.execute("UPDATE jobs SET content_sha256=NULL")
+                db.commit(); db.close()
+                migrated = pipeline.connect()
+                row = migrated.execute("SELECT content_sha256 FROM jobs").fetchone()
+                self.assertEqual(row["content_sha256"], "a" * 64)
 
 
 if __name__ == "__main__":

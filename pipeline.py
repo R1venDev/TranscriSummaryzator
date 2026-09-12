@@ -150,6 +150,9 @@ def connect():
     for column, statement in migrations.items():
         if column not in columns:
             db.execute(statement)
+    # Legacy fingerprints were raw content hashes. Preserve them for stable
+    # output paths while backfilling the new explicit content digest.
+    db.execute("UPDATE jobs SET content_sha256 = fingerprint WHERE content_sha256 IS NULL")
     db.execute("UPDATE jobs SET progress = 100 WHERE status = 'done' AND progress < 100")
     db.execute("UPDATE jobs SET detail = 'Готово' WHERE status = 'done' AND detail IS NULL")
     db.execute("UPDATE jobs SET started_at = created_at WHERE started_at IS NULL AND status IN ('running', 'done', 'failed')")
@@ -200,7 +203,10 @@ def enqueue(path, known_fingerprint=None, speaker_count=None):
     content_sha256 = known_fingerprint or fingerprint(path)
     fp = submission_fingerprint(content_sha256, path.name)
     db = connect()
-    existing = db.execute("SELECT * FROM jobs WHERE fingerprint = ?", (fp,)).fetchone()
+    existing = db.execute(
+        "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
+        (fp, content_sha256, path.name),
+    ).fetchone()
     if existing:
         print("Уже в очереди: job {} ({})".format(existing["id"], existing["status"]))
         return existing["id"]
