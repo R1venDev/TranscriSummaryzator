@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import re
+import hashlib
+import json
 
 
 SPEAKER_RISK_FLAGS = {"ambiguous", "no_diarization", "low_confidence", "overlap"}
@@ -233,6 +235,7 @@ def normalize_semantic_record(raw, fact):
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
+        "topic": fact.get("topic") or "Прочее",
         "statement": fact["statement"],
         "start": float(fact.get("start", 0)),
         "subject": str(raw.get("subject") or "").strip() or None,
@@ -262,6 +265,11 @@ def normalize_semantic_record(raw, fact):
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),
         "risk_level": fact.get("risk_level", "LOW"),
+        "source_word_ids": list(dict.fromkeys(
+            word_id for item in fact.get("evidence", []) for word_id in item.get("source_word_ids", [])
+        )),
+        "model_provenance": fact.get("model_provenance"),
+        "prompt_version": fact.get("prompt_version"),
     }
 
 
@@ -293,17 +301,57 @@ def task_records(records):
     return result
 
 
-def meeting_state(records):
-    """Build the canonical DialogueEvent graph and deterministic state views."""
+def _semantic_id(prefix, value):
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return prefix + hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _tokens(value):
+    ignored = {"это", "как", "для", "что", "при", "или", "уже", "ещё", "будет", "нужно", "надо"}
+    return {item for item in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(item) > 2 and item not in ignored}
+
+
+def _same_proposition(left, right):
+    left = {**left, **left.get("proposition", {})}
+    right = {**right, **right.get("proposition", {})}
+    a = (left.get("subject"), left.get("predicate"))
+    b = (right.get("subject"), right.get("predicate"))
+    if all(a) and a == b:
+        return True
+    left_tokens = _tokens(" ".join(str(left.get(key) or "") for key in ("subject", "predicate", "object", "presentation")))
+    right_tokens = _tokens(" ".join(str(right.get(key) or "") for key in ("subject", "predicate", "object", "presentation")))
+    return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens))) >= 0.55
+
+
+def adaptive_compute_plan(record):
+    """Turn semantic risk into an explicit, auditable compute policy."""
+    level = record.get("risk_level", "LOW")
+    sensitive = record.get("kind") in {"decision", "action", "schedule", "metric"}
+    if level == "CRITICAL" or (level == "HIGH" and sensitive):
+        return {"tier": "CRITICAL", "passes": ["deterministic", "independent_verifier", "audio_repair", "speaker_recheck"], "fail_closed": True}
+    if level == "HIGH":
+        return {"tier": "HIGH", "passes": ["deterministic", "independent_verifier", "expanded_context"], "fail_closed": True}
+    if level == "MEDIUM":
+        return {"tier": "MEDIUM", "passes": ["deterministic", "verifier"], "fail_closed": False}
+    return {"tier": "LOW", "passes": ["deterministic"], "fail_closed": False}
+
+
+def meeting_state(records, *, provenance=None):
+    """Build the canonical, immutable DialogueEvent graph and all state views."""
+    provenance = provenance or {}
     events = []
     for record in records:
-        event_id = "EV" + str(record["record_id"])[1:]
+        claim_id = record.get("claim_id") or _semantic_id("C", {
+            "kind": record.get("kind"), "statement": record.get("statement"),
+            "evidence_ids": record.get("evidence_ids", []),
+        })
+        event_id = _semantic_id("EV", claim_id)
         act = {
             "action": "assignment", "current_state": "assertion", "observation": "assertion",
             "metric": "assertion", "goal": "proposal",
         }.get(record.get("kind"), record.get("kind", "assertion"))
         events.append({
-            "event_id": event_id, "source_record_id": record["record_id"], "act": act,
+            "event_id": event_id, "claim_id": claim_id, "source_record_id": record["record_id"], "act": act,
             "proposition": {"subject": record.get("subject"), "predicate": record.get("predicate"), "object": record.get("object")},
             "speaker_ids": list(record.get("attributed_speakers", [])),
             "mentioned_participant_ids": list(record.get("assignees", [])),
@@ -312,12 +360,27 @@ def meeting_state(records):
             "evidence_ids": list(record.get("evidence_ids", [])), "start": float(record.get("start", 0)),
             "risk": {"level": record.get("risk_level", "LOW"), "signals": list(record.get("semantic_risks", [])), **record.get("uncertainty", {})},
             "presentation": record.get("statement"),
+            "topic": record.get("topic") or "Прочее",
+            "provenance": {
+                "audio_sha256": provenance.get("audio_sha256"),
+                "source_word_ids": list(dict.fromkeys(record.get("source_word_ids", []))),
+                "model": record.get("model_provenance"),
+                "prompt_version": record.get("prompt_version"),
+                "schema_version": 2,
+            },
+            "components": [
+                {"component_id": _semantic_id("CC", [claim_id, "condition", index]), "kind": "precondition", **value}
+                for index, value in enumerate(record.get("conditions", []), 1)
+            ] + [
+                {"component_id": _semantic_id("CQ", [claim_id, "quantity", index]), "kind": "quantity", **value}
+                for index, value in enumerate(record.get("quantities", []), 1)
+            ] + ([{"component_id": _semantic_id("CT", [claim_id, "time"]), "kind": "time", "text": record.get("time_expression"), "evidence_ids": list(record.get("evidence_ids", []))}] if record.get("time_expression") else []),
+            "compute_plan": adaptive_compute_plan(record),
         })
     relations = []
     for index, current in enumerate(events):
         for older in events[:index]:
-            a, b = current["proposition"], older["proposition"]
-            if not a.get("subject") or not a.get("predicate") or (a["subject"], a["predicate"]) != (b.get("subject"), b.get("predicate")):
+            if not _same_proposition(current, older):
                 continue
             relation = None
             if current["polarity"] != older["polarity"]:
@@ -326,16 +389,54 @@ def meeting_state(records):
                 relation = "supersedes"
             elif current["act"] == "decision" and older["act"] in {"proposal", "assertion"}:
                 relation = "accepts"
+            elif current["act"] == "assertion" and older["act"] == "question":
+                relation = "answers"
+            elif "correction" in current.get("risk", {}).get("signals", []):
+                relation = "corrects"
             if relation:
-                relations.append({"source_event": current["event_id"], "relation": relation, "target_event": older["event_id"], "evidence_ids": current["evidence_ids"]})
+                payload = {"source_event": current["event_id"], "relation": relation, "target_event": older["event_id"], "evidence_ids": current["evidence_ids"]}
+                payload["relation_id"] = _semantic_id("R", payload)
+                relations.append(payload)
 
-    superseded = {item["target_event"] for item in relations if item["relation"] == "supersedes"}
+    # Explicit question links and assignee confirmations are already grounded by
+    # normalize_semantic_record; materialize them in the same global graph.
+    by_record = {item["source_record_id"]: item for item in events}
+    for record in records:
+        source = by_record.get(record.get("record_id"))
+        if not source:
+            continue
+        for answer_id in record.get("answer_record_ids", []):
+            target = by_record.get(answer_id)
+            if target:
+                payload = {"source_event": target["event_id"], "relation": "answers", "target_event": source["event_id"], "evidence_ids": list(dict.fromkeys(target["evidence_ids"] + source["evidence_ids"]))}
+                payload["relation_id"] = _semantic_id("R", payload); relations.append(payload)
+        if record.get("assignment_status") == "confirmed":
+            payload = {"source_event": source["event_id"], "relation": "accepted_by", "target_event": source["event_id"], "participant_ids": record.get("assignees", []), "evidence_ids": record.get("confirmation_evidence_ids", [])}
+            payload["relation_id"] = _semantic_id("R", payload); relations.append(payload)
+
+    unique_relations = {item["relation_id"]: item for item in relations}
+    relations = sorted(unique_relations.values(), key=lambda item: item["relation_id"])
+
+    superseded = {item["target_event"] for item in relations if item["relation"] in {"supersedes", "corrects"}}
     decisions = [item for item in events if item["act"] == "decision" and item["event_id"] not in superseded]
     questions = [{**item, "state": next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
-    tasks = task_records(records)
+    active_record_ids = {item["source_record_id"] for item in events if item["event_id"] not in superseded}
+    tasks = [item for item in task_records(records) if item["source_record_id"] in active_record_ids]
+    active = [item for item in events if item["event_id"] not in superseded]
+    topic_states = []
+    for topic in dict.fromkeys(item["topic"] for item in active):
+        members = [item for item in active if item["topic"] == topic]
+        topic_states.append({"topic": topic, "event_ids": [item["event_id"] for item in members], "claim_ids": [item["claim_id"] for item in members]})
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "state_id": _semantic_id("MS", [item["claim_id"] for item in events]),
         "events": events,
         "relations": relations,
-        "views": {"decisions": decisions, "tasks": tasks, "questions": questions},
+        "active_event_ids": [item["event_id"] for item in active],
+        "topic_states": topic_states,
+        "views": {
+            "decisions": decisions, "tasks": tasks, "questions": questions,
+            "timeline": sorted(events, key=lambda item: (item["start"], item["event_id"])),
+            "summary": [{**item, "state": "active" if item["event_id"] not in superseded else "superseded"} for item in events],
+        },
     }

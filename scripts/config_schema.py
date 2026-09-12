@@ -102,6 +102,7 @@ class PipelineConfig(BaseModel):
     ollama_url: str = "http://127.0.0.1:11434"
     summary_extractor_model: str = "qwen3.5:9b-q4_K_M"
     summary_arbitrator_model: str = "qwen3.5:9b-q4_K_M"
+    summary_high_risk_verifier_model: str = "gemma3:12b"
     summary_writer_model: str = "qwen3.5:9b-q4_K_M"
     summary_auditor_model: str = "qwen3.5:9b-q4_K_M"
     summary_public_auditor_model: str = "qwen3.8:27b-q4_K_M"
@@ -120,6 +121,11 @@ class PipelineConfig(BaseModel):
     summary_min_publication_coverage: float = Field(0.99, ge=0, le=1)
     summary_resolution_batch_size: int = Field(7, ge=1)
     summary_auditor_failure_policy: Literal["risk_based", "fail_closed"] = "risk_based"
+    summary_audio_repair_enabled: bool = True
+    summary_repair_padding_before_seconds: float = Field(2.0, ge=0, le=10)
+    summary_repair_padding_after_seconds: float = Field(4.0, ge=0, le=15)
+    summary_repair_max_windows: int = Field(24, ge=0, le=100)
+    summary_require_immutable_provenance: bool = True
     domain_vocabulary: dict[str, str] = Field(default_factory=dict)
 
     def model_post_init(self, __context) -> None:

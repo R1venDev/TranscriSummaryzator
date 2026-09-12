@@ -119,3 +119,41 @@ entry point is `python diarize.py --audio meeting.wav --enrollment enrollment
 - precision/recall/F1 тезисов, типов, исполнителей и условий измеряют смысл.
 
 Режим `--fail-on-regression` блокирует выпуск при ухудшении любого основного показателя. Автоматический вывод pipeline запрещено помечать как `gold`; до появления ручной разметки система сообщает отсутствие измерения и не публикует фиктивную «точность».
+# Summary v15: canonical meeting intelligence
+
+The publication path is now state-first:
+
+```text
+Audio → transcript + immutable word ledger → risk scheduler
+      → atomic typed claims → evidence repair (critical windows)
+      → independent validation → global dialogue relations
+      → canonical MeetingState → deterministic views
+      → constrained narrative → public-surface audit
+```
+
+`semantics/meeting_state.json` is the only semantic authority used by the
+writer. `DecisionsView`, `TasksView`, `QuestionsView`, `TimelineView`, and
+`SummaryView` are deterministic projections of that state. Markdown and HTML
+only render those projections and cannot promote a proposal to a decision.
+
+Every canonical event carries a stable `claim_id`, exact `evidence_ids`, source
+word IDs, the source audio SHA-256, risk/compute policy, model provenance, and
+typed condition/quantity/time components. Publication fails closed when a
+claim cannot be traced to both immutable audio and ASR-word evidence.
+
+The global relation resolver processes the whole meeting and emits stable
+relations (`accepts`, `answers`, `contradicts`, `corrects`, `supersedes`, and
+`accepted_by`). Narrative text may only introduce semantic connective language
+when the cited claims have a corresponding relation; otherwise the generated
+sentence is replaced by the canonical claim wording.
+
+Risk controls compute instead of merely decorating output: LOW claims use
+deterministic validation, MEDIUM claims add a verifier, HIGH claims use the
+independent high-risk model with expanded context, and CRITICAL claims also
+trigger a batched second ASR pass over `t−2s…t+4s` audio windows. Disagreement
+on numbers or negation remains CRITICAL and is exposed to all later auditors.
+
+`evaluate_pipeline.py` reports claim precision/recall, decision and action
+precision, assignee and condition F1, deadline/number/negation/question
+accuracy, unsupported-relation rate, citation precision, omission rate, and
+end-to-end error attribution.

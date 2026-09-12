@@ -205,6 +205,30 @@ class QualitySchemaTests(unittest.TestCase):
         self.assertEqual(record["question_kind"], "discussion")
         self.assertEqual(record["question_status"], "unresolved")
 
+    def test_meeting_state_has_stable_claims_relations_and_all_views(self):
+        base = {
+            "subject": "порог", "predicate": "установить", "object": "значение",
+            "polarity": "positive", "conditions": [], "time_expression": None,
+            "attributed_speakers": ["A"], "proposed_by": [], "assignees": [],
+            "assignment_status": "not_applicable", "confirmation_evidence_ids": [],
+            "confirmation_utterances": [], "question_status": "not_applicable",
+            "answer_record_ids": [], "answer_evidence_ids": [], "uncertainty": {},
+            "semantic_risks": ["quantity"], "risk_level": "HIGH", "source_word_ids": ["W1"],
+            "topic": "Порог",
+        }
+        first = {**base, "record_id": "F00001", "kind": "proposal", "statement": "Предложен порог 0.5", "start": 1, "evidence_ids": ["U1"], "quantities": [{"value": "0.5", "evidence_ids": ["U1"]}], "modality": "proposed"}
+        second = {**base, "record_id": "F00002", "kind": "decision", "statement": "Согласован порог 0.7", "start": 20, "evidence_ids": ["U2"], "quantities": [{"value": "0.7", "evidence_ids": ["U2"]}], "modality": "committed"}
+        state = quality.meeting_state([first, second], provenance={"audio_sha256": "a" * 64})
+        self.assertEqual(state["schema_version"], 2)
+        self.assertIn("timeline", state["views"])
+        self.assertIn("summary", state["views"])
+        self.assertTrue(any(item["relation"] == "supersedes" for item in state["relations"]))
+        self.assertTrue(all(item["provenance"]["source_word_ids"] for item in state["events"]))
+
+    def test_risk_scheduler_spends_audio_compute_only_on_critical(self):
+        self.assertEqual(quality.adaptive_compute_plan({"risk_level": "LOW", "kind": "observation"})["passes"], ["deterministic"])
+        self.assertIn("audio_repair", quality.adaptive_compute_plan({"risk_level": "CRITICAL", "kind": "action"})["passes"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,8 @@ def f1(tp, fp, fn):
 
 def semantic_score(reference_path, hypothesis_path, alignment_path):
     reference, hypothesis = load_records(reference_path), load_records(hypothesis_path)
+    reference_document = json.loads(Path(reference_path).read_text(encoding="utf-8"))
+    hypothesis_document = json.loads(Path(hypothesis_path).read_text(encoding="utf-8"))
     alignment = json.loads(Path(alignment_path).read_text(encoding="utf-8"))
     matches = [item for item in alignment.get("matches", []) if item.get("supported") is True]
     matched_ref = {item["reference_id"] for item in matches if item.get("reference_id") in reference}
@@ -82,12 +84,20 @@ def semantic_score(reference_path, hypothesis_path, alignment_path):
     claim_f1 = 2 * claim_precision * claim_recall / max(1e-12, claim_precision + claim_recall)
     type_hits = 0
     owner_tp = owner_fp = owner_fn = condition_tp = condition_fp = condition_fn = 0
+    decision_tp = decision_fp = action_tp = action_fp = 0
+    deadline_hits = deadline_total = number_hits = number_total = negation_hits = negation_total = 0
+    question_hits = question_total = citation_tp = citation_fp = 0
     for match in matches:
         gold = reference.get(match.get("reference_id"))
         predicted = hypothesis.get(match.get("hypothesis_id"))
         if not gold or not predicted:
             continue
         type_hits += gold.get("kind", gold.get("type")) == predicted.get("kind", predicted.get("type"))
+        gold_kind, predicted_kind = gold.get("kind", gold.get("type")), predicted.get("kind", predicted.get("type"))
+        decision_tp += gold_kind == predicted_kind == "decision"
+        decision_fp += predicted_kind == "decision" and gold_kind != "decision"
+        action_tp += gold_kind == predicted_kind == "action"
+        action_fp += predicted_kind == "action" and gold_kind != "action"
         gold_owners, predicted_owners = set(gold.get("assignees", [])), set(predicted.get("assignees", []))
         owner_tp += len(gold_owners & predicted_owners)
         owner_fp += len(predicted_owners - gold_owners)
@@ -98,8 +108,27 @@ def semantic_score(reference_path, hypothesis_path, alignment_path):
         condition_tp += len(gold_conditions & predicted_conditions)
         condition_fp += len(predicted_conditions - gold_conditions)
         condition_fn += len(gold_conditions - predicted_conditions)
+        if gold.get("time_expression") is not None or predicted.get("time_expression") is not None:
+            deadline_total += 1
+            deadline_hits += normalize_text(gold.get("time_expression")) == normalize_text(predicted.get("time_expression"))
+        gold_numbers = set(re.findall(r"\d+(?:[.,:]\d+)*", str(gold.get("statement", ""))))
+        predicted_numbers = set(re.findall(r"\d+(?:[.,:]\d+)*", str(predicted.get("statement", ""))))
+        if gold_numbers or predicted_numbers:
+            number_total += 1; number_hits += gold_numbers == predicted_numbers
+        gold_neg = bool(re.search(r"(?iu)(?:^|\W)(?:не|нет|нельзя|никогда|без)(?:\W|$)", str(gold.get("statement", ""))))
+        predicted_neg = bool(re.search(r"(?iu)(?:^|\W)(?:не|нет|нельзя|никогда|без)(?:\W|$)", str(predicted.get("statement", ""))))
+        negation_total += 1; negation_hits += gold_neg == predicted_neg
+        if gold_kind == "question":
+            question_total += 1; question_hits += gold.get("question_status") == predicted.get("question_status")
+        gold_citations, predicted_citations = set(gold.get("evidence_ids", [])), set(predicted.get("evidence_ids", []))
+        citation_tp += len(gold_citations & predicted_citations)
+        citation_fp += len(predicted_citations - gold_citations)
     op, ore, of = f1(owner_tp, owner_fp, owner_fn)
     cp, cr, cf = f1(condition_tp, condition_fp, condition_fn)
+    relation_key = lambda item: (item.get("relation"), item.get("source_record_id", item.get("source_event")), item.get("target_record_id", item.get("target_event")))
+    gold_relations = {relation_key(item) for item in reference_document.get("relations", [])}
+    predicted_relations = {relation_key(item) for item in hypothesis_document.get("relations", [])}
+    unsupported_relations = predicted_relations - gold_relations
     return {
         "claim_precision": round(claim_precision, 6),
         "claim_recall": round(claim_recall, 6),
@@ -111,6 +140,15 @@ def semantic_score(reference_path, hypothesis_path, alignment_path):
         "condition_precision": round(cp, 6),
         "condition_recall": round(cr, 6),
         "condition_F1": round(cf, 6),
+        "decision_precision": round(decision_tp / max(1, decision_tp + decision_fp), 6),
+        "action_precision": round(action_tp / max(1, action_tp + action_fp), 6),
+        "deadline_accuracy": round(deadline_hits / max(1, deadline_total), 6),
+        "number_accuracy": round(number_hits / max(1, number_total), 6),
+        "negation_accuracy": round(negation_hits / max(1, negation_total), 6),
+        "question_resolution_accuracy": round(question_hits / max(1, question_total), 6),
+        "citation_precision": round(citation_tp / max(1, citation_tp + citation_fp), 6),
+        "omission_rate": round(1 - claim_recall, 6),
+        "unsupported_relation_rate": round(len(unsupported_relations) / max(1, len(predicted_relations)), 6),
         "gold_records": len(reference),
         "hypothesis_records": len(hypothesis),
         "supported_matches": len(matches),
@@ -144,6 +182,12 @@ def evaluate(manifest):
                     resolve(base, system["semantic_alignment"]),
                 ),
             }
+            metrics["error_attribution"] = {
+                "asr_correct_summary_wrong": metrics["text"]["WER"] == 0 and metrics["meaning"]["claim_F1"] < 1,
+                "asr_error_present": metrics["text"]["WER"] > 0,
+                "speaker_error_with_assignee_error": metrics["speaker"]["DER"] > 0 and metrics["meaning"]["assignee_F1"] < 1,
+                "summary_semantic_error": metrics["meaning"]["claim_F1"] < 1 or metrics["meaning"]["unsupported_relation_rate"] > 0,
+            }
             case_result[system_name] = metrics
             totals.setdefault(system_name, []).append(metrics)
         results["cases"][case_id] = case_result
@@ -163,6 +207,10 @@ def evaluate(manifest):
             "type_accuracy_macro": round(sum(item["meaning"]["type_accuracy"] for item in values) / len(values), 6),
             "assignee_F1_macro": round(sum(item["meaning"]["assignee_F1"] for item in values) / len(values), 6),
             "condition_F1_macro": round(sum(item["meaning"]["condition_F1"] for item in values) / len(values), 6),
+            **{metric + "_macro": round(sum(item["meaning"][metric] for item in values) / len(values), 6) for metric in (
+                "decision_precision", "action_precision", "deadline_accuracy", "number_accuracy",
+                "negation_accuracy", "question_resolution_accuracy", "citation_precision", "omission_rate", "unsupported_relation_rate",
+            )},
         }
     baseline, candidate = payload.get("baseline"), payload.get("candidate")
     if baseline in results["systems"] and candidate in results["systems"]:

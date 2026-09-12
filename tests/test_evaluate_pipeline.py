@@ -22,8 +22,8 @@ class EvaluationTests(unittest.TestCase):
     def test_semantics_scores_claims_owners_and_conditions_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            gold = {"records": [{"record_id": "G1", "kind": "action", "assignees": ["A"], "conditions": [{"text": "после теста"}]}]}
-            hyp = {"records": [{"record_id": "H1", "kind": "action", "assignees": ["B"], "conditions": []}]}
+            gold = {"records": [{"record_id": "G1", "kind": "action", "statement": "Не проверить 10", "assignees": ["A"], "conditions": [{"text": "после теста"}], "evidence_ids": ["U1"]}]}
+            hyp = {"records": [{"record_id": "H1", "kind": "action", "statement": "Проверить 20", "assignees": ["B"], "conditions": [], "evidence_ids": ["U2"]}], "relations": [{"relation": "causes", "source_event": "X", "target_event": "Y"}]}
             alignment = {"matches": [{"reference_id": "G1", "hypothesis_id": "H1", "supported": True}]}
             for name, value in (("gold.json", gold), ("hyp.json", hyp), ("alignment.json", alignment)):
                 (root / name).write_text(json.dumps(value))
@@ -32,6 +32,10 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["type_accuracy"], 1)
         self.assertEqual(result["assignee_F1"], 0)
         self.assertEqual(result["condition_F1"], 0)
+        self.assertEqual(result["number_accuracy"], 0)
+        self.assertEqual(result["negation_accuracy"], 0)
+        self.assertEqual(result["citation_precision"], 0)
+        self.assertEqual(result["unsupported_relation_rate"], 1)
 
     def test_non_gold_reference_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
