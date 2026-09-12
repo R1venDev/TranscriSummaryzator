@@ -7,7 +7,7 @@ record.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Dict, Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -37,20 +37,20 @@ class Condition(StrictModel):
 
 class Quantity(StrictModel):
     value: str
-    unit: str | None = None
+    unit: Optional[str] = None
     evidence_ids: list[str]
 
 
 class SemanticRecordResponse(StrictModel):
     record_id: str
-    subject: str | None = None
-    predicate: str | None = None
-    object: str | None = None
+    subject: Optional[str] = None
+    predicate: Optional[str] = None
+    object: Optional[str] = None
     polarity: Literal["positive", "negative"] = "positive"
     modality: Literal["asserted", "tentative", "proposed", "committed", "question"] = "asserted"
     conditions: list[Condition] = Field(default_factory=list)
     quantities: list[Quantity] = Field(default_factory=list)
-    time_expression: str | dict | None = None
+    time_expression: Optional[Union[str, Dict[str, Any]]] = None
     proposed_by: list[str] = Field(default_factory=list)
     assignees: list[str] = Field(default_factory=list)
     confirmation_evidence_ids: list[str] = Field(default_factory=list)
