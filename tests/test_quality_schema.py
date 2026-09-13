@@ -67,7 +67,9 @@ class QualitySchemaTests(unittest.TestCase):
             {"value": "10", "unit": "%", "evidence_ids": ["U1"]},
             {"value": "20", "unit": "%", "evidence_ids": ["U9"]},
         ]}, fact)
-        self.assertEqual(record["quantities"], [{"value": "10", "unit": "%", "evidence_ids": ["U1"]}])
+        self.assertEqual(record["quantities"][0]["value"], "10")
+        self.assertEqual(record["quantities"][0]["unit"], "%")
+        self.assertEqual(record["quantities"][0]["source_span"], "Рост десять процентов")
 
     def test_non_condition_and_non_numeric_quantity_are_rejected(self):
         fact = {
@@ -219,11 +221,41 @@ class QualitySchemaTests(unittest.TestCase):
         first = {**base, "record_id": "F00001", "kind": "proposal", "statement": "Предложен порог 0.5", "start": 1, "evidence_ids": ["U1"], "quantities": [{"value": "0.5", "evidence_ids": ["U1"]}], "modality": "proposed"}
         second = {**base, "record_id": "F00002", "kind": "decision", "statement": "Согласован порог 0.7", "start": 20, "evidence_ids": ["U2"], "quantities": [{"value": "0.7", "evidence_ids": ["U2"]}], "modality": "committed"}
         state = quality.meeting_state([first, second], provenance={"audio_sha256": "a" * 64})
-        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["schema_version"], 3)
         self.assertIn("timeline", state["views"])
+        self.assertIn("full_timeline", state["views"])
         self.assertIn("summary", state["views"])
-        self.assertTrue(any(item["relation"] == "supersedes" for item in state["relations"]))
+        self.assertTrue(any(item["relation"] == "conflicts_with" for item in state["relations"]))
+        self.assertEqual(state["views"]["summary"], [])
         self.assertTrue(all(item["provenance"]["source_word_ids"] for item in state["events"]))
+
+    def test_explicit_correction_supersedes_low_overlap_claim(self):
+        base = {
+            "kind": "observation", "polarity": "positive", "modality": "asserted",
+            "conditions": [], "quantities": [], "time_expression": None,
+            "attributed_speakers": ["@Misha"], "proposed_by": [], "assignees": [],
+            "assignment_status": "not_applicable", "confirmation_evidence_ids": [],
+            "confirmation_utterances": [], "question_status": "not_applicable",
+            "answer_record_ids": [], "answer_evidence_ids": [], "uncertainty": {},
+            "risk_level": "HIGH", "source_word_ids": ["W1"], "topic": "Точка входа",
+        }
+        stale = {**base, "record_id": "F1", "statement": "Точка возникает после слома M15", "start": 10, "evidence_ids": ["U1"], "semantic_risks": []}
+        corrected = {**base, "record_id": "F2", "statement": "Точка возникает после пересечения нарисованной линии", "start": 20, "evidence_ids": ["U2"], "semantic_risks": ["correction"], "revision_cue": True, "speech_act": "correct"}
+        state = quality.meeting_state([stale, corrected], provenance={"audio_sha256": "a" * 64})
+        self.assertTrue(any(item["relation"] == "corrects" for item in state["relations"]))
+        self.assertEqual([item["source_record_id"] for item in state["views"]["summary"]], ["F2"])
+
+    def test_signed_index_quantity_is_not_a_timeframe(self):
+        fact = {
+            "fact_id": "F1", "type": "metric", "statement": "Используется индекс -5",
+            "speaker_refs": ["A"], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "A", "text": "берём позицию окна с индексом -5"}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"quantities": [{"value": "-5", "unit": "таймфрейм", "evidence_ids": ["U1"]}]}, fact)
+        self.assertEqual(record["quantities"][0]["entity"], "window_index")
+        self.assertEqual(record["quantities"][0]["role"], "index_offset")
+        self.assertIsNone(record["quantities"][0]["unit"])
 
     def test_risk_scheduler_spends_audio_compute_only_on_critical(self):
         self.assertEqual(quality.adaptive_compute_plan({"risk_level": "LOW", "kind": "observation"})["passes"], ["deterministic"])
