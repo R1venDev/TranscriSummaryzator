@@ -142,7 +142,7 @@ class SummaryWorkerTests(unittest.TestCase):
         )
         self.assertIn("автор: **@Yachoy**", rendered)
 
-    def test_unreliable_task_is_not_published_as_action(self):
+    def test_unreliable_task_is_published_as_review_candidate(self):
         item = fact(kind="action", statement="Неясное обещание что-то попробовать")
         item["uncertainty"] = {"needs_review": True, "reasons": ["overlap"]}
         registry = {"records": [], "tasks": [{
@@ -157,9 +157,26 @@ class SummaryWorkerTests(unittest.TestCase):
              "actions": [], "open_questions": []},
             [item], {"total_seconds": 60}, semantic_registry=registry,
         )
-        self.assertNotIn("## Задачи и следующие шаги", rendered)
-        self.assertNotIn("### Требует сверки с аудио", rendered)
-        self.assertNotIn("Неясное обещание", rendered)
+        self.assertIn("## Задачи и следующие шаги", rendered)
+        self.assertIn("### Требуют подтверждения", rendered)
+        self.assertIn("Неясное обещание", rendered)
+        self.assertIn("требуется проверка источника", rendered)
+
+    def test_unclear_question_is_retained_as_unanswered(self):
+        item = fact(kind="question", statement="Какой диапазон имеет сессия AM?")
+        item["uncertainty"] = {"needs_review": False, "reasons": []}
+        registry = {"records": [{
+            "record_id": "F00001", "question_status": "unclear", "question_kind": "discussion",
+        }], "tasks": []}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Тема", "fact_ids": ["F00001"]}, "objective": None,
+             "overview": [], "chronology": [], "topics": [], "decisions": [],
+             "actions": [], "open_questions": []},
+            [item], {"total_seconds": 60}, semantic_registry=registry,
+        )
+        self.assertIn("### Нерешённые вопросы встречи", rendered)
+        self.assertIn("Какой диапазон имеет сессия AM?", rendered)
+        self.assertIn("подтверждённый ответ в материалах встречи не найден", rendered)
 
     def test_speaker_only_uncertainty_keeps_anonymous_content_but_not_attribution(self):
         item = fact(kind="problem", statement="Система создаёт лишние сигналы рядом с паттерном",
@@ -225,7 +242,7 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertNotIn("**", rendered)
         self.assertNotIn("Николай", rendered)
 
-    def test_optional_questions_are_capped_in_human_summary(self):
+    def test_all_unresolved_questions_are_retained_in_human_summary(self):
         facts = []
         questions = []
         for index in range(12):
@@ -249,7 +266,7 @@ class SummaryWorkerTests(unittest.TestCase):
             document, facts, {"covered_seconds": 720, "total_seconds": 720},
             semantic_registry=registry,
         )
-        self.assertEqual(rendered.count("**Q-"), 8)
+        self.assertEqual(rendered.count("**Q-"), 12)
         self.assertNotIn("Ещё 4 пунктов", rendered)
 
     def test_personal_opinion_is_not_a_decision(self):

@@ -408,6 +408,8 @@ def meeting_state(records, *, provenance=None):
             "risk": {"level": record.get("risk_level", "LOW"), "signals": list(record.get("semantic_risks", [])), **record.get("uncertainty", {})},
             "presentation": record.get("statement"),
             "topic": record.get("topic") or "Прочее",
+            "question_status": record.get("question_status"),
+            "question_kind": record.get("question_kind"),
             "provenance": {
                 "audio_sha256": provenance.get("audio_sha256"),
                 "source_word_ids": list(dict.fromkeys(record.get("source_word_ids", []))),
@@ -524,7 +526,13 @@ def meeting_state(records, *, provenance=None):
             event["lifecycle"] = "resolved"
         event["lifecycle_basis_relation_ids"] = lifecycle_relations
     decisions = [item for item in events if item["act"] == "decision" and item["lifecycle"] == "active"]
-    questions = [{**item, "state": "resolved" if item["event_id"] in resolved_questions else next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
+    questions = [
+        {
+            **item,
+            "state": "resolved" if item["event_id"] in resolved_questions else (item.get("question_status") or "unclear"),
+        }
+        for item in events if item["act"] == "question"
+    ]
     active_record_ids = {item["source_record_id"] for item in events if item["lifecycle"] == "active"}
     tasks = [item for item in task_records(records) if item["source_record_id"] in active_record_ids]
     active = [item for item in events if item["lifecycle"] == "active"]

@@ -2113,9 +2113,10 @@ def select_items_evenly(items, fact_map, limit=8):
     return [ordered[index] for index in dict.fromkeys(indexes)]
 
 
-def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None):
+def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None, meeting_state_document=None):
     metadata = metadata or {}
     semantic_registry = semantic_registry or {"tasks": []}
+    meeting_state_document = meeting_state_document or {}
     fact_map = {item["fact_id"]: item for item in facts}
     total_seconds = float(metadata.get("duration_seconds") or coverage.get("total_seconds") or 0)
 
@@ -2162,45 +2163,63 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         for index, item in enumerate(decisions, 1):
             output.append(f"- **D-{index:02d}.** {line(item)}")
 
+    state_views = meeting_state_document.get("views", {})
+    task_source = state_views.get("tasks") if "tasks" in state_views else semantic_registry.get("tasks", [])
     tasks = sorted(
-        (item for item in semantic_registry.get("tasks", []) if item.get("automation_eligible") is not False),
+        task_source,
         key=lambda item: float((fact_map.get(item.get("source_record_id")) or {}).get("start", item.get("start", 0))),
     )
     if tasks:
         output.extend(["", "## Задачи и следующие шаги", ""])
-        for index, task in enumerate(tasks, 1):
-            source = fact_map.get(task.get("source_record_id"))
-            start = float(source.get("start", 0)) if source else 0
-            assignees = canonicalize_people(", ".join(task.get("assignees", []))) if task.get("assignees") else "не назначен"
-            status = {"confirmed": "подтверждено", "unconfirmed": "не подтверждено", "unknown": "не назначено"}.get(task.get("assignment_status"), "требует проверки")
-            if task.get("uncertainty", {}).get("needs_review"):
-                status = {
-                    "confirmed": "подтверждено, но источник требует проверки",
-                    "unconfirmed": "не подтверждено; источник требует проверки",
-                    "unknown": "не назначено; источник требует проверки",
-                }.get(task.get("assignment_status"), "требует проверки")
-            due = normalize_space(task.get("due")) or "не указан"
-            conditions = "; ".join(value.get("text", "") for value in task.get("conditions", []) if value.get("text"))
-            details = f"исполнитель: {assignees} ({status}); срок: {due}"
-            if conditions:
-                details += f"; условие: {canonicalize_people(conditions)}"
-            marker = " ⚠" if task.get("uncertainty", {}).get("needs_review") else ""
-            title = normalize_space(task.get("title")) or concise_action_statement(task.get("description"))
-            content = normalize_space(task.get("details")) or concise_action_statement(task.get("description"))
-            output.append(
-                f'- **T-{index:02d}. {canonicalize_people(title).rstrip(".")}** — '
-                f'{canonicalize_people(content)} — {details}. '
-                f'{time_link(start, total_seconds)}{marker}'
-            )
+        confirmed_tasks = [item for item in tasks if item.get("automation_eligible") is not False]
+        review_tasks = [item for item in tasks if item.get("automation_eligible") is False]
+        indexed_tasks = list(enumerate(tasks, 1))
+        for group_title, group in (
+            ("Подтверждённые задачи", confirmed_tasks),
+            ("Требуют подтверждения", review_tasks),
+        ):
+            if not group:
+                continue
+            if confirmed_tasks and review_tasks or group_title == "Требуют подтверждения":
+                output.extend([f"### {group_title}", ""])
+            for index, task in ((index, task) for index, task in indexed_tasks if task in group):
+                source = fact_map.get(task.get("source_record_id"))
+                start = float(source.get("start", 0)) if source else 0
+                assignees = canonicalize_people(", ".join(task.get("assignees", []))) if task.get("assignees") else "не назначен"
+                status = {"confirmed": "подтверждено", "unconfirmed": "не подтверждено", "unknown": "не назначено"}.get(task.get("assignment_status"), "требует проверки")
+                if task.get("automation_eligible") is False:
+                    status += "; перед выполнением требуется проверка источника"
+                due = normalize_space(task.get("due")) or "не указан"
+                conditions = "; ".join(value.get("text", "") for value in task.get("conditions", []) if value.get("text"))
+                details = f"исполнитель: {assignees} ({status}); срок: {due}"
+                if conditions:
+                    details += f"; условие: {canonicalize_people(conditions)}"
+                marker = " ⚠" if task.get("uncertainty", {}).get("needs_review") or task.get("automation_eligible") is False else ""
+                title = normalize_space(task.get("title")) or concise_action_statement(task.get("description"))
+                content = normalize_space(task.get("details")) or concise_action_statement(task.get("description"))
+                output.append(
+                    f'- **T-{index:02d}. {canonicalize_people(title).rstrip(".")}** — '
+                    f'{canonicalize_people(content)} — {details}. '
+                    f'{time_link(start, total_seconds)}{marker}'
+                )
 
     hypotheses = hypothesis_points(facts)
     semantic_by_id = {item.get("record_id"): item for item in semantic_registry.get("records", [])}
+    state_questions = {
+        item.get("source_record_id"): item
+        for item in state_views.get("questions", [])
+    }
     unresolved = sorted([
         fact for fact in facts
         if fact.get("type") == "question"
-        and fact_is_reliable_for_main(fact)
-        and semantic_by_id.get(fact.get("fact_id"), {}).get("question_status") == "unresolved"
-        and semantic_by_id.get(fact.get("fact_id"), {}).get("question_kind") != "transcript_verification"
+        and (
+            state_questions.get(fact.get("fact_id"), {}).get("state")
+            or semantic_by_id.get(fact.get("fact_id"), {}).get("question_status")
+        ) in {"unresolved", "unclear"}
+        and (
+            state_questions.get(fact.get("fact_id"), {}).get("question_kind")
+            or semantic_by_id.get(fact.get("fact_id"), {}).get("question_kind")
+        ) != "transcript_verification"
     ], key=lambda item: float(item.get("start", 0)))
     transcript_checks = sorted([
         fact for fact in facts
@@ -2221,9 +2240,6 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         if not fact_is_reliable_for_main(fact)
         and fact.get("fact_id") not in transcript_check_ids
     ]
-    if len(unresolved) > 8:
-        indexes = [round(index * (len(unresolved) - 1) / 7) for index in range(8)]
-        unresolved = [unresolved[index] for index in dict.fromkeys(indexes)]
     if hypotheses or unresolved:
         output.extend(["", "## Открытые вопросы и гипотезы", ""])
         if hypotheses:
@@ -2239,7 +2255,18 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
             output.extend(["", "### Нерешённые вопросы встречи", ""])
             for index, fact in enumerate(unresolved, 1):
                 marker = " ⚠" if fact.get("uncertainty", {}).get("needs_review") else ""
-                output.append(f'- **Q-{index:02d}.** {canonicalize_people(fact["statement"])} {time_link(fact["start"], total_seconds)}{marker}')
+                state = (
+                    state_questions.get(fact.get("fact_id"), {}).get("state")
+                    or semantic_by_id.get(fact.get("fact_id"), {}).get("question_status")
+                    or "unclear"
+                )
+                note = "встреча явно оставила вопрос открытым" if state == "unresolved" else "подтверждённый ответ в материалах встречи не найден"
+                if fact.get("uncertainty", {}).get("needs_review"):
+                    note += "; формулировку нужно сверить с аудио"
+                output.append(
+                    f'- **Q-{index:02d}.** {canonicalize_people(fact["statement"])} '
+                    f'— *{note}*. {time_link(fact["start"], total_seconds)}{marker}'
+                )
         # Неуверенные фрагменты сохраняются в summary_audit.json, но не засоряют
         # пользовательское саммари техническими сообщениями без содержания.
 
@@ -3416,6 +3443,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             "project": cfg.get("summary_project_name", "Aurion"),
         },
         semantic_registry=semantic_registry,
+        meeting_state_document=state,
     )
     atomic_json(run_dir / "summary.final.json", final_document)
     atomic_json(run_dir / "audit.json", {
@@ -3453,6 +3481,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "semantics" / "meeting_state.json", state)
     atomic_json(output_dir / "views" / "decisions.json", {"schema_version": 1, "decisions": state["views"]["decisions"]})
     atomic_json(output_dir / "views" / "questions.json", {"schema_version": 1, "questions": state["views"]["questions"]})
+    atomic_json(output_dir / "views" / "tasks.json", {"schema_version": 1, "tasks": state["views"]["tasks"]})
     atomic_json(output_dir / "views" / "timeline.json", {"schema_version": 1, "timeline": state["views"]["timeline"]})
     atomic_json(output_dir / "views" / "summary.json", {"schema_version": 1, "claims": state["views"]["summary"]})
     safe_tasks = [item for item in state["views"]["tasks"] if item.get("automation_eligible")]
