@@ -30,7 +30,9 @@ class V14ArchitectureTests(unittest.TestCase):
                     "subject": "stop", "predicate": "set", "object": str(value), "polarity": "positive",
                     "modality": "proposed", "quantities": [{"value": str(value)}], "conditions": [],
                     "attributed_speakers": ["P1"], "assignees": [], "evidence_ids": [f"E{number}"], "uncertainty": {}}
-        state = meeting_state([record(1, .5), record(2, .7)])
+        newer = record(2, .7)
+        newer.update({"speech_act": "correct", "revision_cue": True})
+        state = meeting_state([record(1, .5), newer])
         self.assertEqual(state["relations"][0]["relation"], "supersedes")
 
     def test_config_rejects_unknown_keys(self):
