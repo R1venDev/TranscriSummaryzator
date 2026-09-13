@@ -7,6 +7,19 @@ import re
 import hashlib
 import json
 
+try:
+    from speech_acts import CORRECTION_CUE_RE, content_kind, modality_axis, primary_speech_act
+except ModuleNotFoundError:  # direct importlib loading in unit tests
+    import importlib.util
+    from pathlib import Path
+    _speech_spec = importlib.util.spec_from_file_location("speech_acts", Path(__file__).with_name("speech_acts.py"))
+    _speech = importlib.util.module_from_spec(_speech_spec)
+    _speech_spec.loader.exec_module(_speech)
+    CORRECTION_CUE_RE = _speech.CORRECTION_CUE_RE
+    content_kind = _speech.content_kind
+    modality_axis = _speech.modality_axis
+    primary_speech_act = _speech.primary_speech_act
+
 
 SPEAKER_RISK_FLAGS = {"ambiguous", "no_diarization", "low_confidence", "overlap"}
 INFERRED_SPEAKER_FLAGS = {"speaker_context", "speaker_smoothed", "clause_coherence"}
@@ -181,9 +194,24 @@ def normalize_semantic_record(raw, fact):
             for digit in digits
         )
         if amount and ids and digits and supported:
+            source_span = str(value.get("source_span") or "").strip() or next(
+                (str(evidence_by_id[item].get("text") or "").strip() for item in ids if item in evidence_by_id), ""
+            )
+            entity = str(value.get("entity") or "").strip() or None
+            role = str(value.get("role") or "").strip() or None
+            unit = str(value.get("unit") or "").strip() or None
+            # A signed integer near index/window language is an offset, never a
+            # timeframe merely because a model guessed that unit.
+            if amount.startswith("-") and re.search(r"(?iu)\b(?:индекс|позици|окн[оа]|свеч[аи])\w*\b", cited_text):
+                entity, role = entity or "window_index", role or "index_offset"
+                if unit and re.search(r"(?iu)таймфрейм|time\s*frame", unit):
+                    unit = None
             quantities.append({
                 "value": amount,
-                "unit": str(value.get("unit") or "").strip() or None,
+                "unit": unit,
+                "entity": entity,
+                "role": role,
+                "source_span": source_span or None,
                 "evidence_ids": ids,
             })
     confirmations = [
@@ -232,6 +260,12 @@ def normalize_semantic_record(raw, fact):
         if assignment_status != "confirmed":
             uncertainty = dict(uncertainty, needs_review=True)
             uncertainty["reasons"] = sorted(set(uncertainty.get("reasons", [])) | {"assignee_not_confirmed"})
+    evidence_text = " ".join(str(item.get("text") or "") for item in fact.get("evidence", []))
+    detected_act = primary_speech_act(evidence_text or fact.get("statement"), fact.get("type"))
+    raw_act = raw.get("speech_act")
+    if raw_act in {"assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"}:
+        detected_act = raw_act if detected_act == "assert" else detected_act
+    legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
@@ -242,7 +276,12 @@ def normalize_semantic_record(raw, fact):
         "predicate": str(raw.get("predicate") or "").strip() or None,
         "object": str(raw.get("object") or "").strip() or None,
         "polarity": "negative" if raw.get("polarity") == "negative" else "positive",
-        "modality": raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted"),
+        "modality": legacy_modality,
+        "content_kind": raw.get("content_kind") or content_kind(fact.get("type")),
+        "speech_act": detected_act,
+        "modality_axis": modality_axis(legacy_modality, fact.get("certainty")),
+        "lifecycle": "active",
+        "revision_cue": bool(CORRECTION_CUE_RE.search(evidence_text or str(fact.get("statement") or ""))),
         "conditions": conditions,
         "quantities": quantities,
         "time_expression": (
@@ -340,22 +379,30 @@ def meeting_state(records, *, provenance=None):
     """Build the canonical, immutable DialogueEvent graph and all state views."""
     provenance = provenance or {}
     events = []
+    records = sorted(records, key=lambda item: (float(item.get("start", 0)), item.get("record_id", "")))
     for record in records:
         claim_id = record.get("claim_id") or _semantic_id("C", {
             "kind": record.get("kind"), "statement": record.get("statement"),
             "evidence_ids": record.get("evidence_ids", []),
         })
         event_id = _semantic_id("EV", claim_id)
+        speech_act = record.get("speech_act") or primary_speech_act(record.get("statement"), record.get("kind"))
         act = {
+            "assert": "assertion", "decide": "decision", "commit": "assignment",
+            "ask": "question", "propose": "proposal", "correct": "correction",
+        }.get(speech_act, {
             "action": "assignment", "current_state": "assertion", "observation": "assertion",
             "metric": "assertion", "goal": "proposal",
-        }.get(record.get("kind"), record.get("kind", "assertion"))
+        }.get(record.get("kind"), record.get("kind", "assertion")))
         events.append({
             "event_id": event_id, "claim_id": claim_id, "source_record_id": record["record_id"], "act": act,
+            "content_kind": record.get("content_kind") or content_kind(record.get("kind")),
+            "speech_act": speech_act,
             "proposition": {"subject": record.get("subject"), "predicate": record.get("predicate"), "object": record.get("object")},
             "speaker_ids": list(record.get("attributed_speakers", [])),
             "mentioned_participant_ids": list(record.get("assignees", [])),
-            "polarity": record.get("polarity", "positive"), "modality": record.get("modality", "asserted"),
+            "polarity": record.get("polarity", "positive"), "modality": record.get("modality_axis") or modality_axis(record.get("modality")),
+            "lifecycle": "active", "revision_cue": bool(record.get("revision_cue")),
             "quantities": list(record.get("quantities", [])), "conditions": list(record.get("conditions", [])),
             "evidence_ids": list(record.get("evidence_ids", [])), "start": float(record.get("start", 0)),
             "risk": {"level": record.get("risk_level", "LOW"), "signals": list(record.get("semantic_risks", [])), **record.get("uncertainty", {})},
@@ -378,25 +425,63 @@ def meeting_state(records, *, provenance=None):
             "compute_plan": adaptive_compute_plan(record),
         })
     relations = []
+    def add_relation(source, relation, target, evidence_ids=None, **extra):
+        payload = {
+            "source_event": source["event_id"], "relation": relation,
+            "target_event": target["event_id"],
+            "evidence_ids": list(dict.fromkeys(evidence_ids or source["evidence_ids"])),
+            **extra,
+        }
+        payload["relation_id"] = _semantic_id("R", payload)
+        relations.append(payload)
+
+    def quantity_signature(event):
+        return {(str(q.get("value")), str(q.get("unit") or ""), str(q.get("entity") or ""), str(q.get("role") or "")) for q in event.get("quantities", [])}
+
     for index, current in enumerate(events):
+        # A correction cue opens a short revision scope.  The replacement may
+        # use entirely different words, so lexical similarity is deliberately
+        # not required here.
+        if current.get("revision_cue") or current.get("speech_act") == "correct":
+            speakers = set(current.get("speaker_ids", []))
+            candidates = [
+                older for older in events[:index]
+                if set(older.get("speaker_ids", [])) & speakers
+                and current["start"] - older["start"] <= 180
+                and older.get("speech_act") not in {"ask", "accept", "reject"}
+                and (older.get("topic") == current.get("topic") or index - events.index(older) <= 3)
+            ]
+            if candidates:
+                add_relation(current, "corrects", candidates[-1], current["evidence_ids"] + candidates[-1]["evidence_ids"])
         for older in events[:index]:
             if not _same_proposition(current, older):
                 continue
             relation = None
             if current["polarity"] != older["polarity"]:
                 relation = "contradicts"
-            elif current.get("quantities") != older.get("quantities") and current.get("quantities") and older.get("quantities"):
-                relation = "supersedes"
+            elif quantity_signature(current) != quantity_signature(older) and current.get("quantities") and older.get("quantities"):
+                # A different number is an unresolved conflict unless the new
+                # claim is explicitly framed as a correction.
+                relation = "supersedes" if current.get("revision_cue") or current.get("speech_act") == "correct" else "conflicts_with"
             elif current["act"] == "decision" and older["act"] in {"proposal", "assertion"}:
                 relation = "accepts"
-            elif current["act"] == "assertion" and older["act"] == "question":
+            elif current.get("speech_act") == "answer" and older["act"] == "question":
                 relation = "answers"
-            elif "correction" in current.get("risk", {}).get("signals", []):
+            elif "correction" in current.get("risk", {}).get("signals", []) or current.get("revision_cue"):
                 relation = "corrects"
             if relation:
-                payload = {"source_event": current["event_id"], "relation": relation, "target_event": older["event_id"], "evidence_ids": current["evidence_ids"]}
-                payload["relation_id"] = _semantic_id("R", payload)
-                relations.append(payload)
+                add_relation(current, relation, older)
+
+        # Question/answer adjacency is a dialogue relation, not a lexical
+        # similarity problem.  Link a nearby answer in the same topic.
+        if current.get("speech_act") in {"answer", "accept", "reject"}:
+            questions = [
+                older for older in events[:index] if older["act"] == "question"
+                and current["start"] - older["start"] <= 180
+                and older.get("topic") == current.get("topic")
+            ]
+            if questions:
+                add_relation(current, "answers", questions[-1], current["evidence_ids"] + questions[-1]["evidence_ids"])
 
     # Explicit question links and assignee confirmations are already grounded by
     # normalize_semantic_record; materialize them in the same global graph.
@@ -408,27 +493,34 @@ def meeting_state(records, *, provenance=None):
         for answer_id in record.get("answer_record_ids", []):
             target = by_record.get(answer_id)
             if target:
-                payload = {"source_event": target["event_id"], "relation": "answers", "target_event": source["event_id"], "evidence_ids": list(dict.fromkeys(target["evidence_ids"] + source["evidence_ids"]))}
-                payload["relation_id"] = _semantic_id("R", payload); relations.append(payload)
+                add_relation(target, "answers", source, target["evidence_ids"] + source["evidence_ids"])
         if record.get("assignment_status") == "confirmed":
-            payload = {"source_event": source["event_id"], "relation": "accepted_by", "target_event": source["event_id"], "participant_ids": record.get("assignees", []), "evidence_ids": record.get("confirmation_evidence_ids", [])}
-            payload["relation_id"] = _semantic_id("R", payload); relations.append(payload)
+            add_relation(source, "accepted_by", source, record.get("confirmation_evidence_ids", []), participant_ids=record.get("assignees", []))
 
     unique_relations = {item["relation_id"]: item for item in relations}
     relations = sorted(unique_relations.values(), key=lambda item: item["relation_id"])
 
     superseded = {item["target_event"] for item in relations if item["relation"] in {"supersedes", "corrects"}}
-    decisions = [item for item in events if item["act"] == "decision" and item["event_id"] not in superseded]
-    questions = [{**item, "state": next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
-    active_record_ids = {item["source_record_id"] for item in events if item["event_id"] not in superseded}
+    conflicted = {value for item in relations if item["relation"] == "conflicts_with" for value in (item["source_event"], item["target_event"])}
+    resolved_questions = {item["target_event"] for item in relations if item["relation"] == "answers"}
+    for event in events:
+        if event["event_id"] in superseded:
+            event["lifecycle"] = "superseded"
+        elif event["event_id"] in conflicted:
+            event["lifecycle"] = "conflicting"
+        elif event["event_id"] in resolved_questions:
+            event["lifecycle"] = "resolved"
+    decisions = [item for item in events if item["act"] == "decision" and item["lifecycle"] == "active"]
+    questions = [{**item, "state": "resolved" if item["event_id"] in resolved_questions else next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
+    active_record_ids = {item["source_record_id"] for item in events if item["lifecycle"] == "active"}
     tasks = [item for item in task_records(records) if item["source_record_id"] in active_record_ids]
-    active = [item for item in events if item["event_id"] not in superseded]
+    active = [item for item in events if item["lifecycle"] == "active"]
     topic_states = []
     for topic in dict.fromkeys(item["topic"] for item in active):
         members = [item for item in active if item["topic"] == topic]
         topic_states.append({"topic": topic, "event_ids": [item["event_id"] for item in members], "claim_ids": [item["claim_id"] for item in members]})
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "state_id": _semantic_id("MS", [item["claim_id"] for item in events]),
         "events": events,
         "relations": relations,
@@ -436,7 +528,9 @@ def meeting_state(records, *, provenance=None):
         "topic_states": topic_states,
         "views": {
             "decisions": decisions, "tasks": tasks, "questions": questions,
-            "timeline": sorted(events, key=lambda item: (item["start"], item["event_id"])),
-            "summary": [{**item, "state": "active" if item["event_id"] not in superseded else "superseded"} for item in events],
+            "timeline": sorted([item for item in active if item["content_kind"] in {"rule", "task", "goal", "schedule", "metric"}], key=lambda item: (item["start"], item["event_id"])),
+            "full_timeline": sorted(events, key=lambda item: (item["start"], item["event_id"])),
+            "summary": active,
+            "history": [item for item in events if item["lifecycle"] != "active"],
         },
     }
