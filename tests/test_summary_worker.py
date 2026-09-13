@@ -26,6 +26,19 @@ def fact(kind="proposal", statement="Предложено проверить BOS
 
 
 class SummaryWorkerTests(unittest.TestCase):
+    def test_evidence_repair_uses_only_work_tree_for_download_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = summary.evidence_repair_environment(root)
+            expected_cache = root / "work" / "cache"
+            self.assertEqual(environment["XDG_CACHE_HOME"], str(expected_cache))
+            self.assertEqual(environment["HF_HOME"], str(expected_cache / "huggingface"))
+            self.assertEqual(environment["HF_XET_CACHE"], str(expected_cache / "huggingface" / "xet"))
+            self.assertEqual(environment["HF_HUB_DISABLE_XET"], "1")
+            self.assertEqual(environment["TMPDIR"], str(root / "work" / "tmp" / "evidence-repair"))
+            for key in ("HF_HOME", "HF_HUB_CACHE", "HF_XET_CACHE", "TMPDIR"):
+                self.assertTrue(Path(environment[key]).is_dir())
+
     def test_semantic_chapter_batches_follow_planner_anchors(self):
         facts = []
         for index in range(8):
