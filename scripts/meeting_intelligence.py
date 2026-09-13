@@ -137,6 +137,14 @@ def apply_question_resolutions(records, resolutions, utterances=None):
             if value in utterance_by_id
             and float(utterance_by_id[value].get("start", 0)) >= float(question.get("start", 0))
         ]
+        if answer_evidence_ids:
+            span_starts = [float(utterance_by_id[value].get("start", 0)) for value in answer_evidence_ids]
+            span_ids = set(answer_evidence_ids)
+            answer_ids = [
+                value for value in answer_ids
+                if span_ids & set(by_id[value].get("evidence_ids", []))
+                or min(abs(float(by_id[value].get("start", 0)) - start) for start in span_starts) <= 60
+            ]
         if state in {"answered", "partially_answered", "tentatively_answered"} and not (answer_ids or answer_evidence_ids):
             continue
         question["question_status"] = state
