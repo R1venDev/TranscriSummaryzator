@@ -3857,6 +3857,17 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
 
     if stable_hash(load_json(output_dir / "transcript.json")) != settings["transcript"]:
         raise RuntimeError("Стенограмма изменилась во время генерации; публикация устаревшего саммари остановлена")
+    claim_by_id = {item["claim_id"]: item for item in state_v2["claims"]}
+    plan_audits = []
+    for sentence_plan in summary_plan["sentence_plans"]:
+        planned = verify_sentence_plan(sentence_plan, state_v2["claims"], state_v2["relations"])
+        claim_text = " ".join(claim_by_id[claim_id]["statement"] for claim_id in sentence_plan["claim_ids"] if claim_id in claim_by_id)
+        realized = audit_realization(claim_text, sentence_plan)
+        plan_audits.append({"sentence_id": sentence_plan["sentence_id"], "plan": planned, "realization": realized})
+    plan_verification = {"schema_version": 1, "audits": plan_audits}
+    atomic_json(run_dir / "plan_verification.json", plan_verification)
+    if not all(item["plan"]["passed"] and item["realization"]["passed"] for item in plan_audits):
+        raise RuntimeError("Plan-before-write verification rejected a public sentence")
     output_dir.mkdir(parents=True, exist_ok=True)
     history = output_dir / "summary_history"
     if (output_dir / "summary.md").is_file():
@@ -3880,16 +3891,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(previous_project_path, project_state)
     atomic_json(output_dir / "views" / "delta.json", project_delta(previous_project, project_state))
     projections = project_views(state_v2, summary_plan["selected_claim_ids"])
-    claim_by_id = {item["claim_id"]: item for item in state_v2["claims"]}
-    plan_audits = []
-    for sentence_plan in summary_plan["sentence_plans"]:
-        planned = verify_sentence_plan(sentence_plan, state_v2["claims"], state_v2["relations"])
-        claim_text = " ".join(claim_by_id[claim_id]["statement"] for claim_id in sentence_plan["claim_ids"] if claim_id in claim_by_id)
-        realized = audit_realization(claim_text, sentence_plan)
-        plan_audits.append({"sentence_id": sentence_plan["sentence_id"], "plan": planned, "realization": realized})
-    if not all(item["plan"]["passed"] and item["realization"]["passed"] for item in plan_audits):
-        raise RuntimeError("Plan-before-write verification rejected a public sentence")
-    atomic_json(output_dir / "views" / "plan_verification.json", {"schema_version": 1, "audits": plan_audits})
+    atomic_json(output_dir / "views" / "plan_verification.json", plan_verification)
     view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
     for view_name, claims in projections.items():
         atomic_json(output_dir / "views" / f"{view_name}.json", {"schema_version": 1, "claims": claims})
