@@ -42,6 +42,42 @@ class SummaryWorkerTests(unittest.TestCase):
         )
         self.assertTrue(all(batch for batch in batches))
 
+    def test_section_and_detailed_views_are_not_limited_to_executive_facts(self):
+        core = fact(statement="Основной результат встречи")
+        hypothesis = dict(
+            fact(kind="hypothesis", statement="Старший таймфрейм может повысить качество фильтрации"),
+            fact_id="F00002", start=20, end=22, evidence_ids=["U00002"],
+            evidence=[utterance(2, 20, 22, text="Старший таймфрейм может повысить качество фильтрации")],
+        )
+        question = dict(
+            fact(kind="question", statement="Какой фильтр использовать?"),
+            fact_id="F00003", start=30, end=32, evidence_ids=["U00003"],
+            evidence=[utterance(3, 30, 32, text="Какой фильтр использовать?")],
+        )
+        detail = dict(
+            fact(statement="Дополнительное подробное объяснение механизма фильтрации"),
+            fact_id="F00004", start=40, end=44, evidence_ids=["U00004"],
+            evidence=[utterance(4, 40, 44, text="Дополнительное подробное объяснение механизма фильтрации")],
+        )
+        state = {"views": {"questions": [{
+            "source_record_id": "F00003", "state": "answered",
+            "answer_spans": [{"text": "Использовать контекст старшего таймфрейма."}],
+            "answer_record_ids": [],
+        }]}}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Проверка фильтра", "fact_ids": ["F00001"]},
+             "objective": None, "overview": [], "chronology": [], "topics": [],
+             "decisions": [], "actions": [], "open_questions": []},
+            [core], {"total_seconds": 60},
+            semantic_registry={"records": [], "tasks": []}, meeting_state_document=state,
+            section_facts=[hypothesis, question], detailed_facts=[core, detail],
+        )
+        self.assertIn("## Ответы и уточнения", rendered)
+        self.assertIn("## Открытые вопросы и гипотезы", rendered)
+        self.assertIn("Старший таймфрейм может повысить качество", rendered)
+        self.assertIn("Открытых вопросов не обнаружено", rendered)
+        self.assertIn("Дополнительное подробное объяснение", rendered)
+
     def test_chunks_cover_every_utterance(self):
         items = [utterance(index, index * 50, index * 50 + 4) for index in range(1, 20)]
         chunks = summary.make_chunks(items, seconds=180, overlap=30)

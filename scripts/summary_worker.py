@@ -1743,7 +1743,7 @@ def navigation_quality(facts, total_seconds):
     }
 
 
-def detailed_chronology_points(facts, total_seconds, window_seconds=300, limit=3):
+def detailed_chronology_points(facts, total_seconds, window_seconds=300, limit=4):
     """Build concise episode details around semantic chapters, not time buckets."""
     ordered = sorted(
         (item for item in facts if fact_is_reliable_for_main(item)
@@ -2112,11 +2112,18 @@ def select_items_evenly(items, fact_map, limit=8):
     return [ordered[index] for index in dict.fromkeys(indexes)]
 
 
-def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None, meeting_state_document=None):
+def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None,
+                    meeting_state_document=None, section_facts=None, detailed_facts=None):
     metadata = metadata or {}
     semantic_registry = semantic_registry or {"tasks": []}
     meeting_state_document = meeting_state_document or {}
-    fact_map = {item["fact_id"]: item for item in facts}
+    section_facts = section_facts if section_facts is not None else facts
+    detailed_facts = detailed_facts if detailed_facts is not None else facts
+    fact_map = {
+        item["fact_id"]: item
+        for source in (facts, section_facts, detailed_facts)
+        for item in source
+    }
     total_seconds = float(metadata.get("duration_seconds") or coverage.get("total_seconds") or 0)
 
     def line(item):
@@ -2139,7 +2146,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         output.append("Содержательных тезисов для краткого описания не обнаружено.")
 
     output.extend(["", "## Участники", ""])
-    participants = participant_lines(facts)
+    participants = participant_lines(section_facts)
     output.extend(participants or ["- Участники не определены."])
 
     output.extend(["", "## Таймкоды", ""])
@@ -2204,14 +2211,14 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                     f'{time_link(start, total_seconds)}{marker}'
                 )
 
-    hypotheses = hypothesis_points(facts)
+    hypotheses = hypothesis_points(section_facts)
     semantic_by_id = {item.get("record_id"): item for item in semantic_registry.get("records", [])}
     state_questions = {
         item.get("source_record_id"): item
         for item in state_views.get("questions", [])
     }
     resolved_qa = []
-    for fact in facts:
+    for fact in section_facts:
         question = state_questions.get(fact.get("fact_id"), {})
         status = question.get("state")
         if fact.get("type") != "question" or status not in {"answered", "partially_answered", "tentatively_answered"}:
@@ -2241,7 +2248,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                 f'*({status_label[status]})* {time_link(question["start"], total_seconds)}'
             )
     unresolved = sorted([
-        fact for fact in facts
+        fact for fact in section_facts
         if fact.get("type") == "question"
         and (
             state_questions.get(fact.get("fact_id"), {}).get("state")
@@ -2253,7 +2260,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         ) != "transcript_verification"
     ], key=lambda item: float(item.get("start", 0)))
     transcript_checks = sorted([
-        fact for fact in facts
+        fact for fact in section_facts
         if (
             semantic_by_id.get(fact.get("fact_id"), {}).get("question_kind") == "transcript_verification"
             and semantic_by_id.get(fact.get("fact_id"), {}).get("question_status") in {"unanswered", "deferred", "requires_external_verification", "unresolved"}
@@ -2267,11 +2274,19 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
     ], key=lambda item: float(item.get("start", 0)))
     transcript_check_ids = {item.get("fact_id") for item in transcript_checks}
     uncertain_omissions = [
-        fact for fact in facts
+        fact for fact in section_facts
         if not fact_is_reliable_for_main(fact)
         and fact.get("fact_id") not in transcript_check_ids
     ]
-    if hypotheses or unresolved:
+    globally_classified_questions = [
+        fact for fact in section_facts
+        if fact.get("type") == "question"
+        and (
+            state_questions.get(fact.get("fact_id"), {}).get("state")
+            or semantic_by_id.get(fact.get("fact_id"), {}).get("question_status")
+        ) in QUESTION_STATES
+    ]
+    if hypotheses or unresolved or globally_classified_questions:
         output.extend(["", "## Открытые вопросы и гипотезы", ""])
         if hypotheses:
             output.extend(["### Гипотезы для проверки", ""])
@@ -2282,8 +2297,8 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                     f'- **H-{index:02d}.** {canonicalize_people(clean_publication_statement(fact))} '
                     f'— автор: {authors}. {time_link(navigation_start(fact), total_seconds)}{marker}'
                 )
+        output.extend(["", "### Нерешённые вопросы встречи", ""])
         if unresolved:
-            output.extend(["", "### Нерешённые вопросы встречи", ""])
             for index, fact in enumerate(unresolved, 1):
                 marker = " ⚠" if fact.get("uncertainty", {}).get("needs_review") else ""
                 state = (
@@ -2303,11 +2318,17 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                     f'- **Q-{index:02d}.** {canonicalize_people(fact["statement"])} '
                     f'— *{note}*. {time_link(fact["start"], total_seconds)}{marker}'
                 )
+        else:
+            output.append(
+                "- Открытых вопросов не обнаружено после глобальной проверки; остальные "
+                "вопросы классифицированы как отвеченные, частично отвеченные, "
+                "предварительные, риторические или снятые."
+            )
         # Неуверенные фрагменты сохраняются в summary_audit.json, но не засоряют
         # пользовательское саммари техническими сообщениями без содержания.
 
     output.extend(["", "## Подробное описание встречи", ""])
-    detailed = detailed_chronology_points(facts, total_seconds)
+    detailed = detailed_chronology_points(detailed_facts, total_seconds)
     if detailed:
         for selected in detailed:
             start = min((navigation_start(fact) for fact in selected), default=0)
@@ -3637,6 +3658,35 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     )
     require_structural_quality(final_quality, final=True)
     coverage = dict(coverage, document=document_coverage)
+    question_ids = {
+        item.get("source_record_id")
+        for item in state.get("views", {}).get("questions", [])
+        if item.get("source_record_id")
+    }
+    answer_ids = {
+        answer_id
+        for item in state.get("views", {}).get("questions", [])
+        for answer_id in item.get("answer_record_ids", [])
+    }
+    section_ids = selected_ids | question_ids | answer_ids | {
+        item.get("fact_id") for item in evidence_facts if item.get("type") == "hypothesis"
+    }
+    section_facts = [item for item in evidence_facts if item.get("fact_id") in section_ids]
+    detailed_groups = detailed_chronology_points(
+        evidence_facts,
+        float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0),
+    )
+    detailed_ids = {
+        item.get("fact_id") for group in detailed_groups for item in group
+    }
+    detailed_facts = [item for item in evidence_facts if item.get("fact_id") in detailed_ids]
+    summary_plan["section_fact_ids"] = [item.get("fact_id") for item in section_facts]
+    summary_plan["detailed_fact_ids"] = [item.get("fact_id") for item in detailed_facts]
+    coverage["public_selection"].update({
+        "section_facts": len(section_facts),
+        "detailed_facts": len(detailed_facts),
+    })
+    atomic_json(run_dir / "summary_plan.json", summary_plan)
     markdown = render_markdown(
         final_document,
         final_facts,
@@ -3648,6 +3698,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         },
         semantic_registry=semantic_registry,
         meeting_state_document=state,
+        section_facts=section_facts,
+        detailed_facts=detailed_facts,
     )
     atomic_json(run_dir / "summary.final.json", final_document)
     atomic_json(run_dir / "audit.json", {
