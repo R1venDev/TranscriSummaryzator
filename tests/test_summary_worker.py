@@ -867,14 +867,14 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertEqual(merged[0]["evidence_ids"], ["U00001"])
 
-    def test_confirmed_owner_question_becomes_action(self):
+    def test_other_speakers_backchannel_does_not_confirm_assignment(self):
         question = utterance(1, 1, 3, speaker="@Misha", text="Мне сделать тебе разметчик Order Block?")
         confirmation = utterance(2, 3.1, 4, speaker="@HoTTaBbicH", text="Да, дальше этап апробации")
         item = fact(kind="proposal", statement="Misha должен сделать разметчик Order Block", evidence=[question])
         updated = summary.resolve_dialogue_commitments([item], [question, confirmation])[0]
-        self.assertEqual(updated["type"], "action")
-        self.assertEqual(updated["speaker_refs"], ["@Misha"])
-        self.assertEqual(updated["evidence_ids"], ["U00001", "U00002"])
+        self.assertEqual(updated["type"], "proposal")
+        self.assertNotIn("confirmed_owner_question_promoted", updated.get("policy_note", ""))
+        self.assertEqual(updated["evidence_ids"], ["U00001"])
 
     def test_cache_is_invalidated_when_prompt_changes(self):
         class Client:

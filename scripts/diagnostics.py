@@ -25,6 +25,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 _path = None
+_trace_path = None
 _component = os.environ.get("TRANSCRISUMMARY_COMPONENT", "unknown")
 _run_id = os.environ.get("TRANSCRISUMMARY_RUN_ID")
 _job_id = os.environ.get("TRANSCRISUMMARY_JOB_ID")
@@ -32,10 +33,12 @@ _lock = threading.Lock()
 _SENSITIVE = ("password", "passwd", "secret", "token", "authorization", "cookie", "api_key")
 
 
-def configure(path=None, *, component=None, run_id=None, job_id=None):
-    global _path, _component, _run_id, _job_id
+def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path=None):
+    global _path, _trace_path, _component, _run_id, _job_id
     value = path or os.environ.get("TRANSCRISUMMARY_DIAGNOSTICS")
     _path = Path(value) if value else None
+    trace_value = trace_path or os.environ.get("TRANSCRISUMMARY_DIAGNOSTICS_TRACE")
+    _trace_path = Path(trace_value) if trace_value else (_path.with_name("diagnostics.trace.jsonl") if _path and os.environ.get("TRANSCRISUMMARY_DEBUG_TRACE") == "1" else None)
     if component:
         _component = str(component)
     if run_id:
@@ -44,6 +47,8 @@ def configure(path=None, *, component=None, run_id=None, job_id=None):
         _job_id = str(job_id)
     if _path:
         os.environ["TRANSCRISUMMARY_DIAGNOSTICS"] = str(_path)
+    if _trace_path:
+        os.environ["TRANSCRISUMMARY_DIAGNOSTICS_TRACE"] = str(_trace_path)
     os.environ["TRANSCRISUMMARY_COMPONENT"] = _component
     if _run_id:
         os.environ["TRANSCRISUMMARY_RUN_ID"] = _run_id
@@ -90,6 +95,8 @@ def event(name, *, category="observation", outcome=None, inputs=None, metrics=No
           thresholds=None, reasons=None, refs=None, severity="INFO", duration_ms=None,
           component=None, error=None):
     path = _path or configure()
+    if category in {"trace", "word", "candidate", "voice_id_phrase", "low_level_arbitration"}:
+        path = _trace_path
     if not path:
         return None
     payload = {
@@ -204,6 +211,9 @@ def publish(source, output_dir):
     temporary = output_dir / "diagnostics_summary.json.tmp"
     temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, output_dir / "diagnostics_summary.json")
+    trace = source.with_name("diagnostics.trace.jsonl")
+    if trace.is_file():
+        shutil.copy2(trace, output_dir / "diagnostics.trace.jsonl")
     return summary
 
 

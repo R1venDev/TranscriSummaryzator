@@ -10,8 +10,20 @@ def overlap(a, b):
     return max(0.0, min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"])))
 
 
+def merge_intervals(items):
+    """Return the measurable union of a track, never double-counting overlaps."""
+    intervals = sorted((float(x["start"]), float(x["end"])) for x in items if float(x["end"]) > float(x["start"]))
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def duration(items):
-    return sum(max(0.0, float(x["end"]) - float(x["start"])) for x in items)
+    return sum(end - start for start, end in merge_intervals(items))
 
 
 def by_speaker(items):
@@ -22,7 +34,16 @@ def by_speaker(items):
 
 
 def intersect_duration(left, right):
-    return sum(overlap(a, b) for a in left for b in right)
+    left, right = merge_intervals(left), merge_intervals(right)
+    total = 0.0
+    i = j = 0
+    while i < len(left) and j < len(right):
+        total += max(0.0, min(left[i][1], right[j][1]) - max(left[i][0], right[j][0]))
+        if left[i][1] <= right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
 
 
 def track_matrix(primary, verifier):

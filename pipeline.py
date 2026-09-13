@@ -614,6 +614,7 @@ def apply_domain_vocabulary(words, cfg):
         tuple(str(source).casefold().split()): str(target)
         for source, target in vocabulary.get("phrases", {}).items()
     }
+    contextual_rules = list(vocabulary.get("contextual_rules", []))
     corrected = []
     token_pattern = re.compile(r"^([^\w@]*)(.*?)([^\w]*)$", re.UNICODE)
     parsed = []
@@ -638,6 +639,8 @@ def apply_domain_vocabulary(words, cfg):
             item["end"] = words[index + length - 1]["end"]
             item["text"] = parsed[index][0] + canonical + parsed[index + length - 1][2]
             item["asr_text"] = " ".join(originals)
+            item["raw_text"] = item["asr_text"]
+            item["normalization_operations"] = [{"source": item["asr_text"], "target": item["text"], "policy": "SAFE_EXACT"}]
             item["source_word_ids"] = [words[position]["word_id"] for position in range(index, index + length)]
             item["vocabulary_corrected"] = True
             corrected.append(item)
@@ -646,12 +649,27 @@ def apply_domain_vocabulary(words, cfg):
         word = words[index]
         item = dict(word)
         text = str(item.get("text", ""))
+        item.setdefault("raw_text", text)
+        item.setdefault("normalization_operations", [])
         leading, token, trailing = parsed[index]
         canonical = replacements.get(token.casefold())
+        applied_policy = "SAFE_EXACT"
+        if canonical is None:
+            context = " ".join(str(words[pos].get("text", "")) for pos in range(max(0, index - 5), min(len(words), index + 6))).casefold()
+            uncertain = ((item.get("asr_confidence") is not None and float(item.get("asr_confidence")) < 0.8) or bool(set(item.get("flags", [])) & {"asr_boundary", "asr_alternative"}))
+            for rule in contextual_rules:
+                if token.casefold() != str(rule.get("source", "")).casefold():
+                    continue
+                required = [str(value).casefold() for value in rule.get("required_context", [])]
+                if rule.get("policy") == "CONTEXT_REQUIRED" and any(value in context for value in required) and (uncertain or not rule.get("require_asr_uncertainty", False)):
+                    canonical, applied_policy = str(rule.get("target")), "CONTEXT_REQUIRED"
+                    break
         if canonical is not None:
             item["text"] = leading + canonical + trailing
             item["asr_text"] = text
+            item["raw_text"] = text
             item["vocabulary_corrected"] = True
+            item["normalization_operations"] = list(item.get("normalization_operations", [])) + [{"source": token, "target": canonical, "policy": applied_policy}]
         corrected.append(item)
         index += 1
     return corrected
@@ -1373,6 +1391,7 @@ def conflict_embedding_groups(audio, consensus, matches, cfg):
 def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=None, cache_dir=None, consensus=None):
     """Cluster-level ReDimNet ID followed by automatic per-region arbitration."""
     from scripts.speaker_identity import match_clusters, resolve_timeline, rttm_lines
+    from scripts.calibration import load_calibrator
 
     enrolled = ensure_redimnet_enrollment(cfg, log)
     if not enrolled:
@@ -1494,12 +1513,14 @@ def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=No
         short_seconds=float(cfg.get("short_turn_seconds", 1.5)),
         boundary_tolerance=float(cfg.get("boundary_tolerance_ms", 300)) / 1000.0,
         local_decisions=local_decisions,
+        calibrator=load_calibrator(cfg.get("speaker_calibration_file")),
     )
     final_diarization = {
         "model": "DiariZen+Ultra+ReDimNet2 automatic fusion",
         "intervals": [{
             "start": item["start"], "end": item["end"], "speaker": item["speaker_id"],
             "confidence": item["confidence"], "confidence_level": item["confidence_level"],
+            "confidence_source": item.get("confidence_source"), "calibration_bucket": item.get("calibration_bucket"),
             "overlap": item["overlap"], "known_speaker": item["known_speaker"],
             "decision": item["decision"],
         } for item in final_segments],
@@ -1584,7 +1605,7 @@ def process_job(job_id):
     final_dir = OUTPUTS / ("{}-{}".format(safe_name(source), job["fingerprint"][:8]))
     publishing = final_dir.with_name(final_dir.name + ".publishing")
     audio_key = stage_cache_key("audio-v1", {"source": content_sha256, "track": cfg["audio_track"], "rate": 16000, "channels": 1})
-    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg.get("diarization_batch_size", 8), "min": cfg.get("diarization_min_speakers", 1), "max": cfg.get("diarization_max_speakers", 5), "exact": job["speaker_count"]})
+    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg["diarization_batch_size"], "min": cfg["diarization_min_speakers"], "max": cfg["diarization_max_speakers"], "exact": job["speaker_count"]})
     ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
     asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
@@ -1647,7 +1668,7 @@ def process_job(job_id):
                 "--device", cfg["diarization_device"],
                 "--batch-size", str(cfg.get("diarization_batch_size", 8)),
                 "--min-speakers", str(cfg.get("diarization_min_speakers", 1)),
-                "--max-speakers", str(cfg.get("diarization_max_speakers", 5)),
+                "--max-speakers", str(cfg["diarization_max_speakers"]),
             ]
             if job["speaker_count"] is not None:
                 diarization_command.extend(["--num-speakers", str(job["speaker_count"])])

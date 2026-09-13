@@ -7,8 +7,10 @@ record.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
+from semantics.ontology import ClaimKind
+from contracts.meeting import Condition, Quantity, TimeExpression
 
 
 class StrictModel(BaseModel):
@@ -16,7 +18,7 @@ class StrictModel(BaseModel):
 
 
 class ExtractedFact(StrictModel):
-    type: Literal["observation", "problem", "proposal", "decision", "action", "question", "hypothesis", "goal", "metric", "current_state", "schedule"]
+    type: ClaimKind
     topic: str = Field(min_length=1)
     statement: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
@@ -30,20 +32,6 @@ class ExtractionResponse(StrictModel):
     coverage_note: str = ""
 
 
-class Condition(StrictModel):
-    text: str
-    evidence_ids: list[str]
-
-
-class Quantity(StrictModel):
-    value: str
-    unit: Optional[str] = None
-    entity: Optional[str] = None
-    role: Optional[str] = None
-    source_span: Optional[str] = None
-    evidence_ids: list[str]
-
-
 class SemanticRecordResponse(StrictModel):
     record_id: str
     subject: Optional[str] = None
@@ -51,17 +39,19 @@ class SemanticRecordResponse(StrictModel):
     object: Optional[str] = None
     polarity: Literal["positive", "negative"] = "positive"
     modality: Literal["asserted", "tentative", "proposed", "committed", "question"] = "asserted"
-    content_kind: Optional[Literal["state", "metric", "rule", "task", "goal", "schedule", "question"]] = None
+    content_kind: Optional[Literal["state", "metric", "experimental_result", "definition", "rule", "trading_rule", "system_rule", "task", "goal", "schedule", "question", "constraint", "assumption", "resource", "design_choice", "alternative", "risk", "dependency", "blocker", "correction", "rejected_option"]] = None
     speech_act: Optional[Literal["assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"]] = None
     conditions: list[Condition] = Field(default_factory=list)
     quantities: list[Quantity] = Field(default_factory=list)
-    time_expression: Optional[Union[str, Dict[str, Any]]] = None
+    time_expression: Optional[TimeExpression] = None
     proposed_by: list[str] = Field(default_factory=list)
     assignees: list[str] = Field(default_factory=list)
     confirmation_evidence_ids: list[str] = Field(default_factory=list)
     question_status: Literal["resolved", "unresolved", "unclear"] = "unclear"
     answer_evidence_ids: list[str] = Field(default_factory=list)
     answer_record_ids: list[str] = Field(default_factory=list)
+    requested_slots: list[str] = Field(default_factory=list)
+    answered_slots: list[str] = Field(default_factory=list)
 
 
 class SemanticBatchResponse(StrictModel):

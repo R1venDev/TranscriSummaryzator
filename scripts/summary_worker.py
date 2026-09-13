@@ -18,6 +18,10 @@ import urllib.request
 from difflib import SequenceMatcher
 from pathlib import Path
 
+APPLICATION_ROOT = Path(__file__).resolve().parents[1]
+if str(APPLICATION_ROOT) not in sys.path:
+    sys.path.insert(0, str(APPLICATION_ROOT))
+
 from quality_schema import adaptive_compute_plan, evidence_uncertainty, meeting_state, normalize_semantic_record, task_records
 from semantic_contracts import json_schema as contract_schema, validate_response
 from evidence_ledger import risk_level, semantic_risks
@@ -30,17 +34,17 @@ from meeting_intelligence import (
     QUESTION_STATES, apply_question_resolutions, build_summary_plan,
     consolidate_tasks, is_noise, question_candidate_bundles, valid_hypothesis,
 )
+from semantics.ontology import CLAIM_KINDS
+from semantics.core import build_meeting_state
+from summary.planner import plan as build_constrained_plan
+from summary.views import project_views
+from summary.verifier import audit_realization, verify_sentence_plan
+from project_memory.project_state import delta as project_delta, update_project_state
+from pipeline_core.artifacts import manifest as artifact_manifest
 
 
-PIPELINE_VERSION = "summary-state-v18"
-FACT_TYPES = {
-    "current_state", "observation", "problem", "hypothesis", "proposal",
-    "decision", "action", "question", "metric", "schedule", "goal",
-    "definition", "experimental_result", "target", "constraint", "assumption",
-    "trading_rule", "system_rule", "dataset", "resource", "design_choice",
-    "alternative", "risk", "dependency", "blocker", "follow_up",
-    "correction", "rejected_option",
-}
+PIPELINE_VERSION = "meeting-intelligence-v20"
+FACT_TYPES = set(CLAIM_KINDS)
 CRITICAL_TYPES = {"decision", "action", "metric", "schedule", "goal"}
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*[%×xх])?(?!\w)", re.I)
 PROFILE_RE = re.compile(r"@[\w.-]+", re.U)
@@ -577,7 +581,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     manifest = directory / "manifest.json"
     output = directory / "repairs.json"
-    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "audio_size": audio.stat().st_size})
+    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "secondary_model": cfg.get("summary_independent_asr_model") if cfg.get("summary_independent_asr_enabled", True) else None, "audio_size": audio.stat().st_size})
     if output.is_file():
         cached = load_json(output)
         if cached.get("request_key") == request_key:
@@ -595,6 +599,8 @@ def run_evidence_repair(facts, cache_root, cfg):
         "--cache", str(application_root / "work" / "cache" / "gigaam"),
         "--device", str(cfg.get("asr_device", "auto")),
     ]
+    if cfg.get("summary_independent_asr_enabled", True):
+        command.extend(["--secondary-model", str(cfg.get("summary_independent_asr_model", "large-v3-turbo"))])
     environment = dict(os.environ, PYTHONPATH=str(Path(__file__).parent), PYTHONUNBUFFERED="1")
     completed = subprocess.run(command, text=True, capture_output=True, env=environment)
     if completed.returncode:
@@ -613,6 +619,12 @@ def output_limit_error(exc):
         r"ответ оборван|лимит(?:а|у|ом)? вывода|truncat|max(?:imum)? (?:output )?tokens?",
         str(exc), re.IGNORECASE,
     ))
+
+
+def token_aware_split_required(items, model_output_budget, p95_tokens_per_record=180, schema_overhead=700, safety=0.75):
+    """Prevent predictable truncation before an LLM request is sent."""
+    expected_output = len(items) * p95_tokens_per_record + schema_overhead
+    return len(items) > 1 and expected_output > model_output_budget * safety
 
 
 def missing_response_ids(items, response_items, source_id="fact_id", response_id="fact_id"):
@@ -831,10 +843,10 @@ def resolve_dialogue_commitments(facts, utterances):
             last_id = fact.get("evidence_ids", [None])[-1]
             position = by_id.get(last_id)
             following = utterances[position + 1:position + 3] if position is not None else []
-            confirmation = next(
-                (item for item in following if re.match(r"^(?:да|угу|ага|ок(?:ей)?)(?:\b|[-–—,])", item["text"].casefold())),
-                None,
-            )
+            # A bare backchannel from another person is not acceptance by the
+            # assignee.  Promotion requires an explicit self-commitment, which
+            # is handled by the commitment classifier below.
+            confirmation = None
             if confirmation:
                 updated = dict(fact)
                 updated["type"] = "action"
@@ -1457,7 +1469,9 @@ def semantic_metrics(registry, facts=None):
         "confirmed_tasks": sum(item.get("assignment_status") == "confirmed" for item in tasks),
         "unconfirmed_tasks": sum(item.get("assignment_status") != "confirmed" for item in tasks),
         "automation_eligible_tasks": sum(bool(item.get("automation_eligible")) for item in tasks),
-        "questions_resolved": sum(item.get("question_status") in {"answered", "partially_answered", "tentatively_answered", "resolved"} for item in questions),
+        "questions_resolved": sum(item.get("question_status") in {"answered", "resolved"} for item in questions),
+        "questions_partially_answered": sum(item.get("question_status") == "partially_answered" for item in questions),
+        "questions_tentatively_answered": sum(item.get("question_status") == "tentatively_answered" for item in questions),
         "questions_unresolved": sum(item.get("question_status") in {"unanswered", "deferred", "requires_external_verification", "unresolved"} for item in questions),
         "questions_unclear": sum(item.get("question_status") == "unclear" for item in questions),
         "question_status_counts": {
@@ -3205,7 +3219,12 @@ def build_semantic_registry(client, model, facts, run_dir):
     processed_ids = set()
 
     def structure_batch(batch, offset):
-        prompt = "Структурируй каждый тезис. Формат:\n" + '''{"records":[{"record_id":"F00001","subject":null,"predicate":null,"object":null,"polarity":"positive|negative","modality":"asserted|tentative|proposed|committed|question","content_kind":"state|metric|experimental_result|definition|rule|trading_rule|system_rule|task|goal|schedule|question|constraint|assumption|resource|design_choice|alternative|risk|dependency|blocker|correction|rejected_option","speech_act":"assert|propose|ask|answer|commit|accept|reject|correct|decide","conditions":[{"text":"условие","evidence_ids":["U00001"]}],"quantities":[{"value":"10","unit":"%","entity":"risk_limit","role":"threshold","source_span":"дословный фрагмент","evidence_ids":["U00001"]}],"time_expression":null,"proposed_by":[],"assignees":[],"confirmation_evidence_ids":[],"question_status":"resolved|unresolved|unclear","answer_evidence_ids":[],"answer_record_ids":[]}]}'''
+        if token_aware_split_required(batch, 4200):
+            middle = len(batch) // 2
+            structure_batch(batch[:middle], offset)
+            structure_batch(batch[middle:], offset + middle)
+            return
+        prompt = "Структурируй каждый тезис. Используй строгую схему запроса. Для conditions укажи predicate/effect/evidence_ids; для quantities — quantity_id/raw_text/normalized(value, unit, operator, direction)/entity/evidence_ids/status; time_expression — объект raw_text/kind/date_resolution/time/timezone/certainty или null. Для вопроса укажи requested_slots и только доказанные answered_slots."
         prompt += "\n\nТЕЗИСЫ:\n" + json.dumps([compact_fact(item) for item in batch], ensure_ascii=False)
         first, last = offset + 1, offset + len(batch)
         try:
@@ -3635,6 +3654,11 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     state["views"]["atomic_tasks"] = list(state["views"].get("tasks", []))
     state["views"]["tasks"] = list(semantic_registry.get("tasks", []))
     atomic_json(run_dir / "meeting_state.json", state)
+    state_v2 = build_meeting_state(
+        state, semantic_registry.get("records", []),
+        provenance={"audio_sha256": source_manifest.get("audio_sha256")},
+    )
+    atomic_json(run_dir / "meeting_state.v2.json", state_v2)
     lifecycle_counts = {}
     for item in state.get("events", []):
         lifecycle_counts[item.get("lifecycle", "unknown")] = lifecycle_counts.get(item.get("lifecycle", "unknown"), 0) + 1
@@ -3701,11 +3725,17 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             f'{coverage["evidence_registry"]["material_coverage_ratio"]*100:.1f}%'
         )
     diagnostic_decision("evidence_completeness_gate", "accepted", metrics=coverage["evidence_registry"], thresholds={"minimum_material_coverage": minimum_publication_coverage}, reasons=["coverage_threshold_passed"])
-    summary_plan = build_summary_plan(
-        evidence_facts, state,
-        max_units=int(cfg.get("summary_public_fact_limit", 32)),
-        max_chapters=int(cfg.get("summary_navigation_max_chapters", 12)),
+    facts_by_id = {item.get("fact_id"): item for item in evidence_facts}
+    summary_plan = build_constrained_plan(
+        state_v2["claims"], state_v2["episodes"], state_v2["relations"],
+        score_fn=lambda claim: salience_score(facts_by_id.get(claim.get("source_record_id"), {"type": claim.get("kind"), "statement": claim.get("statement")}), claim),
     )
+    summary_plan["selected_fact_ids"] = [
+        claim.get("source_record_id") for claim in state_v2["claims"]
+        if claim.get("claim_id") in set(summary_plan["selected_claim_ids"])
+        and claim.get("source_record_id") in facts_by_id
+    ]
+    summary_plan["chapter_fact_ids"] = summary_plan["selected_fact_ids"][:int(cfg.get("summary_navigation_max_chapters", 12))]
     selected_ids = set(summary_plan["selected_fact_ids"])
     final_facts = [item for item in evidence_facts if item.get("fact_id") in selected_ids]
     if not final_facts:
@@ -3819,6 +3849,34 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "semantics" / "dialogue_events.json", {"schema_version": 1, "events": state["events"]})
     atomic_json(output_dir / "semantics" / "relations.json", {"schema_version": 1, "relations": state["relations"]})
     atomic_json(output_dir / "semantics" / "meeting_state.json", state)
+    atomic_json(output_dir / "semantics" / "meeting_state.v2.json", state_v2)
+    previous_project_path = output_dir / "semantics" / "project_state.json"
+    previous_project = load_json(previous_project_path) if previous_project_path.is_file() else None
+    project_state = update_project_state(previous_project, state_v2)
+    atomic_json(previous_project_path, project_state)
+    atomic_json(output_dir / "views" / "delta.json", project_delta(previous_project, project_state))
+    projections = project_views(state_v2, summary_plan["selected_claim_ids"])
+    claim_by_id = {item["claim_id"]: item for item in state_v2["claims"]}
+    plan_audits = []
+    for sentence_plan in summary_plan["sentence_plans"]:
+        planned = verify_sentence_plan(sentence_plan, state_v2["claims"], state_v2["relations"])
+        claim_text = " ".join(claim_by_id[claim_id]["statement"] for claim_id in sentence_plan["claim_ids"] if claim_id in claim_by_id)
+        realized = audit_realization(claim_text, sentence_plan)
+        plan_audits.append({"sentence_id": sentence_plan["sentence_id"], "plan": planned, "realization": realized})
+    if not all(item["plan"]["passed"] and item["realization"]["passed"] for item in plan_audits):
+        raise RuntimeError("Plan-before-write verification rejected a public sentence")
+    atomic_json(output_dir / "views" / "plan_verification.json", {"schema_version": 1, "audits": plan_audits})
+    view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
+    for view_name, claims in projections.items():
+        atomic_json(output_dir / "views" / f"{view_name}.json", {"schema_version": 1, "claims": claims})
+        body = "# " + view_titles[view_name] + "\n\n" + ("\n".join(f"- {item.get('statement')}" for item in claims) or "Нет подтвержденных элементов.") + "\n"
+        atomic_text(output_dir / "views" / f"{view_name}.md", body)
+    manifests = [
+        artifact_manifest("meeting_state.v2.json", "MeetingStateSchema", "claim_graph", PIPELINE_VERSION, {"transcript": settings["transcript"]}),
+        artifact_manifest("summary_plan.json", "SummaryPlanSchema", "summary_plan", PIPELINE_VERSION, {"meeting_state": stable_hash(state_v2)}),
+        artifact_manifest("project_state.json", "ProjectStateSchema", "project_state", PIPELINE_VERSION, {"meeting_state": stable_hash(state_v2)}),
+    ]
+    atomic_json(output_dir / "artifact_manifest.json", {"pipeline_version": PIPELINE_VERSION, "artifacts": manifests})
     atomic_json(output_dir / "views" / "decisions.json", {"schema_version": 1, "decisions": state["views"]["decisions"]})
     atomic_json(output_dir / "views" / "questions.json", {"schema_version": 1, "questions": state["views"]["questions"]})
     atomic_json(output_dir / "views" / "tasks.json", {"schema_version": 1, "tasks": state["views"]["tasks"]})

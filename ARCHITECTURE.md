@@ -1,5 +1,17 @@
 # Архитектура транскрипции и саммари
 
+## v20: formal meeting intelligence core
+
+Основной продукт теперь `Evidence-backed MeetingState + Claim Graph`, а не Markdown:
+
+`Audio → immutable evidence → atomic claims → dialogue episodes → discussion threads → verified relations → latest MeetingState → ProjectState/delta → constrained plans → verified views`.
+
+`semantics/ontology.py` является единственным словарём типов claims и relations. `semantics/core.py` переводит проверенный event graph в `MeetingStateSchema v2`; `summary/planner.py` выполняет mandatory-first selection с адаптивным бюджетом и покрытием episodes, затем выпускает paragraph/sentence plans. Межэпизодная композиция разрешена только при наличии явной relation.
+
+`project_memory/` хранит продольный контекст отдельно от evidence конкретной встречи. Артефакты имеют независимые версии схем и manifest производителя. Старый fixed public limit при чтении конфигурации инвалидируется. Legacy renderer сохранён как compatibility view, а authoritative state и purpose-specific views публикуются в `semantics/` и `views/`.
+
+Critical spans сравниваются с независимой ASR family; разногласия сохраняются как alternatives и приводят к abstention/review. Speaker confidence считается вероятностью только при наличии fitted calibration artifact, иначе явно маркируется как routing score.
+
 ## v18: meeting intelligence и utility-driven summary
 
 Evidence registry и публичное саммари теперь являются разными представлениями.

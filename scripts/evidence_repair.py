@@ -96,8 +96,15 @@ def reconcile_repairs(facts, repairs):
             mismatch_reasons = repair_mismatch_reasons(before, after)
             mismatch = bool(mismatch_reasons)
             status = "disagreed" if mismatch else ("agreed" if after.strip() else "missing")
+            alternatives = list(item.get("alternatives", []))
+            if alternatives:
+                independent_reasons = repair_mismatch_reasons(before, alternatives[0].get("text", ""))
+                mismatch_reasons = sorted(set(mismatch_reasons + independent_reasons))
+                mismatch = bool(mismatch_reasons)
+                status = "disputed" if mismatch else status
+            report.setdefault(status, 0)
             report[status] += 1
-            report["items"].append({"evidence_id": item["evidence_id"], "status": status, "mismatch_reasons": mismatch_reasons, "audio_clip_sha256": item.get("audio_clip_sha256"), "model": item.get("model")})
+            report["items"].append({"evidence_id": item["evidence_id"], "status": status, "mismatch_reasons": mismatch_reasons, "audio_clip_sha256": item.get("audio_clip_sha256"), "model": item.get("model"), "alternatives": alternatives})
             if mismatch:
                 disagreements.append(item["evidence_id"])
         fact["audio_repairs"] = relevant

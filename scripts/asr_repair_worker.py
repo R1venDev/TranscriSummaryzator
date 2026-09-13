@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", default="v3_e2e_rnnt")
+    parser.add_argument("--secondary-model")
     parser.add_argument("--cache", required=True)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
@@ -57,7 +58,29 @@ def main():
             "method": "second_pass_no_vad_fixed_chunks", "chunk_count": len(ranges),
         })
         print("REPAIR_PROGRESS " + json.dumps({"current": index, "total": len(requests)}), flush=True)
-    write_json(args.output, {"schema_version": 1, "repairs": repairs})
+    if args.secondary_model:
+        # Load a genuinely independent model family only after GigaAM is released.
+        del model
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        from faster_whisper import WhisperModel
+        secondary = WhisperModel(args.secondary_model, device="cuda" if device != "cpu" else "cpu", compute_type="float16" if device != "cpu" else "int8", download_root=args.cache)
+        for repair in repairs:
+            start, end = float(repair["start"]), float(repair["end"])
+            clip = audio[int(start * rate):int(end * rate)]
+            with __import__("tempfile").NamedTemporaryFile(suffix=".wav") as temporary:
+                sf.write(temporary.name, clip, rate, subtype="PCM_16")
+                segments, _ = secondary.transcribe(temporary.name, language="ru", word_timestamps=True, vad_filter=False)
+                alternative = " ".join(segment.text.strip() for segment in segments).strip()
+            repair["alternatives"] = [{"text": alternative, "source": "faster_whisper", "model": args.secondary_model}] if alternative else []
+            repair["status"] = "disputed" if alternative and alternative.casefold() != str(repair.get("text", "")).casefold() else "agreed"
+    write_json(args.output, {"schema_version": 2, "repairs": repairs})
 
 
 if __name__ == "__main__":

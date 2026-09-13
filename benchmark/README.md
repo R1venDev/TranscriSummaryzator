@@ -1,5 +1,11 @@
 # Эталонная проверка pipeline
 
+## Release gates v20
+
+Gold scorecard включает atomic claim precision/recall, canonical type accuracy, relation precision, modality/latest-state/correction accuracy, task acceptance F1, question slot/direct-answer accuracy, mandatory recall, episode/topic coverage, cross-episode merge error, redundancy, speaker ECE/Brier и critical ASR number/negation errors.
+
+Release блокируется при регрессии critical factual precision или mandatory recall, любом известном cross-episode merge, превышении порога false-positive задач/false-resolution вопросов либо недопустимой деградации DER/JER. `evaluation/hard_negatives.py` генерирует corruption pairs для speaker, number, negation и modality; набор расширяется assignment, answer-swap, causal inversion и supersession примерами по мере пополнения gold meetings.
+
 Эта папка предназначена только для данных, вручную сверенных с аудио. Автоматическую транскрипцию нельзя копировать в reference и помечать как `gold`.
 
 Для каждого случая нужны:

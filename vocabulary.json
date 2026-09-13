@@ -67,11 +67,6 @@
     "эмбалансов": "имбалансов",
     "эмбалансами": "имбалансами",
     "эмбов": "имбалансов",
-    "баланс": "имбаланс",
-    "баланса": "имбаланса",
-    "балансы": "имбалансы",
-    "балансов": "имбалансов",
-    "балансом": "имбалансом",
     "имбала-ой": "имбаланса",
     "свип": "Sweep",
     "свипы": "Sweep",
@@ -195,6 +190,13 @@
     "волюм": "Volume",
     "цмя": "CME"
   },
+  "contextual_rules": [
+    {"source": "баланс", "target": "имбаланс", "policy": "CONTEXT_REQUIRED", "required_context": ["FVG", "BOS", "свеча", "SMC"], "require_asr_uncertainty": true},
+    {"source": "баланса", "target": "имбаланса", "policy": "CONTEXT_REQUIRED", "required_context": ["FVG", "BOS", "свеча", "SMC"], "require_asr_uncertainty": true},
+    {"source": "балансы", "target": "имбалансы", "policy": "CONTEXT_REQUIRED", "required_context": ["FVG", "BOS", "свеча", "SMC"], "require_asr_uncertainty": true},
+    {"source": "балансов", "target": "имбалансов", "policy": "CONTEXT_REQUIRED", "required_context": ["FVG", "BOS", "свеча", "SMC"], "require_asr_uncertainty": true},
+    {"source": "балансом", "target": "имбалансом", "policy": "CONTEXT_REQUIRED", "required_context": ["FVG", "BOS", "свеча", "SMC"], "require_asr_uncertainty": true}
+  ],
   "phrases": {
     "дев джонс": "Dow Jones",
     "дав джонс": "Dow Jones",

@@ -177,16 +177,17 @@ def normalize_semantic_record(raw, fact):
     for value in raw.get("conditions", []):
         if not isinstance(value, dict):
             continue
-        text = str(value.get("text") or "").strip()
+        text = str(value.get("predicate") or value.get("text") or "").strip()
         ids = [item for item in value.get("evidence_ids", []) if item in evidence_set]
         if text and ids and CONDITION_RE.search(text):
-            conditions.append({"text": text, "evidence_ids": ids})
+            conditions.append({"predicate": text, "effect": str(value.get("effect") or "").strip() or None, "evidence_ids": ids})
     quantities = []
     for value in raw.get("quantities", []):
         if not isinstance(value, dict):
             continue
         ids = [item for item in value.get("evidence_ids", []) if item in evidence_set]
-        amount = str(value.get("value") or "").strip()
+        normalized = value.get("normalized", {}) if isinstance(value.get("normalized"), dict) else {}
+        amount = str(normalized.get("value") if normalized.get("value") is not None else value.get("value") or "").strip()
         digits = re.findall(r"\d+(?:[.,]\d+)?", amount)
         cited_text = " ".join(str(evidence_by_id[item].get("text") or "") for item in ids if item in evidence_by_id).casefold()
         supported = any(
@@ -199,21 +200,14 @@ def normalize_semantic_record(raw, fact):
             )
             entity = str(value.get("entity") or "").strip() or None
             role = str(value.get("role") or "").strip() or None
-            unit = str(value.get("unit") or "").strip() or None
+            unit = str(normalized.get("unit") or value.get("unit") or "").strip() or None
             # A signed integer near index/window language is an offset, never a
             # timeframe merely because a model guessed that unit.
             if amount.startswith("-") and re.search(r"(?iu)\b(?:индекс|позици|окн[оа]|свеч[аи])\w*\b", cited_text):
                 entity, role = entity or "window_index", role or "index_offset"
                 if unit and re.search(r"(?iu)таймфрейм|time\s*frame", unit):
                     unit = None
-            quantities.append({
-                "value": amount,
-                "unit": unit,
-                "entity": entity,
-                "role": role,
-                "source_span": source_span or None,
-                "evidence_ids": ids,
-            })
+            quantities.append({"quantity_id": value.get("quantity_id") or f"N{len(quantities)+1:03d}", "raw_text": value.get("raw_text") or source_span or amount, "normalized": {"value": float(amount.replace(",", ".")), "unit": unit, "operator": normalized.get("operator", "exact"), "direction": normalized.get("direction")}, "entity": entity, "evidence_ids": ids, "status": value.get("status", "accepted"), "value": amount, "unit": unit, "role": role, "source_span": source_span or None})
     confirmations = [
         {
             "evidence_id": evidence_id,
@@ -285,7 +279,7 @@ def normalize_semantic_record(raw, fact):
         "conditions": conditions,
         "quantities": quantities,
         "time_expression": (
-            str(raw.get("time_expression", {}).get("text") or "").strip()
+            str(raw.get("time_expression", {}).get("raw_text") or raw.get("time_expression", {}).get("text") or "").strip()
             if isinstance(raw.get("time_expression"), dict)
             else str(raw.get("time_expression") or "").strip()
         ) or None,
@@ -300,6 +294,8 @@ def normalize_semantic_record(raw, fact):
         "answer_evidence_ids": answer_ids,
         "answer_record_ids": answer_record_ids,
         "answer_resolution_basis": answer_resolution_basis,
+        "requested_slots": list(dict.fromkeys(str(value) for value in raw.get("requested_slots", []) if str(value).strip())),
+        "answered_slots": list(dict.fromkeys(str(value) for value in raw.get("answered_slots", []) if str(value).strip())),
         "evidence_ids": evidence_ids,
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),

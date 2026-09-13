@@ -8,6 +8,7 @@ either diarizer or the embedding model.
 from __future__ import annotations
 
 import math
+from calibration import predict as calibrated_probability, voice_bucket
 
 
 def cosine(left, right):
@@ -105,7 +106,7 @@ def _identity(cluster, matches, unknown_ids):
     return unknown_ids[cluster], unknown_ids[cluster], 0.0, 0.0, False
 
 
-def resolve_timeline(consensus, matches, short_seconds=1.5, boundary_tolerance=0.3, local_decisions=None):
+def resolve_timeline(consensus, matches, short_seconds=1.5, boundary_tolerance=0.3, local_decisions=None, calibrator=None):
     """Resolve local model conflicts and preserve true overlap automatically."""
     unknown_ids, atomic, debug = {}, [], []
     local_decisions = local_decisions or {}
@@ -164,12 +165,23 @@ def resolve_timeline(consensus, matches, short_seconds=1.5, boundary_tolerance=0
                 confidence = min(0.89, 0.58 + 0.22 * max(0.0, voice_score) + 0.07 * min(1.0, voice_margin / 0.2))
             elif agreement >= 0.99:
                 confidence = 0.72
+            bucket = voice_bucket(
+                float(item["end"]) - float(item["start"]),
+                overlap=bool(item.get("overlap", False)),
+                session_prototype=bool(matches.get(cluster, {}).get("session_prototype")),
+                conflict=reason == "redimnet_second_pass",
+            )
+            calibrated = calibrated_probability(calibrator, {"score": voice_score, "margin": voice_margin, "agreement": agreement, "duration": float(item["end"]) - float(item["start"])}, bucket)
+            if calibrated is not None:
+                confidence = calibrated
             level = "HIGH" if confidence >= 0.9 else ("MEDIUM" if confidence >= 0.7 else "LOW")
             selected.append({
                 "start": float(item["start"]), "end": float(item["end"]),
                 "speaker_id": speaker_id, "speaker_name": name,
                 "anonymous_cluster": cluster, "known_speaker": known,
                 "confidence": round(confidence, 4), "confidence_level": level,
+                "confidence_source": "calibrated_probability" if calibrated is not None else "uncalibrated_routing_score",
+                "calibration_bucket": bucket,
                 "overlap": bool(item.get("overlap", False)), "decision": reason,
                 "primary_tracks": list(item.get("primary", [])),
                 "verifier_tracks": list(item.get("verifier_mapped", [])),

@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,6 +31,7 @@ class PipelineConfig(BaseModel):
     redimnet_repository: str = "PalabraAI/redimnet2"
     redimnet_revision: str = "c5bbe0b76e37df698c403f8844e41304ceab6307"
     redimnet_device: str = "auto"
+    speaker_calibration_file: Optional[str] = None
     redimnet_anchor_min_seconds: float = 3.0
     redimnet_anchor_target_seconds: float = 30.0
     redimnet_known_threshold: float = 0.55
@@ -125,11 +126,14 @@ class PipelineConfig(BaseModel):
     summary_resolution_batch_size: int = Field(7, ge=1)
     summary_auditor_failure_policy: Literal["risk_based", "fail_closed"] = "risk_based"
     summary_audio_repair_enabled: bool = True
+    summary_independent_asr_enabled: bool = True
+    summary_independent_asr_model: str = "large-v3-turbo"
     summary_repair_padding_before_seconds: float = Field(2.0, ge=0, le=10)
     summary_repair_padding_after_seconds: float = Field(4.0, ge=0, le=15)
     summary_repair_max_windows: int = Field(24, ge=0, le=100)
     summary_require_immutable_provenance: bool = True
-    summary_public_fact_limit: int = Field(32, ge=8, le=80)
+    summary_public_budget_min: int = Field(20, ge=8, le=120)
+    summary_public_budget_max: int = Field(120, ge=20, le=240)
     summary_navigation_max_chapters: int = Field(12, ge=4, le=16)
     domain_vocabulary: dict[str, str] = Field(default_factory=dict)
 
@@ -148,10 +152,15 @@ class PipelineConfig(BaseModel):
             raise ValueError("voice identity phrase bounds must satisfy min <= max")
         if self.voice_identity_strong_threshold < self.voice_identity_threshold:
             raise ValueError("strong voice threshold must not be lower than the normal threshold")
+        if self.summary_public_budget_min > self.summary_public_budget_max:
+            raise ValueError("summary public budget min cannot exceed max")
 
 
 def load_config(path: Path, resolved_path: Path | None = None) -> dict:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    # v18 compatibility: the fixed cap is intentionally discarded; v19 derives
+    # the budget from meeting state.
+    raw.pop("summary_public_fact_limit", None)
     resolved = PipelineConfig.model_validate(raw).model_dump(mode="json")
     if resolved_path is not None:
         resolved_path = Path(resolved_path)

@@ -8,7 +8,7 @@
   "diarization_model_revision": "main",
   "diarization_batch_size": 8,
   "diarization_min_speakers": 1,
-  "diarization_max_speakers": 5,
+  "diarization_max_speakers": 8,
   "ultra_model": "mago-ai/ultra_diar_streaming_sortformer_8spk_v1",
   "ultra_model_revision": "main",
   "ultra_device": "cuda",
