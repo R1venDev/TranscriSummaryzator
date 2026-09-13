@@ -7,15 +7,25 @@ import json
 import re
 from typing import Any
 
+try:
+    from speech_acts import COMMITMENT_RE, CORRECTION_CUE_RE, SCHEDULE_RE
+except ModuleNotFoundError:  # direct importlib loading in unit tests
+    import importlib.util
+    from pathlib import Path
+    _speech_spec = importlib.util.spec_from_file_location("speech_acts", Path(__file__).with_name("speech_acts.py"))
+    _speech = importlib.util.module_from_spec(_speech_spec)
+    _speech_spec.loader.exec_module(_speech)
+    COMMITMENT_RE, CORRECTION_CUE_RE, SCHEDULE_RE = _speech.COMMITMENT_RE, _speech.CORRECTION_CUE_RE, _speech.SCHEDULE_RE
+
 
 RISK_PATTERNS = {
     "agreement": re.compile(r"(?iu)^\s*(?:да|ага|угу|ок(?:ей)?|соглас(?:ен|на|ны)?)\W*$"),
     "disagreement": re.compile(r"(?iu)^\s*(?:нет|неа|не соглас(?:ен|на|ны)?)\W*$"),
     "negation": re.compile(r"(?iu)(?:^|\W)(?:не|нет|нельзя|никогда|без)(?:\W|$)"),
     "quantity": re.compile(r"(?iu)(?:\d+(?:[.,:]\d+)*|\b(?:один|два|три|четыре|пять|шесть|семь|восемь|девять|десять)\b)"),
-    "date_time": re.compile(r"(?iu)(?:\b\d{1,2}[:.]\d{2}\b|сегодня|завтра|понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресень[ея]|дедлайн|срок)"),
-    "commitment": re.compile(r"(?iu)(?:\b(?:сделаю|проверю|подготовлю|возьму|исправлю|отправлю|договорились|решили)\b)"),
-    "correction": re.compile(r"(?iu)(?:не\s+\S+[,—-]+\s*а|точнее|поправка|вместо|переносим|нет[,—-])"),
+    "date_time": SCHEDULE_RE,
+    "commitment": COMMITMENT_RE,
+    "correction": CORRECTION_CUE_RE,
     "question": re.compile(r"(?iu)\?|^\s*(?:кто|что|где|когда|почему|как|какой|нужно ли)\b"),
 }
 
