@@ -566,6 +566,29 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     raise RuntimeError("; ".join(errors))
 
 
+def evidence_repair_environment(application_root: Path):
+    """Keep model download state inside the service's writable work tree."""
+    cache_root = Path(application_root) / "work" / "cache"
+    hf_home = cache_root / "huggingface"
+    hub_cache = hf_home / "hub"
+    xet_cache = hf_home / "xet"
+    temporary = Path(application_root) / "work" / "tmp" / "evidence-repair"
+    for directory in (hf_home, hub_cache, xet_cache, temporary):
+        directory.mkdir(parents=True, exist_ok=True)
+    return dict(
+        os.environ,
+        PYTHONPATH=str(Path(__file__).parent),
+        PYTHONUNBUFFERED="1",
+        XDG_CACHE_HOME=str(cache_root),
+        HF_HOME=str(hf_home),
+        HUGGINGFACE_HUB_CACHE=str(hub_cache),
+        HF_HUB_CACHE=str(hub_cache),
+        HF_XET_CACHE=str(xet_cache),
+        HF_HUB_DISABLE_XET="1",
+        TMPDIR=str(temporary),
+    )
+
+
 def run_evidence_repair(facts, cache_root, cfg):
     """Re-listen to CRITICAL evidence with an independent segmentation pass."""
     requests = repair_requests(
@@ -602,7 +625,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     ]
     if cfg.get("summary_independent_asr_enabled", True):
         command.extend(["--secondary-model", str(cfg.get("summary_independent_asr_model", "large-v3-turbo"))])
-    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).parent), PYTHONUNBUFFERED="1")
+    environment = evidence_repair_environment(application_root)
     completed = subprocess.run(command, text=True, capture_output=True, env=environment)
     if completed.returncode:
         raise RuntimeError("Evidence repair ASR failed: " + completed.stderr[-1000:])
