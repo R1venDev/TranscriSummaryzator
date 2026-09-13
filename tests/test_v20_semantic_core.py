@@ -55,6 +55,17 @@ class V20SemanticCoreTests(unittest.TestCase):
         self.assertFalse(audit["passed"])
         self.assertIn("unsupported_relation_language", audit["errors"])
 
+    def test_planner_allows_relation_wording_already_present_in_atomic_claim(self):
+        claim = {
+            "claim_id": "C1", "kind": "observation", "statement": "Есть проблема из-за ложных срабатываний.",
+            "episode_id": "E1", "lifecycle": "active", "start": 1,
+        }
+        result = plan([claim], [{"episode_id": "E1"}], [], lambda _: 1)
+        sentence_plan = result["sentence_plans"][0]
+        self.assertEqual(sentence_plan["allowed_relation_markers"], ["из-за"])
+        self.assertTrue(audit_realization(claim["statement"], sentence_plan)["passed"])
+        self.assertFalse(audit_realization("Поэтому появилась проблема.", sentence_plan)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
