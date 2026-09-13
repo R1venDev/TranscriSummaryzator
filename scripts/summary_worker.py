@@ -23,9 +23,10 @@ from semantic_contracts import json_schema as contract_schema, validate_response
 from evidence_ledger import risk_level, semantic_risks
 from evidence_repair import reconcile_repairs, repair_requests
 from config_schema import load_config
+from speech_acts import COMMITMENT_RE, CORRECTION_CUE_RE, DECISION_RE, SCHEDULE_RE
 
 
-PIPELINE_VERSION = "summary-state-v16"
+PIPELINE_VERSION = "summary-state-v17"
 FACT_TYPES = {
     "current_state", "observation", "problem", "hypothesis", "proposal",
     "decision", "action", "question", "metric", "schedule", "goal",
@@ -231,12 +232,23 @@ class Ollama:
             pass
 
     def available_models(self):
+        return set(self.model_inventory())
+
+    def model_inventory(self):
         try:
             with urllib.request.urlopen(self.url + "/api/tags", timeout=30) as response:
                 payload = json.loads(response.read())
-            return {item.get("name") for item in payload.get("models", []) if item.get("name")}
+            return {
+                item.get("name"): {
+                    "digest": item.get("digest"),
+                    "modified_at": item.get("modified_at"),
+                    "size": item.get("size"),
+                    "details": item.get("details", {}),
+                }
+                for item in payload.get("models", []) if item.get("name")
+            }
         except Exception:
-            return set()
+            return {}
 
 
 def parse_json_response(text):
@@ -396,6 +408,49 @@ def recover_omitted_intent(item_id, utterances, facts):
     fact = normalize_fact(raw, focused, len(facts) + 1)
     okay, _ = deterministic_fact_check(fact) if fact else (False, "normalization_failed")
     return (deduplicate(facts + [repair_fact_attribution(fact)]), True) if okay else (facts, False)
+
+
+def closing_pass(facts, utterances, window_seconds=600.0):
+    """Rescue explicit closing commitments/decisions and audit every closing signal."""
+    if not utterances:
+        return facts, {"window_seconds": window_seconds, "candidates": [], "rescued": []}
+    cutoff = max(0.0, float(utterances[-1].get("end", 0)) - float(window_seconds))
+    covered = {value for fact in facts for value in fact.get("evidence_ids", [])}
+    candidates, rescued = [], []
+    for source in utterances:
+        if float(source.get("start", 0)) < cutoff:
+            continue
+        text = str(source.get("text") or "")
+        signals = [name for name, pattern in (("commitment", COMMITMENT_RE), ("decision", DECISION_RE), ("schedule", SCHEDULE_RE), ("correction", CORRECTION_CUE_RE)) if pattern.search(text)]
+        if not signals:
+            continue
+        candidates.append({"evidence_id": source["id"], "signals": signals, "covered": source["id"] in covered})
+        if source["id"] in covered:
+            continue
+        if "commitment" in signals:
+            facts, recovered = recover_omitted_intent(source["id"], utterances, facts)
+            if recovered:
+                rescued.append(source["id"])
+                covered.add(source["id"])
+                continue
+        if "decision" not in signals and "schedule" not in signals:
+            continue
+        kind = "decision" if "decision" in signals else "schedule"
+        speaker = source.get("speaker")
+        raw = {
+            "type": kind, "topic": "заключительная часть встречи",
+            "statement": f'{speaker}: «{normalize_space(text)}».' if speaker else normalize_space(text),
+            "evidence_ids": [source["id"]], "speaker_refs": [speaker] if speaker else [],
+            "certainty": "explicit",
+        }
+        focused = {"index": 0, "start": source["start"], "end": source["end"], "utterances": [source]}
+        fact = normalize_fact(raw, focused, len(facts) + 1)
+        okay, _ = deterministic_fact_check(fact) if fact else (False, None)
+        if okay:
+            facts = deduplicate(facts + [fact])
+            rescued.append(source["id"])
+            covered.add(source["id"])
+    return facts, {"window_seconds": window_seconds, "cutoff": cutoff, "candidates": candidates, "rescued": rescued}
 
 
 def apply_resolution_response(response, focused, targets, facts, rejected_dir):
@@ -609,10 +664,7 @@ def enforce_fact_policy(fact):
     action_markers = ("я сделаю", "я подготовлю", "я пришлю", "я скину", "мы сделаем", "нужно сделать", "надо сделать", "тогда сделаю")
     goal_markers = ("цель встречи", "наша цель", "основная цель", "наша задача", "задача встречи")
     commitment_markers = ("я сделаю", "я подготовлю", "я пришлю", "я скину", "мы сделаем", "тогда сделаю")
-    first_person_commitment = re.search(
-        r"\bя\b[^.!?\n]{0,80}\b(?:сделаю|подготовлю|пришлю|скину|дам|залью|размечу|проверю|попробую|буду)\b",
-        evidence_text,
-    )
+    first_person_commitment = COMMITMENT_RE.search(evidence_text)
     first_person_intent = first_person_commitment or re.search(
         r"\bмне\s+(?:нужно|надо)\b[^.!?\n]{0,100}\b(?:сделать|попробовать|проверить|подготовить|"
         r"доработать|продолжить|посидеть|уделить|сосредоточиться|сконцентрироваться|пилить)\b",
@@ -2943,7 +2995,7 @@ def build_semantic_registry(client, model, facts, run_dir):
     processed_ids = set()
 
     def structure_batch(batch, offset):
-        prompt = "Структурируй каждый тезис. Формат:\n" + '''{"records":[{"record_id":"F00001","subject":null,"predicate":null,"object":null,"polarity":"positive|negative","modality":"asserted|tentative|proposed|committed|question","conditions":[{"text":"условие","evidence_ids":["U00001"]}],"quantities":[{"value":"10","unit":"%","evidence_ids":["U00001"]}],"time_expression":null,"proposed_by":[],"assignees":[],"confirmation_evidence_ids":[],"question_status":"resolved|unresolved|unclear","answer_evidence_ids":[],"answer_record_ids":[]}]}'''
+        prompt = "Структурируй каждый тезис. Формат:\n" + '''{"records":[{"record_id":"F00001","subject":null,"predicate":null,"object":null,"polarity":"positive|negative","modality":"asserted|tentative|proposed|committed|question","content_kind":"state|metric|rule|task|goal|schedule|question","speech_act":"assert|propose|ask|answer|commit|accept|reject|correct|decide","conditions":[{"text":"условие","evidence_ids":["U00001"]}],"quantities":[{"value":"10","unit":"%","entity":"risk_limit","role":"threshold","source_span":"дословный фрагмент","evidence_ids":["U00001"]}],"time_expression":null,"proposed_by":[],"assignees":[],"confirmation_evidence_ids":[],"question_status":"resolved|unresolved|unclear","answer_evidence_ids":[],"answer_record_ids":[]}]}'''
         prompt += "\n\nТЕЗИСЫ:\n" + json.dumps([compact_fact(item) for item in batch], ensure_ascii=False)
         first, last = offset + 1, offset + len(batch)
         try:
@@ -3127,6 +3179,8 @@ def canonical_facts_from_state(state, facts):
             relations_by_event.setdefault(event_id, []).append(relation["relation_id"])
     result = []
     for event in state.get("views", {}).get("summary", []):
+        if event.get("lifecycle", event.get("state", "active")) != "active":
+            continue
         source = by_record.get(event.get("source_record_id"))
         if not source:
             continue
@@ -3147,6 +3201,50 @@ def provenance_report(state):
         if not provenance.get("audio_sha256") or not provenance.get("source_word_ids") or not event.get("evidence_ids"):
             missing.append(event.get("claim_id"))
     return {"traceable_claims": len(state.get("events", [])) - len(missing), "total_claims": len(state.get("events", [])), "untraceable_claim_ids": missing, "passed": not missing}
+
+
+def release_commit():
+    marker = Path(__file__).resolve().parents[1] / "RELEASE_COMMIT"
+    if marker.is_file():
+        value = marker.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    configured = os.environ.get("TRANSCRISUMMARY_GIT_COMMIT", "").strip()
+    if configured:
+        return configured
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def build_run_manifest(settings, cfg, source_manifest):
+    vocabulary = Path(__file__).resolve().parents[1] / "vocabulary.json"
+    roles = ("extractor", "arbitrator", "high_risk_verifier", "critical_secondary_verifier", "writer", "auditor", "public_auditor")
+    inventory = settings.get("model_inventory", {})
+    return {
+        "schema_version": 1,
+        "pipeline_version": PIPELINE_VERSION,
+        "git_commit": release_commit(),
+        "worker_sha256": settings.get("worker_hash"),
+        "config_sha256": stable_hash(cfg),
+        "prompt_versions": {
+            "extraction": PIPELINE_VERSION + ":extract-v1",
+            "semantic_records": PIPELINE_VERSION + ":semantic-v1",
+            "writer": PIPELINE_VERSION + ":writer-v1",
+            "public_surface_audit": PIPELINE_VERSION + ":public-audit-v1",
+        },
+        "models": {
+            role: {"name": settings.get(role), **inventory.get(settings.get(role), {})}
+            for role in roles if settings.get(role)
+        },
+        "vocabulary_sha256": hashlib.sha256(vocabulary.read_bytes()).hexdigest() if vocabulary.is_file() else None,
+        "input_audio_sha256": source_manifest.get("audio_sha256"),
+        "transcript_sha256": settings.get("transcript"),
+    }
 
 
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
@@ -3180,6 +3278,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     )
     semantic_counts = semantic_metrics(semantic_registry, final_facts)
     source_manifest = load_json(output_dir / "source.manifest.json") if (output_dir / "source.manifest.json").is_file() else {}
+    run_manifest = build_run_manifest(settings, cfg, source_manifest)
     state = meeting_state(semantic_registry.get("records", []), provenance={"audio_sha256": source_manifest.get("audio_sha256")})
     atomic_json(run_dir / "meeting_state.json", state)
     provenance = provenance_report(state)
@@ -3278,7 +3377,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             if source.is_file():
                 __import__("shutil").copy2(source, history / f"{stamp}-{name}")
     atomic_text(output_dir / "summary.md", markdown)
-    atomic_json(output_dir / "summary.json", {"pipeline_version": PIPELINE_VERSION, "transcript_hash": settings["transcript"], "document": final_document, "facts": final_facts, "coverage": coverage, "semantic_records_file": "semantic_records.json", "tasks_file": "tasks.json"})
+    atomic_json(output_dir / "summary.json", {"pipeline_version": PIPELINE_VERSION, "transcript_hash": settings["transcript"], "document": final_document, "facts": final_facts, "coverage": coverage, "semantic_records_file": "semantic_records.json", "tasks_file": "tasks.json", "run_manifest_file": "run_manifest.json"})
+    atomic_json(output_dir / "run_manifest.json", run_manifest)
     atomic_json(output_dir / "semantic_records.json", semantic_registry)
     atomic_json(output_dir / "semantics" / "dialogue_events.json", {"schema_version": 1, "events": state["events"]})
     atomic_json(output_dir / "semantics" / "relations.json", {"schema_version": 1, "relations": state["relations"]})
@@ -3319,7 +3419,7 @@ def main():
             for path in (
                 Path(__file__), Path(__file__).with_name("quality_schema.py"),
                 Path(__file__).with_name("evidence_ledger.py"), Path(__file__).with_name("evidence_repair.py"),
-                Path(__file__).with_name("semantic_contracts.py"),
+                Path(__file__).with_name("semantic_contracts.py"), Path(__file__).with_name("speech_acts.py"),
             )
         }),
         "transcript": stable_hash(transcript),
@@ -3340,7 +3440,8 @@ def main():
     generation_suffix = ("-" + time.strftime("%Y%m%d-%H%M%S")) if args.force else ""
     atomic_json(run_dir / "manifest.json", settings)
     client = Ollama(cfg.get("ollama_url", "http://127.0.0.1:11434"))
-    available_models = client.available_models()
+    settings["model_inventory"] = client.model_inventory()
+    available_models = set(settings["model_inventory"])
     if available_models and settings["high_risk_verifier"] not in available_models:
         fallback = (
             settings["critical_secondary_verifier"]
@@ -3523,6 +3624,10 @@ def main():
                         },
                     )
 
+    facts, closing_audit = closing_pass(
+        facts, utterances, float(cfg.get("summary_closing_pass_seconds", 600))
+    )
+    atomic_json(run_dir / "closing-pass.json", closing_audit)
     extraction_coverage = evidence_coverage(utterances, facts, reviewed_non_facts)
     atomic_json(
         run_dir / "facts.extracted.json",
