@@ -3260,6 +3260,17 @@ def canonical_facts_from_state(state, facts):
     return sorted(result, key=lambda item: (float(item.get("start", 0)), item["fact_id"]))
 
 
+def lifecycle_reviewed_evidence_ids(state):
+    """Return evidence reviewed but intentionally hidden by claim lifecycle."""
+    return sorted({
+        evidence_id
+        for event in state.get("events", [])
+        if event.get("lifecycle", "active") != "active"
+        for evidence_id in event.get("evidence_ids", [])
+        if evidence_id
+    })
+
+
 def provenance_report(state):
     missing = []
     for event in state.get("events", []):
@@ -3394,12 +3405,16 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0),
     )
     publication_reviewed = set(coverage.get("reviewed_non_fact_ids", []))
+    lifecycle_reviewed = lifecycle_reviewed_evidence_ids(state)
+    publication_reviewed.update(lifecycle_reviewed)
     for rejected in list(fact_rejected) + list(publication_rejected) + list(semantic_rejected) + list(surface_rejected):
         source = rejected.get("fact", {}) if isinstance(rejected, dict) else {}
         publication_reviewed.update(source.get("evidence_ids", []))
     coverage["publication_evidence"] = evidence_coverage(
         source_turns, final_facts, publication_reviewed
     )
+    coverage["publication_evidence"]["lifecycle_reviewed_ids"] = lifecycle_reviewed
+    coverage["publication_evidence"]["lifecycle_reviewed_utterances"] = len(lifecycle_reviewed)
     minimum_publication_coverage = float(
         cfg.get("summary_min_publication_coverage", 0.99)
     )

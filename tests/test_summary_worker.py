@@ -494,6 +494,18 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(result["material_coverage_ratio"], 1.0)
         self.assertEqual(result["reviewed_non_fact_utterances"], 1)
 
+    def test_non_active_lifecycle_evidence_is_counted_as_reviewed(self):
+        state = {"events": [
+            {"lifecycle": "active", "evidence_ids": ["U00001"]},
+            {"lifecycle": "superseded", "evidence_ids": ["U00002", "U00003"]},
+            {"lifecycle": "resolved", "evidence_ids": ["U00004"]},
+            {"lifecycle": "conflicting", "evidence_ids": ["U00003", "U00005"]},
+        ]}
+        self.assertEqual(
+            summary.lifecycle_reviewed_evidence_ids(state),
+            ["U00002", "U00003", "U00004", "U00005"],
+        )
+
     def test_first_person_intent_cannot_be_silently_classified_as_context(self):
         source = utterance(1, 1, 3, speaker="@Yachoy", text="Я сейчас, наверное, сделаю упор на доработку этого способа")
         focused = {"index": 0, "utterances": [source], "start": 1, "end": 3}
