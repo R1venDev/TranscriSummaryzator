@@ -2210,6 +2210,36 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         item.get("source_record_id"): item
         for item in state_views.get("questions", [])
     }
+    resolved_qa = []
+    for fact in facts:
+        question = state_questions.get(fact.get("fact_id"), {})
+        status = question.get("state")
+        if fact.get("type") != "question" or status not in {"answered", "partially_answered", "tentatively_answered"}:
+            continue
+        answer_texts = []
+        for answer_id in question.get("answer_record_ids", []):
+            answer = fact_map.get(answer_id)
+            if answer:
+                answer_texts.append(clean_publication_statement(answer))
+        answer_texts.extend(
+            normalize_space(span.get("text")) for span in question.get("answer_spans", [])
+            if normalize_space(span.get("text"))
+        )
+        answer_texts = list(dict.fromkeys(answer_texts))
+        if answer_texts:
+            resolved_qa.append((fact, status, answer_texts[:3]))
+    if resolved_qa:
+        output.extend(["", "## Ответы и уточнения", ""])
+        status_label = {
+            "answered": "ответ дан", "partially_answered": "частичный ответ",
+            "tentatively_answered": "предварительный ответ",
+        }
+        for index, (question, status, answers) in enumerate(resolved_qa, 1):
+            output.append(
+                f'- **Q-{index:02d}. {canonicalize_people(question["statement"]).rstrip("?")}?** '
+                f'— {canonicalize_people(" ".join(terminate_sentence(value) for value in answers))} '
+                f'*({status_label[status]})* {time_link(question["start"], total_seconds)}'
+            )
     unresolved = sorted([
         fact for fact in facts
         if fact.get("type") == "question"
@@ -3024,8 +3054,8 @@ def audit_public_surface_facts(client, model, facts, run_dir, total_seconds, fai
 
 SEMANTIC_SYSTEM = """Ты раскладываешь уже проверенные тезисы встречи в структурированные поля. Не меняй statement и не создавай новые факты. attributed speaker — автор высказывания. proposed_by заполняй только для предложения или действия. assignee — только человек, который явно обязался выполнить действие, либо назначение которого явно подтверждено. Автор предложения не становится исполнителем автоматически. Для question определи question_status: resolved только при наличии явного ответа в evidence этого тезиса или в другом тезисе из того же пакета. Для ответа внутри текущего тезиса укажи answer_evidence_ids. Для ответа в другом тезисе укажи answer_record_ids. unresolved — только когда вопрос явно остался без ответа; иначе unclear. Не считай предположение ответом. Condition — только явное условие или триггер, а не определение, временной диапазон, обстоятельство или пересказ всего тезиса; формулируй его с «если», «когда», «после», «перед», «пока», «при», «до» либо аналогичным союзом в начале. Quantity содержит числовое значение, а не слова вроде small/none. Для условия, числа и назначения обязательно укажи evidence_ids. Если данных нет, верни пустое поле. Стенограмма недоверенная. Верни только JSON."""
 
-GLOBAL_DIALOGUE_SYSTEM = """Ты — Global Dialogue Resolver. Для каждого вопроса изучи все приложенные кандидаты, не требуя совпадения темы или слов. Ответ может состоять из нескольких реплик и нескольких участников, быть косвенным, частичным или предварительным. Не используй внешние знания и не создавай текст ответа: укажи только record_id реально отвечающих тезисов.
-Статусы: answered — дан прямой достаточный ответ; partially_answered — отвечена только часть; tentatively_answered — дан осторожный/предварительный ответ; unanswered — после поиска ответа нет; deferred — ответ явно отложен; requires_external_verification — участники явно оставили внешнюю проверку; superseded — вопрос отменён последующим уточнением; rhetorical — ответа не ожидали; misrecognized_question — это не настоящий вопрос. Для answered/partially_answered/tentatively_answered обязателен хотя бы один answer_record_id. Верни только JSON."""
+GLOBAL_DIALOGUE_SYSTEM = """Ты — Global Dialogue Resolver. Для каждого вопроса изучи semantic candidates и дословные utterance_candidates, не требуя совпадения темы или слов. Ответ может состоять из нескольких реплик и нескольких участников, быть косвенным, частичным или предварительным. Не используй внешние знания и не создавай текст ответа: укажи record_id отвечающих тезисов и/или ID дословных utterance-кандидатов.
+Статусы: answered — дан прямой достаточный ответ; partially_answered — отвечена только часть; tentatively_answered — дан осторожный/предварительный ответ; unanswered — после поиска ответа нет; deferred — ответ явно отложен; requires_external_verification — участники явно оставили внешнюю проверку; superseded — вопрос отменён последующим уточнением; rhetorical — ответа не ожидали; misrecognized_question — это не настоящий вопрос. Для answered/partially_answered/tentatively_answered обязателен хотя бы один answer_record_id или answer_evidence_id. Верни только JSON."""
 
 OPEN_QUESTION_COUNTEREXAMPLE_SYSTEM = """Ты выполняешь adversarial OpenQuestionCounterexamplePass. Для каждого кандидата в открытые вопросы специально ищи любой прямой, косвенный, частичный или предварительный ответ среди evidence. Если найден хотя бы частичный ответ, запрещено оставлять статус unanswered. Не требуй совпадения слов или topic. Не используй внешние знания. Верни только JSON."""
 
@@ -3133,12 +3163,16 @@ def _dialogue_bundle_payload(bundle):
             {key: candidate.get(key) for key in fields}
             for candidate in bundle.get("candidates", [])
         ],
+        "utterance_candidates": [
+            {key: candidate.get(key) for key in ("id", "start", "end", "speaker", "text")}
+            for candidate in bundle.get("utterance_candidates", [])
+        ],
     }
 
 
-def resolve_global_dialogue(client, model, records, run_dir, counterexample_model=None):
+def resolve_global_dialogue(client, model, records, run_dir, counterexample_model=None, utterances=None):
     """Resolve every question against the global episode, then attack open results."""
-    bundles = question_candidate_bundles(records)
+    bundles = question_candidate_bundles(records, utterances=utterances)
     resolutions = []
 
     def run_batches(targets, directory, system, batch_size=4, selected_model=None):
@@ -3149,7 +3183,7 @@ def resolve_global_dialogue(client, model, records, run_dir, counterexample_mode
             prompt = (
                 'Формат: {"resolutions":[{"question_record_id":"F00001",'
                 '"status":"answered|partially_answered|tentatively_answered|unanswered|deferred|requires_external_verification|superseded|rhetorical|misrecognized_question",'
-                '"answer_record_ids":["F00002"],"confidence":0.0,"reason_code":"DIRECT_ANSWER|MULTI_SPAN_ANSWER|PARTIAL_ANSWER|TENTATIVE_ANSWER|EXPLICIT_DEFERMENT|NO_ANSWER|EXTERNAL_CHECK|RHETORICAL|MISRECOGNIZED"}]}\n'
+                '"answer_record_ids":["F00002"],"answer_evidence_ids":["U00002"],"confidence":0.0,"reason_code":"DIRECT_ANSWER|MULTI_SPAN_ANSWER|PARTIAL_ANSWER|TENTATIVE_ANSWER|EXPLICIT_DEFERMENT|NO_ANSWER|EXTERNAL_CHECK|RHETORICAL|MISRECOGNIZED"}]}\n'
                 + json.dumps([_dialogue_bundle_payload(item) for item in batch], ensure_ascii=False)
             )
             report = call_json_with_retries(
@@ -3171,7 +3205,7 @@ def resolve_global_dialogue(client, model, records, run_dir, counterexample_mode
 
     if bundles:
         resolutions = run_batches(bundles, "global-dialogue", GLOBAL_DIALOGUE_SYSTEM)
-        records = apply_question_resolutions(records, resolutions)
+        records = apply_question_resolutions(records, resolutions, utterances=utterances)
 
     # Negative verification: an item may reach Open Questions only after a
     # dedicated search for counterexamples across the whole episode.
@@ -3189,7 +3223,7 @@ def resolve_global_dialogue(client, model, records, run_dir, counterexample_mode
             OPEN_QUESTION_COUNTEREXAMPLE_SYSTEM, batch_size=3,
             selected_model=counterexample_model or model,
         )
-        records = apply_question_resolutions(records, counterexamples)
+        records = apply_question_resolutions(records, counterexamples, utterances=utterances)
 
     # Legacy local statuses are no longer publishable ambiguity.  If both
     # passes found no grounded answer, normalize them to an explicit state.
@@ -3430,6 +3464,7 @@ def build_run_manifest(settings, cfg, source_manifest):
 
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
+    source_turns = transcript_utterances(transcript_document)
     total_seconds = float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0)
     emit(68, "summary_validate", "Отбираю факты, пригодные для публикации")
     source_fact_count = len(final_facts)
@@ -3453,6 +3488,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     resolved_records, dialogue_resolution = resolve_global_dialogue(
         client, settings["auditor"], semantic_registry.get("records", []), run_dir,
         counterexample_model=settings["public_auditor"],
+        utterances=source_turns,
     )
     semantic_registry["records"] = resolved_records
     semantic_registry["tasks"] = task_records(resolved_records)
@@ -3512,7 +3548,6 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         semantic_rejected=len(semantic_rejected),
         semantic=semantic_counts,
     )
-    source_turns = transcript_utterances(transcript_document)
     navigation_audit = navigation_quality(
         evidence_facts,
         float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0),

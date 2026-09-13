@@ -64,7 +64,7 @@ def _overlap(left, right):
     return len(a & b) / max(1, min(len(a), len(b)))
 
 
-def question_candidate_bundles(records, max_delay=900.0, max_candidates=16):
+def question_candidate_bundles(records, utterances=None, max_delay=900.0, max_candidates=16):
     """Retrieve local and episode-level candidates without requiring topic equality."""
     ordered = sorted(records, key=lambda item: (float(item.get("start", 0)), item.get("record_id", "")))
     bundles = []
@@ -93,17 +93,31 @@ def question_candidate_bundles(records, max_delay=900.0, max_candidates=16):
             if offset <= 12 or delay <= 90 or score >= 1.25:
                 candidates.append((score, candidate))
         candidates.sort(key=lambda value: (-value[0], float(value[1].get("start", 0))))
+        raw_candidates = []
+        for turn in utterances or []:
+            delay = float(turn.get("start", 0)) - q_start
+            if delay < 0 or delay > max_delay:
+                continue
+            # The first 20 turns/90 seconds are preserved regardless of lexical
+            # overlap; later candidates must share semantic surface terms.
+            lexical = _overlap(question.get("statement"), turn.get("text"))
+            if delay <= 90 or lexical >= 0.18:
+                raw_candidates.append(turn)
+            if len(raw_candidates) >= 24:
+                break
         bundles.append({
             "question": question,
             "candidates": [item for _, item in candidates[:max_candidates]],
+            "utterance_candidates": raw_candidates,
         })
     return bundles
 
 
-def apply_question_resolutions(records, resolutions):
+def apply_question_resolutions(records, resolutions, utterances=None):
     """Apply only candidate-grounded global resolutions; fail closed otherwise."""
     result = [dict(item) for item in records]
     by_id = {item.get("record_id"): item for item in result}
+    utterance_by_id = {item.get("id"): item for item in (utterances or []) if item.get("id")}
     for raw in resolutions:
         if not isinstance(raw, dict):
             continue
@@ -118,10 +132,27 @@ def apply_question_resolutions(records, resolutions):
             if value in by_id and value != question.get("record_id")
             and float(by_id[value].get("start", 0)) >= float(question.get("start", 0))
         ]
-        if state in {"answered", "partially_answered", "tentatively_answered"} and not answer_ids:
+        answer_evidence_ids = [
+            value for value in raw.get("answer_evidence_ids", [])
+            if value in utterance_by_id
+            and float(utterance_by_id[value].get("start", 0)) >= float(question.get("start", 0))
+        ]
+        if state in {"answered", "partially_answered", "tentatively_answered"} and not (answer_ids or answer_evidence_ids):
             continue
         question["question_status"] = state
         question["answer_record_ids"] = list(dict.fromkeys(answer_ids))
+        question["answer_evidence_ids"] = list(dict.fromkeys(answer_evidence_ids))
+        question["answer_spans"] = [
+            {
+                "id": value,
+                "start": float(utterance_by_id[value].get("start", 0)),
+                "end": float(utterance_by_id[value].get("end", utterance_by_id[value].get("start", 0))),
+                "speaker": utterance_by_id[value].get("speaker"),
+                "text": utterance_by_id[value].get("text"),
+                "source_word_ids": list(utterance_by_id[value].get("source_word_ids", [])),
+            }
+            for value in answer_evidence_ids
+        ]
         question["answer_relation"] = {
             "answered": "answers", "partially_answered": "partially_answers",
             "tentatively_answered": "tentatively_answers",
@@ -167,7 +198,7 @@ def salience_score(fact, semantic_record=None, relation_count=0):
     if fact.get("type") == "question" and semantic_record.get("question_status") in {
         "answered", "partially_answered", "tentatively_answered", "rhetorical", "superseded",
     }:
-        score -= 1.0
+        score += 1.6 if semantic_record.get("question_status") == "answered" else 0.8
     return round(score, 4)
 
 

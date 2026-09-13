@@ -45,6 +45,18 @@ class MeetingIntelligenceTests(unittest.TestCase):
         self.assertEqual(resolved[0]["question_status"], "partially_answered")
         self.assertEqual(resolved[0]["answer_relation"], "partially_answers")
 
+    def test_answer_may_come_directly_from_immutable_utterance(self):
+        records = [record("F00001", "question", "Какой диапазон AM?", 10)]
+        turns = [{"id": "U00002", "start": 12, "end": 15, "speaker": "@A", "text": "С 17 до 18", "source_word_ids": ["W1"]}]
+        resolved = apply_question_resolutions(records, [{
+            "question_record_id": "F00001", "status": "answered",
+            "answer_record_ids": [], "answer_evidence_ids": ["U00002"],
+            "confidence": 0.95,
+        }], utterances=turns)
+        self.assertEqual(resolved[0]["question_status"], "answered")
+        self.assertEqual(resolved[0]["answer_evidence_ids"], ["U00002"])
+        self.assertEqual(resolved[0]["answer_spans"][0]["source_word_ids"], ["W1"])
+
     def test_banter_is_not_hypothesis(self):
         item = fact("F00001", "hypothesis", "Когда Dow Jones появился, начало XX века?", 10)
         self.assertFalse(valid_hypothesis(item))

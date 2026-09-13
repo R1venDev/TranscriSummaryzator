@@ -426,6 +426,42 @@ def meeting_state(records, *, provenance=None):
             ] + ([{"component_id": _semantic_id("CT", [claim_id, "time"]), "kind": "time", "text": record.get("time_expression"), "evidence_ids": list(record.get("evidence_ids", []))}] if record.get("time_expression") else []),
             "compute_plan": adaptive_compute_plan(record),
         })
+    # Answers may live in transcript turns that the atomic extractor correctly
+    # treated as contextual rather than standalone facts. Materialize grounded
+    # answer-span events so Q/A remains first-class without polluting the fact
+    # registry or losing immutable word provenance.
+    answer_span_events = {}
+    for record in records:
+        if record.get("kind") != "question":
+            continue
+        for span in record.get("answer_spans", []):
+            evidence_id = span.get("id")
+            if not evidence_id:
+                continue
+            claim_id = _semantic_id("CA", [record.get("record_id"), evidence_id, span.get("text")])
+            event = {
+                "event_id": _semantic_id("EV", claim_id), "claim_id": claim_id,
+                "source_record_id": f'answer:{record.get("record_id")}:{evidence_id}',
+                "act": "answer", "content_kind": "answer", "speech_act": "answer",
+                "proposition": {"subject": None, "predicate": None, "object": None},
+                "speaker_ids": [span.get("speaker")] if span.get("speaker") else [],
+                "mentioned_participant_ids": [], "polarity": "positive", "modality": "certain",
+                "lifecycle": "active", "revision_cue": False, "quantities": [], "conditions": [],
+                "evidence_ids": [evidence_id], "start": float(span.get("start", record.get("start", 0))),
+                "risk": {"level": "LOW", "signals": []}, "presentation": span.get("text"),
+                "topic": record.get("topic") or "Прочее", "question_status": "not_applicable",
+                "question_kind": "not_applicable",
+                "provenance": {
+                    "audio_sha256": provenance.get("audio_sha256"),
+                    "source_word_ids": list(span.get("source_word_ids", [])),
+                    "model": "global_dialogue_resolver", "prompt_version": "global-dialogue-v1",
+                    "schema_version": 2,
+                },
+                "components": [], "compute_plan": {"tier": "LOW", "passes": ["global_dialogue_resolver"], "fail_closed": False},
+            }
+            events.append(event)
+            answer_span_events[(record.get("record_id"), evidence_id)] = event
+    events.sort(key=lambda item: (float(item.get("start", 0)), item.get("event_id", "")))
     relations = []
     def add_relation(source, relation, target, evidence_ids=None, basis=None, metrics=None, **extra):
         payload = {
@@ -500,6 +536,11 @@ def meeting_state(records, *, provenance=None):
             if target:
                 answer_relation = record.get("answer_relation") or "answers"
                 add_relation(target, answer_relation, source, target["evidence_ids"] + source["evidence_ids"], basis="global_or_explicit_answer_record_link", metrics={"source_record_id": record.get("record_id"), "answer_record_id": answer_id, "question_status": record.get("question_status")})
+        for evidence_id in record.get("answer_evidence_ids", []):
+            target = answer_span_events.get((record.get("record_id"), evidence_id))
+            if target:
+                answer_relation = record.get("answer_relation") or "answers"
+                add_relation(target, answer_relation, source, [evidence_id] + source["evidence_ids"], basis="global_answer_evidence_link", metrics={"source_record_id": record.get("record_id"), "answer_evidence_id": evidence_id, "question_status": record.get("question_status")})
         if record.get("assignment_status") == "confirmed":
             add_relation(source, "accepted_by", source, record.get("confirmation_evidence_ids", []), basis="grounded_assignee_confirmation", metrics={"assignment_status": record.get("assignment_status")}, participant_ids=record.get("assignees", []))
 
@@ -527,6 +568,8 @@ def meeting_state(records, *, provenance=None):
             **item,
             "state": item.get("question_status") or ("answered" if item["event_id"] in resolved_questions else "unanswered"),
             "answer_record_ids": next((record.get("answer_record_ids", []) for record in records if record.get("record_id") == item.get("source_record_id")), []),
+            "answer_evidence_ids": next((record.get("answer_evidence_ids", []) for record in records if record.get("record_id") == item.get("source_record_id")), []),
+            "answer_spans": next((record.get("answer_spans", []) for record in records if record.get("record_id") == item.get("source_record_id")), []),
             "answer_resolution_basis": next((record.get("answer_resolution_basis") for record in records if record.get("record_id") == item.get("source_record_id")), None),
         }
         for item in events if item["act"] == "question"
