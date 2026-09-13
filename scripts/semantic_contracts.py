@@ -38,6 +38,9 @@ class Condition(StrictModel):
 class Quantity(StrictModel):
     value: str
     unit: Optional[str] = None
+    entity: Optional[str] = None
+    role: Optional[str] = None
+    source_span: Optional[str] = None
     evidence_ids: list[str]
 
 
@@ -48,6 +51,8 @@ class SemanticRecordResponse(StrictModel):
     object: Optional[str] = None
     polarity: Literal["positive", "negative"] = "positive"
     modality: Literal["asserted", "tentative", "proposed", "committed", "question"] = "asserted"
+    content_kind: Optional[Literal["state", "metric", "rule", "task", "goal", "schedule", "question"]] = None
+    speech_act: Optional[Literal["assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"]] = None
     conditions: list[Condition] = Field(default_factory=list)
     quantities: list[Quantity] = Field(default_factory=list)
     time_expression: Optional[Union[str, Dict[str, Any]]] = None
