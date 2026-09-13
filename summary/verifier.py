@@ -7,6 +7,11 @@ CAUSAL_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|привел[оа]? 
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?")
 
 
+def relation_markers(text):
+    """Return relation wording that was already present in a source claim."""
+    return {match.casefold() for match in CAUSAL_RE.findall(text or "")}
+
+
 def verify_sentence_plan(plan, claims, relations):
     by_id = {x.get("claim_id"): x for x in claims}
     errors = []
@@ -26,6 +31,8 @@ def audit_realization(text, plan):
     errors = []
     if not found_numbers.issubset(allowed_numbers):
         errors.append("unplanned_number")
-    if CAUSAL_RE.search(text or "") and not plan.get("relation_ids"):
+    found_relations = relation_markers(text)
+    allowed_relations = {str(x).casefold() for x in plan.get("allowed_relation_markers", [])}
+    if found_relations and not plan.get("relation_ids") and not found_relations.issubset(allowed_relations):
         errors.append("unsupported_relation_language")
     return {"passed": not errors, "errors": errors, "atomic_claims": list(plan.get("claim_ids", [])), "relations": list(plan.get("relation_ids", []))}
