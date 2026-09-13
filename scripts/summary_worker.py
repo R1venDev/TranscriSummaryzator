@@ -32,7 +32,8 @@ from diagnostics import decision as diagnostic_decision, event as diagnostic_eve
 from diagnostics import system_snapshot
 from meeting_intelligence import (
     QUESTION_STATES, apply_question_resolutions, build_summary_plan,
-    consolidate_tasks, is_noise, question_candidate_bundles, valid_hypothesis,
+    consolidate_tasks, is_noise, question_candidate_bundles, salience_score,
+    valid_hypothesis,
 )
 from semantics.ontology import CLAIM_KINDS
 from semantics.core import build_meeting_state
