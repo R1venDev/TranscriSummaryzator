@@ -28,6 +28,17 @@ class EvidenceRepairTests(unittest.TestCase):
         self.assertTrue(all(right - left <= 20 * 16000 for left, right in ranges))
         self.assertTrue(all(ranges[index][1] == ranges[index + 1][0] for index in range(len(ranges) - 1)))
 
+    def test_repair_compares_units_entities_modality_and_direction(self):
+        reasons = repair.repair_mismatch_reasons(
+            "@Misha: возможно после M15 риск 10% выше",
+            "после M5 риск 10 ниже",
+        )
+        self.assertIn("participant", reasons)
+        self.assertIn("technical_entity", reasons)
+        self.assertIn("unit", reasons)
+        self.assertIn("modality", reasons)
+        self.assertIn("direction", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()
