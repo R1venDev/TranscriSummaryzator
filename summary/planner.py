@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import re
 from semantics.graph import cross_episode_allowed
+from summary.verifier import relation_markers
 
 MANDATORY_KINDS = {"decision", "action", "schedule", "blocker", "correction"}
 TECHNICAL_KINDS = {"trading_rule", "system_rule", "experimental_result", "metric", "design_choice"}
@@ -70,6 +71,7 @@ def plan(claims, episodes, relations, score_fn, max_units=None):
         "sentence_id": f"S{i:05d}", "episode_id": x.get("episode_id"),
         "claim_ids": [x["claim_id"]], "relation_ids": [], "intent": "state_claim",
         "allowed_numbers": re.findall(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?", x.get("statement", "")),
+        "allowed_relation_markers": sorted(relation_markers(x.get("statement", ""))),
         "allowed_speakers": list(x.get("speaker_refs", [])), "max_sentences": 1,
     } for i, x in enumerate(ordered, 1)]
     paragraph_plans = [{
