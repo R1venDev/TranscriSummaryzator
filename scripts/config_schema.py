@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -154,7 +156,24 @@ def load_config(path: Path, resolved_path: Path | None = None) -> dict:
     if resolved_path is not None:
         resolved_path = Path(resolved_path)
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(resolved, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temporary.replace(resolved_path)
+        payload = json.dumps(resolved, ensure_ascii=False, indent=2) + "\n"
+        temporary_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=resolved_path.parent,
+                prefix=f".{resolved_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_name = temporary.name
+                temporary.write(payload)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, resolved_path)
+            temporary_name = None
+        finally:
+            if temporary_name is not None:
+                Path(temporary_name).unlink(missing_ok=True)
     return resolved

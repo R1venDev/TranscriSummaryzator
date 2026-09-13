@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,6 +40,18 @@ class V14ArchitectureTests(unittest.TestCase):
     def test_config_rejects_unknown_keys(self):
         with self.assertRaises(Exception):
             PipelineConfig.model_validate({"unknown": True})
+
+    def test_concurrent_config_resolution_uses_unique_atomic_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "config.json"
+            resolved = root / "state" / "config.resolved.json"
+            source.write_text("{}\n", encoding="utf-8")
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                results = list(pool.map(lambda _: load_config(source, resolved), range(100)))
+            self.assertTrue(all(result == results[0] for result in results))
+            self.assertEqual(json.loads(resolved.read_text(encoding="utf-8")), results[0])
+            self.assertEqual(list(resolved.parent.glob(".config.resolved.json.*.tmp")), [])
 
     def test_same_content_with_different_name_is_a_new_submission(self):
         digest = "a" * 64
