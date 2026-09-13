@@ -3243,9 +3243,34 @@ def resolve_global_dialogue(client, model, records, run_dir, counterexample_mode
     }
 
 
-def build_document(client, settings, cfg, run_dir, final_facts, generation_suffix):
-    chapter_size = max(12, int(cfg.get("summary_chapter_fact_limit", 24)))
-    batches = [final_facts[offset:offset + chapter_size] for offset in range(0, len(final_facts), chapter_size)]
+def semantic_chapter_batches(facts, chapter_fact_ids=None):
+    """Assign selected facts to the semantic episode anchors chosen by the planner."""
+    ordered = sorted(facts, key=lambda item: (float(item.get("start", 0)), item.get("fact_id", "")))
+    if not ordered:
+        return []
+    by_id = {item.get("fact_id"): item for item in ordered}
+    anchors = []
+    for fact_id in chapter_fact_ids or []:
+        fact = by_id.get(fact_id)
+        if fact is not None and fact not in anchors:
+            anchors.append(fact)
+    anchors.sort(key=lambda item: (float(item.get("start", 0)), item.get("fact_id", "")))
+    if not anchors:
+        chapter_size = max(1, (len(ordered) + 7) // 8)
+        return [ordered[offset:offset + chapter_size] for offset in range(0, len(ordered), chapter_size)]
+    groups = [[] for _ in anchors]
+    for fact in ordered:
+        position = float(fact.get("start", 0))
+        nearest = min(
+            range(len(anchors)),
+            key=lambda index: (abs(position - float(anchors[index].get("start", 0))), index),
+        )
+        groups[nearest].append(fact)
+    return [group for group in groups if group]
+
+
+def build_document(client, settings, cfg, run_dir, final_facts, generation_suffix, chapter_fact_ids=None):
+    batches = semantic_chapter_batches(final_facts, chapter_fact_ids)
     chapters = []
     repaired = 0
     for index, batch in enumerate(batches, 1):
@@ -3589,7 +3614,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     }
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     final_document, writer_details = build_document(
-        client, settings, cfg, run_dir, final_facts, generation_suffix
+        client, settings, cfg, run_dir, final_facts, generation_suffix,
+        chapter_fact_ids=summary_plan.get("chapter_fact_ids", []),
     )
     emit(97, "summary_audit", "Проверяю структуру, ссылки и полноту")
     final_document, audit_rejected = sanitize_structured(final_document, final_facts)

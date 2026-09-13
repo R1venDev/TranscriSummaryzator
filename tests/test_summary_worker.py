@@ -26,6 +26,22 @@ def fact(kind="proposal", statement="Предложено проверить BOS
 
 
 class SummaryWorkerTests(unittest.TestCase):
+    def test_semantic_chapter_batches_follow_planner_anchors(self):
+        facts = []
+        for index in range(8):
+            item = fact(statement=f"Тезис {index}")
+            item.update({"fact_id": f"F{index:05d}", "start": index * 100})
+            facts.append(item)
+        batches = summary.semantic_chapter_batches(
+            facts, ["F00000", "F00002", "F00004", "F00006"],
+        )
+        self.assertEqual(len(batches), 4)
+        self.assertEqual(
+            {item["fact_id"] for batch in batches for item in batch},
+            {item["fact_id"] for item in facts},
+        )
+        self.assertTrue(all(batch for batch in batches))
+
     def test_chunks_cover_every_utterance(self):
         items = [utterance(index, index * 50, index * 50 + 4) for index in range(1, 20)]
         chunks = summary.make_chunks(items, seconds=180, overlap=30)
