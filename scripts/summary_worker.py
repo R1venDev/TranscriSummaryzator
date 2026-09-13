@@ -24,6 +24,8 @@ from evidence_ledger import risk_level, semantic_risks
 from evidence_repair import reconcile_repairs, repair_requests
 from config_schema import load_config
 from speech_acts import COMMITMENT_RE, CORRECTION_CUE_RE, DECISION_RE, SCHEDULE_RE
+from diagnostics import decision as diagnostic_decision, event as diagnostic_event
+from diagnostics import system_snapshot
 
 
 PIPELINE_VERSION = "summary-state-v17"
@@ -74,6 +76,7 @@ def hhmmss(seconds: float) -> str:
 
 def emit(progress: float, stage: str, detail: str, **extra):
     payload = {"progress": round(max(0.0, min(100.0, progress)), 1), "stage": stage, "detail": detail, **extra}
+    diagnostic_event("summary_progress", category="progress", outcome=stage, metrics=payload)
     print("SUMMARY_PROGRESS " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
@@ -505,9 +508,17 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     if cache_path.is_file():
         cached = load_json(cache_path)
         if cached.get("request_key") == request_key:
+            diagnostic_decision("llm_cache", "hit", metrics={"request_key": request_key}, refs={"cache": str(cache_path)}, reasons=["request_key_match"])
             return cached
+    diagnostic_decision("llm_cache", "miss", metrics={"request_key": request_key}, refs={"cache": str(cache_path)}, reasons=["missing_or_request_key_changed"])
     errors = []
     for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        diagnostic_event(
+            "llm_request", category="stage", outcome="started",
+            inputs={"model": model, "attempt": attempt, "contract": contract, "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(), "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "system_chars": len(system), "prompt_chars": len(prompt)},
+            thresholds={"num_predict": num_predict, "num_ctx": num_ctx, "temperature": 0.0}, refs={"cache": str(cache_path)},
+        )
         try:
             suffix = "" if attempt == 1 else f"\n\nПовтор {attempt}: предыдущий ответ был пустым или невалидным. Обязательно верни полный JSON."
             text, metrics = client.chat(model, system, prompt + suffix, json_mode=True, json_schema=schema, temperature=0.0, progress=progress, num_predict=num_predict, num_ctx=num_ctx)
@@ -515,9 +526,19 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
             if contract:
                 parsed = validate_response(parsed, contract)
             atomic_json(cache_path, {"request_key": request_key, "response": parsed, "metrics": metrics, "attempt": attempt})
+            diagnostic_event(
+                "llm_request", category="stage", outcome="completed", inputs={"model": model, "attempt": attempt, "contract": contract},
+                metrics=metrics, refs={"cache": str(cache_path), "request_key": request_key},
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
             return load_json(cache_path)
         except Exception as exc:
             errors.append(str(exc))
+            diagnostic_event(
+                "llm_request", category="stage", outcome="failed", inputs={"model": model, "attempt": attempt, "contract": contract},
+                refs={"cache": str(cache_path), "request_key": request_key}, severity="ERROR", error=exc,
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+            )
     raise RuntimeError("; ".join(errors))
 
 
@@ -531,6 +552,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     )
     audio = Path(cache_root).parent / "audio.wav"
     if not cfg.get("summary_audio_repair_enabled", True) or not requests or not audio.is_file():
+        diagnostic_decision("evidence_repair", "skipped", metrics={"requested_windows": len(requests), "audio_exists": audio.is_file()}, thresholds={"enabled": bool(cfg.get("summary_audio_repair_enabled", True))}, reasons=["no_requests_or_audio"])
         return facts, {"enabled": bool(cfg.get("summary_audio_repair_enabled", True)), "requested": len(requests), "status": "skipped", "reason": "no_requests_or_audio"}
     directory = Path(cache_root) / "evidence-repair"
     directory.mkdir(parents=True, exist_ok=True)
@@ -542,6 +564,7 @@ def run_evidence_repair(facts, cache_root, cfg):
         if cached.get("request_key") == request_key:
             repaired, report = reconcile_repairs(facts, cached.get("repairs", []))
             report.update({"enabled": True, "status": "cached", "method": "second_pass_no_vad_fixed_chunks"})
+            diagnostic_event("evidence_repair", category="decision", outcome="cached", metrics=report, refs={"output": str(output), "request_key": request_key})
             return repaired, report
     atomic_json(manifest, {"schema_version": 1, "request_key": request_key, "requests": requests})
     application_root = Path(cache_root).parents[3]
@@ -562,6 +585,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     atomic_json(output, payload)
     repaired, report = reconcile_repairs(facts, payload.get("repairs", []))
     report.update({"enabled": True, "status": "completed", "method": "second_pass_no_vad_fixed_chunks"})
+    diagnostic_event("evidence_repair", category="decision", outcome="completed", metrics=report, refs={"output": str(output), "request_key": request_key})
     return repaired, report
 
 
@@ -712,6 +736,14 @@ def enforce_fact_policy(fact):
             updated["certainty"] = "tentative"
             updated["statement"] = cautious_statement(updated["statement"], "Обсуждалась возможность ")
             updated["policy_note"] = "schedule_downgraded"
+    if updated.get("type") != fact.get("type") or updated.get("policy_note"):
+        diagnostic_decision(
+            "fact_policy", updated.get("type"),
+            candidates=[fact.get("type"), updated.get("type")],
+            metrics={"kind_before": fact.get("type"), "kind_after": updated.get("type"), "certainty_before": fact.get("certainty"), "certainty_after": updated.get("certainty"), "first_person_commitment": bool(first_person_commitment), "first_person_intent": bool(first_person_intent)},
+            reasons=[updated.get("policy_note") or "policy_rule"],
+            refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])},
+        )
     return updated
 
 
@@ -861,6 +893,7 @@ def apply_reviews(facts, reviews, strict=False, enforce_policy=True):
         if not review:
             if strict:
                 rejected.append({"fact": fact, "reason": "нет ответа проверяющей модели"})
+                diagnostic_decision("fact_review", "rejected", metrics={"strict": strict, "risk_level": fact.get("risk_level")}, reasons=["missing_model_review"], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
                 continue
             updated = dict(fact, confidence=0.55, validation="missing")
             accepted.append(updated)
@@ -871,7 +904,9 @@ def apply_reviews(facts, reviews, strict=False, enforce_policy=True):
         if not verdict:
             verdict = "reject"
         if verdict not in {"supported", "corrected"}:
-            rejected.append({"fact": fact, "reason": normalize_space(review.get("reason")) or "отклонено моделью"})
+            rejection_reason = normalize_space(review.get("reason")) or "отклонено моделью"
+            rejected.append({"fact": fact, "reason": rejection_reason})
+            diagnostic_decision("fact_review", "rejected", metrics={"model_verdict": verdict, "model_confidence": review.get("confidence"), "kind": fact.get("type"), "risk_level": fact.get("risk_level")}, reasons=[rejection_reason], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
             continue
         updated = dict(fact)
         if verdict == "corrected":
@@ -894,6 +929,7 @@ def apply_reviews(facts, reviews, strict=False, enforce_policy=True):
         okay, reason = deterministic_fact_check(updated)
         if not okay:
             rejected.append({"fact": updated, "reason": reason})
+            diagnostic_decision("fact_review", "rejected", metrics={"model_verdict": verdict, "kind_before": fact.get("type"), "kind_after": updated.get("type")}, reasons=["deterministic_check_failed", reason], refs={"fact_id": fact.get("fact_id"), "evidence_ids": updated.get("evidence_ids", [])})
             continue
         try:
             confidence = float(review.get("confidence", 0.85))
@@ -902,6 +938,7 @@ def apply_reviews(facts, reviews, strict=False, enforce_policy=True):
         updated["confidence"] = max(0.0, min(1.0, confidence)) if math.isfinite(confidence) else 0.0
         updated["validation"] = "corrected" if verdict == "corrected" else "supported"
         accepted.append(updated)
+        diagnostic_decision("fact_review", updated["validation"], metrics={"confidence": updated["confidence"], "kind_before": fact.get("type"), "kind_after": updated.get("type"), "risk_level": updated.get("risk_level"), "policy_note": updated.get("policy_note")}, reasons=[normalize_space(review.get("reason"))] if review.get("reason") else [], refs={"fact_id": fact.get("fact_id"), "evidence_ids": updated.get("evidence_ids", [])})
     return accepted, rejected
 
 
@@ -1016,6 +1053,7 @@ def critical_verifier_consensus(
                 "reason": reason,
                 "verifiers": [primary_model, secondary_model],
             })
+            diagnostic_decision("critical_verifier_consensus", "rejected", metrics={"primary_validation": left.get("validation") if left else None, "secondary_validation": right.get("validation") if right else None, "primary_type": left.get("type") if left else None, "secondary_type": right.get("type") if right else None}, reasons=[reason], refs={"fact_id": fact_id, "models": [primary_model, secondary_model]})
             continue
         result = dict(left if left.get("validation") == "corrected" else original)
         result["confidence"] = min(float(left.get("confidence", 0)), float(right.get("confidence", 0)))
@@ -1025,6 +1063,7 @@ def critical_verifier_consensus(
             "verdict": result["validation"],
         }
         accepted.append(result)
+        diagnostic_decision("critical_verifier_consensus", result["validation"], metrics={"confidence": result["confidence"], "type": result.get("type")}, reasons=["independent_verifiers_agree"], refs={"fact_id": fact_id, "models": [primary_model, secondary_model], "evidence_ids": result.get("evidence_ids", [])})
     return accepted, rejected
 
 
@@ -3281,9 +3320,36 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     run_manifest = build_run_manifest(settings, cfg, source_manifest)
     state = meeting_state(semantic_registry.get("records", []), provenance={"audio_sha256": source_manifest.get("audio_sha256")})
     atomic_json(run_dir / "meeting_state.json", state)
+    lifecycle_counts = {}
+    for item in state.get("events", []):
+        lifecycle_counts[item.get("lifecycle", "unknown")] = lifecycle_counts.get(item.get("lifecycle", "unknown"), 0) + 1
+    relation_counts = {}
+    for item in state.get("relations", []):
+        relation_counts[item.get("relation", "unknown")] = relation_counts.get(item.get("relation", "unknown"), 0) + 1
+    diagnostic_event(
+        "meeting_state", category="decision", outcome="built",
+        metrics={"records": len(semantic_registry.get("records", [])), "events": len(state.get("events", [])), "active_events": len(state.get("active_event_ids", [])), "lifecycle_counts": lifecycle_counts, "relation_counts": relation_counts, "view_counts": {name: len(value) for name, value in state.get("views", {}).items() if isinstance(value, list)}},
+        refs={"state_id": state.get("state_id"), "artifact": str(run_dir / "meeting_state.json")},
+    )
+    for relation in state.get("relations", []):
+        diagnostic_event(
+            "dialogue_relation", category="decision", outcome=relation.get("relation"),
+            metrics=relation.get("decision_basis", {}).get("metrics", {}),
+            reasons=[relation.get("decision_basis", {}).get("rule", relation.get("relation"))],
+            refs={"relation_id": relation.get("relation_id"), "source_event": relation.get("source_event"), "target_event": relation.get("target_event"), "evidence_ids": relation.get("evidence_ids", [])},
+        )
+    for state_event in state.get("events", []):
+        diagnostic_decision(
+            "claim_lifecycle", state_event.get("lifecycle", "active"),
+            metrics={"content_kind": state_event.get("content_kind"), "speech_act": state_event.get("speech_act"), "modality": state_event.get("modality"), "risk": state_event.get("risk"), "compute_plan": state_event.get("compute_plan")},
+            reasons=["canonical_meeting_state"],
+            refs={"claim_id": state_event.get("claim_id"), "event_id": state_event.get("event_id"), "source_record_id": state_event.get("source_record_id"), "evidence_ids": state_event.get("evidence_ids", []), "basis_relation_ids": state_event.get("lifecycle_basis_relation_ids", [])},
+        )
     provenance = provenance_report(state)
     if cfg.get("summary_require_immutable_provenance", True) and not provenance["passed"]:
+        diagnostic_decision("immutable_provenance_gate", "rejected", metrics=provenance, thresholds={"required": True}, reasons=["untraceable_claims"])
         raise RuntimeError("Публикация остановлена: claims без трассировки до audio/word evidence: " + ", ".join(provenance["untraceable_claim_ids"][:10]))
+    diagnostic_decision("immutable_provenance_gate", "accepted", metrics=provenance, thresholds={"required": bool(cfg.get("summary_require_immutable_provenance", True))}, reasons=["all_claims_traceable"])
     final_facts = canonical_facts_from_state(state, final_facts)
     if not final_facts:
         raise RuntimeError("Canonical MeetingState не содержит публикуемых claims")
@@ -3311,10 +3377,12 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         cfg.get("summary_min_publication_coverage", 0.99)
     )
     if coverage["publication_evidence"]["material_coverage_ratio"] < minimum_publication_coverage:
+        diagnostic_decision("publication_coverage_gate", "rejected", metrics=coverage["publication_evidence"], thresholds={"minimum_material_coverage": minimum_publication_coverage}, reasons=["coverage_below_threshold"])
         raise RuntimeError(
             "Недостаточное покрытие содержательных реплик после всех проверок: "
             f'{coverage["publication_evidence"]["material_coverage_ratio"]*100:.1f}%'
         )
+    diagnostic_decision("publication_coverage_gate", "accepted", metrics=coverage["publication_evidence"], thresholds={"minimum_material_coverage": minimum_publication_coverage}, reasons=["coverage_threshold_passed"])
     final_document, writer_details = build_document(
         client, settings, cfg, run_dir, final_facts, generation_suffix
     )
@@ -3420,6 +3488,7 @@ def main():
                 Path(__file__), Path(__file__).with_name("quality_schema.py"),
                 Path(__file__).with_name("evidence_ledger.py"), Path(__file__).with_name("evidence_repair.py"),
                 Path(__file__).with_name("semantic_contracts.py"), Path(__file__).with_name("speech_acts.py"),
+                Path(__file__).with_name("diagnostics.py"),
             )
         }),
         "transcript": stable_hash(transcript),
@@ -3442,6 +3511,7 @@ def main():
     client = Ollama(cfg.get("ollama_url", "http://127.0.0.1:11434"))
     settings["model_inventory"] = client.model_inventory()
     available_models = set(settings["model_inventory"])
+    diagnostic_event("summary_configuration", outcome="accepted", inputs={"pipeline_version": PIPELINE_VERSION, "force": args.force, "models": {key: settings.get(key) for key in ("extractor", "arbitrator", "high_risk_verifier", "critical_secondary_verifier", "writer", "auditor", "public_auditor")}}, metrics={"utterances": len(utterances), "transcript_sha256": settings["transcript"], "worker_sha256": settings["worker_hash"], "installed_models": settings["model_inventory"], "system": system_snapshot(run_dir)}, thresholds=settings["config"], refs={"run_dir": str(run_dir), "output_dir": str(args.output)})
     if available_models and settings["high_risk_verifier"] not in available_models:
         fallback = (
             settings["critical_secondary_verifier"]
@@ -3456,6 +3526,7 @@ def main():
             "requested": settings["high_risk_verifier_requested"], "selected": fallback,
             "reason": "requested independent model is not installed",
         })
+        diagnostic_decision("high_risk_verifier_model", fallback, candidates=[settings["high_risk_verifier_requested"], settings["critical_secondary_verifier"], settings["public_auditor"], settings["arbitrator"]], reasons=["requested_model_not_installed"], refs={"artifact": str(run_dir / "model-role-fallback.json")})
     if available_models and settings["critical_secondary_verifier"] not in available_models:
         settings["critical_secondary_verifier_requested"] = settings["critical_secondary_verifier"]
         settings["critical_secondary_verifier"] = None
@@ -3464,6 +3535,7 @@ def main():
             "requested": settings["critical_secondary_verifier_requested"],
             "reason": "secondary independent model is not installed; CRITICAL claims fail closed",
         })
+        diagnostic_decision("critical_secondary_verifier_model", "unavailable_fail_closed", candidates=[settings["critical_secondary_verifier_requested"]], reasons=["requested_model_not_installed"], refs={"artifact": str(run_dir / "critical-secondary-unavailable.json")})
     if settings["critical_secondary_verifier"] == settings["high_risk_verifier"]:
         settings["critical_secondary_verifier"] = None
         settings["critical_dual_verification_degraded"] = True
@@ -3628,6 +3700,7 @@ def main():
         facts, utterances, float(cfg.get("summary_closing_pass_seconds", 600))
     )
     atomic_json(run_dir / "closing-pass.json", closing_audit)
+    diagnostic_event("closing_pass", category="decision", outcome="completed", metrics={"candidates": len(closing_audit.get("candidates", [])), "covered": sum(bool(item.get("covered")) for item in closing_audit.get("candidates", [])), "rescued": len(closing_audit.get("rescued", [])), "window_seconds": closing_audit.get("window_seconds")}, refs={"rescued_evidence_ids": closing_audit.get("rescued", []), "artifact": str(run_dir / "closing-pass.json")})
     extraction_coverage = evidence_coverage(utterances, facts, reviewed_non_facts)
     atomic_json(
         run_dir / "facts.extracted.json",
@@ -3644,6 +3717,7 @@ def main():
     for fact in facts:
         fact["compute_plan"] = adaptive_compute_plan({"risk_level": fact.get("risk_level"), "kind": fact.get("type")})
         fact["model_provenance"] = {"extractor": settings["extractor"], "pipeline": PIPELINE_VERSION}
+        diagnostic_decision("adaptive_compute", fact["compute_plan"]["tier"], metrics={"risk_level": fact.get("risk_level"), "kind": fact.get("type"), "risk_signals": fact.get("semantic_risks", []), "passes": fact["compute_plan"]["passes"], "fail_closed": fact["compute_plan"]["fail_closed"]}, reasons=["risk_policy"], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
     deterministic = [dict(item, confidence=1.0, validation="deterministic") for item in facts if item["compute_plan"]["tier"] == "LOW"]
     to_validate = [item for item in facts if item["compute_plan"]["tier"] != "LOW"]
     emit(38, "summary_validate", f"Адаптивно проверяю {len(to_validate)} из {len(facts)} фактов")

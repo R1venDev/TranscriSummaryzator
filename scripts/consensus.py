@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from diagnostics import event as diagnostic_event
+
 def overlap(a, b):
     return max(0.0, min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"])))
 
@@ -147,10 +149,19 @@ def main():
     primary = json.loads(Path(args.primary).read_text())["intervals"]
     verifier = json.loads(Path(args.verifier).read_text())["intervals"]
     mapping, timeline = consensus(primary, verifier, args.boundary_tolerance)
+    decisions = {}
+    for item in timeline:
+        decisions[item["decision"]] = decisions.get(item["decision"], 0) + 1
+    diagnostic_event(
+        "diarization_consensus", outcome="completed",
+        inputs={"primary_intervals": len(primary), "verifier_intervals": len(verifier)},
+        metrics={"track_matrix": mapping.get("matrix"), "mapping": mapping.get("mapping"), "pair_metrics": mapping.get("pairs"), "timeline_intervals": len(timeline), "decision_counts": decisions, "overlap_intervals": sum(bool(item.get("overlap")) for item in timeline)},
+        thresholds={"boundary_tolerance_seconds": args.boundary_tolerance},
+        refs={"mapping": args.mapping, "output": args.output},
+    )
     Path(args.mapping).write_text(json.dumps(mapping, ensure_ascii=False, indent=2) + "\n")
     Path(args.output).write_text(json.dumps({"intervals": timeline}, ensure_ascii=False, indent=2) + "\n")
 
 
 if __name__ == "__main__":
     main()
-

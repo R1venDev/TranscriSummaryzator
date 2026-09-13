@@ -8,6 +8,7 @@ from pathlib import Path
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 from model_common import choose_torch_device, write_json
+from diagnostics import decision as diagnostic_decision, event as diagnostic_event
 
 
 def main() -> int:
@@ -28,6 +29,8 @@ def main() -> int:
     from diarizen.pipelines.inference import DiariZenPipeline
 
     device = choose_torch_device(args.device)
+    diagnostic_decision("diarization_device", device, candidates=[args.device, "cuda", "mps", "cpu"], reasons=["runtime_device_selection"])
+    diagnostic_event("diarization_configuration", outcome="accepted", inputs={"model": args.model}, thresholds={"min_speakers": args.min_speakers, "max_speakers": args.max_speakers, "exact_speakers": args.num_speakers, "batch_size": args.batch_size})
     rttm_path = Path(args.rttm)
     rttm_path.parent.mkdir(parents=True, exist_ok=True)
     session = rttm_path.stem
@@ -47,6 +50,7 @@ def main() -> int:
             pipeline.to(torch.device(device))
         except Exception as exc:
             print(f"Requested accelerator unavailable for DiariZen ({exc}); using CPU.", flush=True)
+            diagnostic_event("diarization_device_fallback", category="decision", outcome="cpu", reasons=["accelerator_unavailable"], error=exc)
             device = "cpu"
             pipeline.to(torch.device("cpu"))
 
@@ -56,6 +60,7 @@ def main() -> int:
         if device != "mps":
             raise
         print(f"Metal inference failed ({exc}); retrying on CPU.", flush=True)
+        diagnostic_event("diarization_device_fallback", category="decision", outcome="cpu", reasons=["mps_inference_failed"], error=exc)
         pipeline.to(torch.device("cpu"))
         result = pipeline(args.audio, sess_name=session)
         device = "cpu"
@@ -70,6 +75,12 @@ def main() -> int:
             }
         )
     intervals.sort(key=lambda item: (item["start"], item["end"], item["speaker"]))
+    speakers = sorted({item["speaker"] for item in intervals})
+    diagnostic_event(
+        "diarization_result", outcome="completed",
+        metrics={"intervals": len(intervals), "speakers": len(speakers), "speech_seconds_sum": sum(item["end"] - item["start"] for item in intervals)},
+        inputs={"speaker_ids": speakers, "device": device}, refs={"output": args.output, "rttm": args.rttm},
+    )
     write_json(
         args.output,
         {

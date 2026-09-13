@@ -27,6 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from quality_schema import utterance_uncertainty, word_uncertainty
 from config_schema import load_config
 from evidence_ledger import attach_word_ids, ledger_document, record_resolution
+from diagnostics import configure as configure_diagnostics, decision as diagnostic_decision
+from diagnostics import event as diagnostic_event, publish as publish_diagnostics
+from diagnostics import system_snapshot
 
 
 ROOT = Path(__file__).resolve().parent
@@ -62,13 +65,22 @@ def write_json(path, value):
     os.replace(temporary, path)
 
 
+def diagnostic_environment(job_id, job_dir, component):
+    return {
+        "TRANSCRISUMMARY_DIAGNOSTICS": str(Path(job_dir) / "diagnostics.jsonl"),
+        "TRANSCRISUMMARY_COMPONENT": component,
+        "TRANSCRISUMMARY_JOB_ID": str(job_id),
+        "TRANSCRISUMMARY_RUN_ID": str(getattr(diagnostic_environment, "run_id", "")),
+    }
+
+
 STAGE_DEPENDENCIES = {
-    "audio": ["pipeline.py"],
-    "diarizen": ["pipeline.py", "scripts/diarize_worker.py"],
-    "ultra": ["pipeline.py", "scripts/ultra_worker.py"],
-    "consensus": ["pipeline.py", "scripts/consensus.py"],
-    "asr": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py"],
-    "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py"],
+    "audio": ["pipeline.py", "scripts/diagnostics.py"],
+    "diarizen": ["pipeline.py", "scripts/diarize_worker.py", "scripts/diagnostics.py"],
+    "ultra": ["pipeline.py", "scripts/ultra_worker.py", "scripts/diagnostics.py"],
+    "consensus": ["pipeline.py", "scripts/consensus.py", "scripts/diagnostics.py"],
+    "asr": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py", "scripts/diagnostics.py"],
+    "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py", "scripts/diagnostics.py"],
 }
 
 
@@ -258,6 +270,8 @@ def write_status_snapshot(db):
 
 def run_command(command, log_path, env=None, progress_callback=None):
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    diagnostic_event("subprocess", category="stage", outcome="started", inputs={"command": list(map(str, command))}, refs={"log": str(log_path)})
     with log_path.open("a", encoding="utf-8") as log:
         log.write("\n[{}] {}\n".format(now(), " ".join(map(str, command))))
         log.flush()
@@ -269,6 +283,12 @@ def run_command(command, log_path, env=None, progress_callback=None):
             if progress_callback:
                 progress_callback(line.strip())
         process.wait()
+    diagnostic_event(
+        "subprocess", category="stage", outcome="completed" if process.returncode == 0 else "failed",
+        metrics={"return_code": process.returncode}, refs={"log": str(log_path)},
+        duration_ms=round((time.monotonic() - started) * 1000, 3),
+        severity="INFO" if process.returncode == 0 else "ERROR",
+    )
     if process.returncode:
         raise RuntimeError("Команда завершилась с кодом {}. См. {}".format(process.returncode, log_path))
 
@@ -482,6 +502,13 @@ def assign_speakers(words, intervals, cfg):
         item = dict(word, speaker=speaker, speaker_confidence=round(confidence, 3), flags=sorted(set(flags)), speaker_evidence=evidence)
         item["resolution"] = {"selected": speaker, "method": "acoustic_overlap" if clear else "unresolved", "risk": "low" if clear else "high"}
         item["speaker_resolution_history"] = [{"speaker": speaker, "reason": item["resolution"]["method"]}]
+        diagnostic_decision(
+            "word_speaker_overlap", speaker if speaker is not None else "unresolved",
+            candidates=[value for value, _ in ranked],
+            metrics={"start": start, "end": end, "duration": duration, "best_overlap_ratio": confidence, "margin_ratio": (best[1] - second) / duration, "active_speakers": len(active), "diarization_confidence_max": max(evidence_confidence) if evidence_confidence else None, "candidate_overlaps": evidence},
+            thresholds={"minimum_overlap": cfg["speaker_match_min_overlap"], "minimum_margin": cfg["speaker_match_margin"], "low_diarization_confidence": 0.7},
+            reasons=item["flags"] or ["overlap_and_margin_passed"], refs={"word_id": item.get("word_id"), "source_word_ids": item.get("source_word_ids", []), "text": item.get("text")},
+        )
         assigned.append(item)
 
     # ASR often starts very short words a few milliseconds before diarization.
@@ -931,6 +958,20 @@ def export_results(job, duration, diarization, asr, output_dir, cfg):
     turns = utterances(words, cfg["utterance_gap_seconds"])
     for word in words:
         word["uncertainty"] = word_uncertainty(word)
+    flag_counts = {}
+    resolution_counts = {}
+    for word in words:
+        for flag in word.get("flags", []):
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+        method = word.get("resolution", {}).get("method", "unknown")
+        resolution_counts[method] = resolution_counts.get(method, 0) + 1
+    diagnostic_event(
+        "speaker_word_assignment", category="decision", outcome="completed",
+        inputs={"words": len(words), "diarization_intervals": len(diarization.get("intervals", []))},
+        metrics={"assigned_words": sum(word.get("speaker") is not None for word in words), "unassigned_words": sum(word.get("speaker") is None for word in words), "flag_counts": flag_counts, "resolution_method_counts": resolution_counts, "speaker_confidence_min": min((float(word.get("speaker_confidence", 0)) for word in words), default=None), "speaker_confidence_mean": sum(float(word.get("speaker_confidence", 0)) for word in words) / max(1, len(words)), "utterances": len(turns)},
+        thresholds={"minimum_overlap": cfg.get("speaker_match_min_overlap"), "minimum_margin": cfg.get("speaker_match_margin"), "word_boundary_context_seconds": cfg.get("word_boundary_context_seconds"), "utterance_gap_seconds": cfg.get("utterance_gap_seconds")},
+        refs={"word_level_evidence": "transcript.json#words", "review": "review.csv"},
+    )
     payload = {
         "schema_version": 3,
         "source": job["original_name"],
@@ -1335,15 +1376,26 @@ def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=No
 
     enrolled = ensure_redimnet_enrollment(cfg, log)
     if not enrolled:
+        diagnostic_decision("speaker_identity_fusion", "skipped", metrics={"profiles": 0}, reasons=["no_enrolled_voice_profiles"])
         return {"matches": {}, "message": "Добавьте голосовые образцы", "diarization": diarization}
     groups = cluster_anchor_groups(audio, diarization.get("intervals", []), cfg, consensus)
     if not groups:
+        diagnostic_decision("speaker_identity_fusion", "skipped", metrics={"profiles": len(enrolled), "cluster_groups": 0}, reasons=["no_clean_anchor_segments"])
         return {"matches": {}, "message": "Нет чистых опорных фрагментов", "diarization": diarization}
     embedding_path = Path(cache_dir or output_dir) / "redimnet_cluster_embeddings.json"
     cluster_embeddings = extract_redimnet_embeddings(groups, embedding_path, log, cfg)
     threshold = float(cfg.get("redimnet_known_threshold", 0.55))
     margin = float(cfg.get("redimnet_known_margin", 0.08))
     matches, scores = match_clusters(cluster_embeddings, enrolled, threshold, margin)
+    for cluster, score_report in scores.items():
+        match = matches.get(cluster)
+        diagnostic_decision(
+            "voice_id_cluster", match.get("name") if match else "unresolved",
+            candidates=[item.get("name") for item in score_report.get("scores", [])],
+            metrics={"scores": score_report.get("scores", []), "best_similarity": score_report.get("best_similarity"), "margin": score_report.get("margin"), "chunks": score_report.get("chunks"), "session_prototype": score_report.get("session_prototype", False)},
+            thresholds={"minimum_similarity": threshold, "minimum_margin": margin},
+            reasons=["score_and_margin_passed" if match else "score_or_margin_below_threshold"], refs={"cluster": cluster, "profile_id": match.get("profile_id") if match else None},
+        )
     timeline = consensus or []
     if not timeline:
         timeline = [{
@@ -1388,6 +1440,15 @@ def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=No
                 "margin": match["margin"],
                 "source": "redimnet_phrase_corroborated" if match.get("corroborated") else "redimnet_phrase",
             })
+        for key, score_report in phrase_scores.items():
+            match = phrase_matches.get(key)
+            diagnostic_decision(
+                "voice_id_phrase", match.get("name") if match else "unresolved",
+                candidates=[item.get("name") for item in score_report.get("scores", [])],
+                metrics={"scores": score_report.get("scores", []), "best_similarity": score_report.get("best_similarity"), "margin": score_report.get("margin"), "corroborated": score_report.get("corroborated", False), "verifier_coverage": score_report.get("verifier_coverage")},
+                thresholds={"minimum_similarity": cfg.get("redimnet_phrase_threshold"), "minimum_margin": cfg.get("redimnet_phrase_margin"), "corroborated_similarity": corroborated_threshold, "corroborated_margin": corroborated_margin, "corroborated_coverage": corroborated_coverage},
+                reasons=["direct_or_corroborated_threshold_passed" if match else "voice_evidence_insufficient"], refs={"phrase": key, **phrase_metadata.get(key, {})},
+            )
     conflict_groups, conflict_indices = conflict_embedding_groups(audio, timeline, matches, cfg)
     local_decisions = {}
     if conflict_groups:
@@ -1419,6 +1480,15 @@ def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=No
                     local_decisions[index] = match
     else:
         local_scores = {}
+    for key, score_report in local_scores.items():
+        match = local_matches.get(key) if conflict_groups else None
+        diagnostic_decision(
+            "voice_id_conflict_second_pass", match.get("name") if match else "unresolved",
+            candidates=[item.get("name") for item in score_report.get("scores", [])],
+            metrics={"scores": score_report.get("scores", []), "best_similarity": score_report.get("best_similarity"), "margin": score_report.get("margin"), "affected_intervals": conflict_indices.get(key, [])},
+            thresholds={"minimum_similarity": cfg.get("redimnet_second_pass_threshold", threshold), "minimum_margin": cfg.get("redimnet_second_pass_margin", margin), "short_turn_seconds": cfg.get("short_turn_seconds", 1.5)},
+            reasons=["second_pass_match" if match else "second_pass_insufficient"], refs={"conflict_region": key},
+        )
     final_segments, debug = resolve_timeline(
         timeline, matches,
         short_seconds=float(cfg.get("short_turn_seconds", 1.5)),
@@ -1452,6 +1522,18 @@ def identify_speakers(output_dir, cfg, log, audio=None, asr=None, diarization=No
     write_json(Path(output_dir) / "debug.json", {"matches": report, "timeline": debug})
     (Path(output_dir) / "result.rttm").write_text("\n".join(rttm_lines(final_segments, Path(audio).stem)) + "\n", encoding="utf-8")
     report["diarization"] = final_diarization
+    decision_counts = {}
+    confidence_levels = {}
+    for item in final_segments:
+        decision_counts[item.get("decision", "unknown")] = decision_counts.get(item.get("decision", "unknown"), 0) + 1
+        confidence_levels[item.get("confidence_level", "unknown")] = confidence_levels.get(item.get("confidence_level", "unknown"), 0) + 1
+    diagnostic_event(
+        "speaker_identity_fusion", category="decision", outcome="completed",
+        inputs={"profiles": len(enrolled), "cluster_groups": len(groups), "consensus_intervals": len(timeline)},
+        metrics={"cluster_matches": len(matches), "cluster_score_reports": len(scores), "identified_phrases": len(phrase_segments), "conflict_regions": len(conflict_groups), "second_pass_resolutions": len(local_decisions), "final_segments": len(final_segments), "decision_counts": decision_counts, "confidence_levels": confidence_levels},
+        thresholds={"cluster_score": threshold, "cluster_margin": margin, "phrase_score": cfg.get("redimnet_phrase_threshold"), "phrase_margin": cfg.get("redimnet_phrase_margin"), "corroborated_score": cfg.get("redimnet_corroborated_phrase_threshold"), "corroborated_margin": cfg.get("redimnet_corroborated_phrase_margin"), "corroborated_coverage": cfg.get("redimnet_corroborated_phrase_coverage"), "second_pass_score": cfg.get("redimnet_second_pass_threshold", threshold), "second_pass_margin": cfg.get("redimnet_second_pass_margin", margin)},
+        refs={"complete_scores": "voice_matches.json", "timeline_decisions": "debug.json", "voice_segments": "voice_segments.json"},
+    )
     return report
 
 
@@ -1461,6 +1543,7 @@ def copy_artifacts(job_dir, output_dir):
         if source.exists():
             shutil.copy2(source, output_dir / name)
     shutil.copy2(job_dir / "processing.log", output_dir / "processing.log")
+    publish_diagnostics(Path(job_dir) / "diagnostics.jsonl", output_dir)
 
 
 def consensus_diarization(job_dir, diarization):
@@ -1484,6 +1567,9 @@ def process_job(job_id):
     if not source.exists():
         raise FileNotFoundError("Исходный файл больше не существует: {}".format(source))
     job_dir = Path(job["job_dir"])
+    run_id = job["attempt_id"] or uuid.uuid4().hex
+    diagnostic_environment.run_id = run_id
+    configure_diagnostics(job_dir / "diagnostics.jsonl", component="pipeline", run_id=run_id, job_id=job_id)
     log = job_dir / "processing.log"
     audio = job_dir / "audio.wav"
     diar_json = job_dir / "diarization.json"
@@ -1502,6 +1588,11 @@ def process_job(job_id):
     ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
     asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
+    diagnostic_event(
+        "job", category="stage", outcome="started",
+        inputs={"original_name": job["original_name"], "content_sha256": content_sha256, "speaker_count": job["speaker_count"]},
+        refs={"job_dir": str(job_dir)}, metrics={"config_sha256": _json_hash(cfg), "system": system_snapshot(job_dir)},
+    )
 
     try:
         update_job(db, job_id, status="running", stage="validate", progress=2, detail="Проверяю запись", error=None, started_at=job["started_at"] or now(), finished_at=None)
@@ -1510,15 +1601,20 @@ def process_job(job_id):
             write_json(duration_path, {"seconds": duration})
         else:
             duration = load_json(duration_path)["seconds"]
+        diagnostic_event("media_validation", category="observation", outcome="accepted", metrics={"duration_seconds": duration}, refs={"source": str(source)})
         update_job(db, job_id, progress=5)
-        if not stage_cache_valid(job_dir, "audio", audio_key, ["audio.wav"]):
+        audio_cached = stage_cache_valid(job_dir, "audio", audio_key, ["audio.wav"])
+        diagnostic_decision("stage_cache.audio", "hit" if audio_cached else "miss", metrics={"cache_key": audio_key}, refs={"artifacts": ["audio.wav"]})
+        if not audio_cached:
             update_job(db, job_id, stage="extract_audio", progress=7, detail="Извлекаю звуковую дорожку")
             extract_audio(source, audio, cfg["audio_track"], log)
             mark_stage_cached(job_dir, "audio", audio_key, ["audio.wav"])
         update_job(db, job_id, progress=12)
-        if not stage_cache_valid(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"]):
+        diar_cached = stage_cache_valid(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"])
+        diagnostic_decision("stage_cache.diarizen", "hit" if diar_cached else "miss", metrics={"cache_key": diar_key}, refs={"artifacts": ["diarization.json", "diarization.rttm"]})
+        if not diar_cached:
             update_job(db, job_id, stage="diarization", progress=15, detail="DiariZen: определяю участников")
-            env = dict(os.environ, PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "diarizen"), PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
             def diarization_progress(line):
                 markers = {
                     "Extracting segmentations.": (20, "DiariZen: анализирую участки речи"),
@@ -1558,9 +1654,11 @@ def process_job(job_id):
             run_command(diarization_command, log, env=env, progress_callback=diarization_progress)
             mark_stage_cached(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"])
         update_job(db, job_id, progress=56)
-        if not stage_cache_valid(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"]):
+        ultra_cached = stage_cache_valid(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
+        diagnostic_decision("stage_cache.ultra", "hit" if ultra_cached else "miss", metrics={"cache_key": ultra_key}, refs={"artifacts": ["ultra.json", "ultra.rttm"]})
+        if not ultra_cached:
             update_job(db, job_id, stage="ultra_diarization", progress=57, detail="Ultra Sortformer: независимо проверяю участников")
-            env = dict(os.environ, PYTHONUNBUFFERED="1", HF_HOME=str(ROOT / "work" / "cache" / "ultra"), TORCH_HOME=str(ROOT / "work" / "cache" / "torch"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "ultra"), PYTHONUNBUFFERED="1", HF_HOME=str(ROOT / "work" / "cache" / "ultra"), TORCH_HOME=str(ROOT / "work" / "cache" / "torch"))
             run_command([
                 str(ROOT / ".venv-fusion" / "bin" / "python"), str(ROOT / "scripts" / "ultra_worker.py"),
                 "--audio", str(audio), "--output", str(ultra_json), "--rttm", str(ultra_rttm),
@@ -1569,18 +1667,22 @@ def process_job(job_id):
                 "--revision", cfg["ultra_model_revision"],
             ], log, env=env)
             mark_stage_cached(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
-        if not stage_cache_valid(job_dir, "consensus", consensus_key, ["consensus.json", "track_mapping.json"]):
+        consensus_cached = stage_cache_valid(job_dir, "consensus", consensus_key, ["consensus.json", "track_mapping.json"])
+        diagnostic_decision("stage_cache.consensus", "hit" if consensus_cached else "miss", metrics={"cache_key": consensus_key}, refs={"artifacts": ["consensus.json", "track_mapping.json"]})
+        if not consensus_cached:
             update_job(db, job_id, stage="consensus", progress=66, detail="Сопоставляю дорожки DiariZen и Ultra")
             run_command([
                 sys.executable, str(ROOT / "scripts" / "consensus.py"),
                 "--primary", str(diar_json), "--verifier", str(ultra_json),
                 "--mapping", str(mapping_json), "--output", str(consensus_json),
                 "--boundary-tolerance", str(cfg.get("boundary_tolerance_ms", 300) / 1000.0),
-            ], log)
+            ], log, env=dict(os.environ, **diagnostic_environment(job_id, job_dir, "consensus")))
             mark_stage_cached(job_dir, "consensus", consensus_key, ["consensus.json", "track_mapping.json"])
-        if not stage_cache_valid(job_dir, "asr", asr_key, ["asr.json"]):
+        asr_cached = stage_cache_valid(job_dir, "asr", asr_key, ["asr.json"])
+        diagnostic_decision("stage_cache.asr", "hit" if asr_cached else "miss", metrics={"cache_key": asr_key}, refs={"artifacts": ["asr.json"]})
+        if not asr_cached:
             update_job(db, job_id, stage="transcription", progress=68, detail="GigaAM: готовлю распознавание речи")
-            env = dict(os.environ, PYTHONPATH=str(ROOT / "scripts"), PYTORCH_ENABLE_MPS_FALLBACK="1", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "asr"), PYTHONPATH=str(ROOT / "scripts"), PYTORCH_ENABLE_MPS_FALLBACK="1", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
             def transcription_progress(line):
                 prefix = "PIPELINE_PROGRESS "
                 if not line.startswith(prefix):
@@ -1652,10 +1754,13 @@ def process_job(job_id):
                 "summary_finished_at": None,
             }
         update_job(db, job_id, status="done", stage="done", progress=100, detail="Готово", output_dir=str(final_dir), error=None, finished_at=now(), **summary_values)
+        diagnostic_event("job", category="stage", outcome="completed", metrics={"duration_seconds": duration}, refs={"output_dir": str(final_dir)})
+        publish_diagnostics(job_dir / "diagnostics.jsonl", final_dir)
         if cfg.get("notify") and sys.platform == "darwin":
             subprocess.run(["osascript", "-e", 'display notification "Расшифровка готова" with title "Meeting Transcript"'], check=False)
         print("Готово: {}".format(final_dir))
     except Exception as exc:
+        diagnostic_event("job", category="stage", outcome="failed", severity="ERROR", error=exc, refs={"processing_log": str(log)})
         with log.open("a", encoding="utf-8") as stream:
             traceback.print_exc(file=stream)
         update_job(db, job_id, status="failed", detail="Ошибка обработки", error=str(exc), finished_at=now())
@@ -1696,7 +1801,14 @@ def process_summary(job_id, force=False):
     if not transcript.is_file():
         raise FileNotFoundError("Не найден transcript.json")
     job_dir = Path(job["job_dir"])
+    summary_run_id = uuid.uuid4().hex
+    diagnostic_environment.run_id = summary_run_id
+    configure_diagnostics(job_dir / "diagnostics.jsonl", component="pipeline.summary", run_id=summary_run_id, job_id=job_id)
     log = job_dir / "summary-processing.log"
+    diagnostic_event(
+        "summary_job", category="stage", outcome="started",
+        inputs={"force": bool(force)}, refs={"transcript": str(transcript), "output_dir": str(output_dir)},
+    )
     update_job(
         db, job_id,
         summary_status="running", summary_stage="summary_prepare", summary_progress=1,
@@ -1735,14 +1847,22 @@ def process_summary(job_id, force=False):
     if force:
         command.append("--force")
     try:
-        run_command(command, log, env=dict(os.environ, PYTHONUNBUFFERED="1"), progress_callback=summary_progress)
+        run_command(
+            command, log,
+            env=dict(os.environ, **diagnostic_environment(job_id, job_dir, "summary"), PYTHONUNBUFFERED="1", PYTHONPATH=str(ROOT / "scripts")),
+            progress_callback=summary_progress,
+        )
         update_job(
             db, job_id,
             summary_status="done", summary_stage="summary_done", summary_progress=100,
             summary_detail="Саммари готово", summary_error=None, summary_finished_at=now(),
         )
+        diagnostic_event("summary_job", category="stage", outcome="completed", refs={"summary": str(output_dir / "summary.json")})
+        publish_diagnostics(job_dir / "diagnostics.jsonl", output_dir)
+        shutil.copy2(log, output_dir / "summary-processing.log")
         return True
     except Exception as exc:
+        diagnostic_event("summary_job", category="stage", outcome="failed", severity="ERROR", error=exc, refs={"summary_log": str(log)})
         with log.open("a", encoding="utf-8") as stream:
             traceback.print_exc(file=stream)
         update_job(
@@ -1752,6 +1872,9 @@ def process_summary(job_id, force=False):
             summary_error=worker_failure_detail or str(exc),
             summary_finished_at=now(),
         )
+        publish_diagnostics(job_dir / "diagnostics.jsonl", output_dir)
+        if log.is_file():
+            shutil.copy2(log, output_dir / "summary-processing.log")
         return False
 
 
@@ -2325,7 +2448,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
         if parsed.path == "/download":
             job_id = parse_qs(parsed.query).get("id", [""])[0]
             name = parse_qs(parsed.query).get("file", [""])[0]
-            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json"}
+            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics_summary.json"}
             row = connect().execute("SELECT output_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
             target = Path(row["output_dir"]) / name if row and row["output_dir"] and name in allowed else None
             if not target or not target.is_file():
@@ -2358,7 +2481,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 title=title, job_id=int(job_id), content=content,
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
                 state_display="none" if ready else "block", content_display="block" if ready else "none",
-                downloads=(('<a class="primary" href="/download?id={}&file=summary.md">Markdown</a><a href="/download?id={}&file=summary.json">JSON</a><a href="/download?id={}&file=tasks.json">Задачи</a><a href="/download?id={}&file=semantic_records.json">Тезисы</a><a href="/download?id={}&file=summary_audit.json">Аудит</a>').format(job_id, job_id, job_id, job_id, job_id) if ready else ""),
+                downloads=(('<a class="primary" href="/download?id={}&file=summary.md">Markdown</a><a href="/download?id={}&file=summary.json">JSON</a><a href="/download?id={}&file=tasks.json">Задачи</a><a href="/download?id={}&file=semantic_records.json">Тезисы</a><a href="/download?id={}&file=summary_audit.json">Аудит</a><a href="/download?id={}&file=diagnostics.jsonl">Подробная диагностика</a><a href="/download?id={}&file=diagnostics_summary.json">Сводка диагностики</a><a href="/download?id={}&file=run_manifest.json">Manifest</a>').format(job_id, job_id, job_id, job_id, job_id, job_id, job_id, job_id) if ready else ""),
             )
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -2393,6 +2516,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 )
             content = "".join(rendered_turns) or '<div class="empty">В расшифровке пока нет реплик.</div>'
             links = " ".join('<a href="/download?id={}&file={}">{}</a>'.format(job_id, name, label) for name, label in (("transcript.md", "Markdown"), ("transcript.txt", "TXT"), ("subtitles.srt", "SRT"), ("transcript.json", "JSON")))
+            links += ' <a href="/download?id={}&file=diagnostics.jsonl">Диагностика</a>'.format(job_id)
             links += ' <a href="/summary?id={}">{}</a>'.format(job_id, "Саммари" if row["summary_status"] == "done" else "Прогресс саммари")
             page = """<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#f5f7fb}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}}a,button{{display:inline-flex;align-items:center;padding:9px 12px;border:0;border-radius:10px;background:#202530;color:#b8d9ff;text-decoration:none;font:600 14px/1.2 -apple-system,BlinkMacSystemFont,\"SF Pro Text\",sans-serif;cursor:pointer}}a:hover,button:hover{{background:#293140;color:white}}button.primary{{margin-left:auto;background:#2d75e8;color:white}}button:disabled{{opacity:.55;cursor:wait}}article{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:8px 24px 18px;box-shadow:0 16px 50px #0005}}h1{{font-size:24px;line-height:1.25;margin:20px 0 22px;overflow-wrap:anywhere}}.turn{{display:grid;grid-template-columns:112px minmax(0,1fr);gap:16px;padding:18px 0;border-top:1px solid #292e3b}}.turn:first-of-type{{border-top:0}}time{{color:#8490a4;font:14px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}}.speech{{min-width:0}}.who{{display:flex;align-items:center;gap:8px;min-height:26px;margin-bottom:7px}}.speaker{{display:inline-flex;padding:4px 9px;border-radius:999px;font-size:13px;font-weight:700;color:#eaf3ff;background:#285b91}}.speaker-1{{background:#6650a4}}.speaker-2{{background:#7a4c22}}.speaker-3{{background:#246558}}.speaker-4{{background:#75435e}}.speaker-5{{background:#4f5f79}}.speaker.unknown{{background:#713b42;color:#ffe9ec}}.warning{{font-size:12px;color:#ffc1c7}}.text{{font-size:18px;line-height:1.58;color:#eef1f7;overflow-wrap:anywhere;word-break:normal}}.needs-review{{background:linear-gradient(90deg,#ff65720d,transparent 70%)}}.empty{{padding:20px;color:#8993a5}}@media(max-width:650px){{main{{margin-top:18px}}article{{padding:6px 18px 14px}}button.primary{{margin-left:0}}.turn{{grid-template-columns:1fr;gap:5px;padding:16px 0}}time{{font-size:13px}}.text{{font-size:17px}}}}</style></head><body><main><nav><a href=\"/\">← К списку записей</a><a href=\"/profiles\">Голосовые профили</a>{links}<button class=\"primary\" id=\"applyProfiles\" type=\"button\">Определить имена</button></nav><article><h1>{title}</h1>{content}</article></main><script>const b=document.querySelector('#applyProfiles');b.addEventListener('click',async()=>{{b.disabled=true;b.textContent='Сопоставляю голоса…';try{{const r=await fetch('/api/apply-profiles?id={job_id}',{{method:'POST'}}),d=await r.json();if(!r.ok)throw new Error(d.error||'Не удалось определить имена');const count=Object.keys(d.matches||{{}}).length;if(count)location.reload();else{{b.textContent=d.message||'Совпадений нет';setTimeout(()=>{{b.disabled=false;b.textContent='Определить имена'}},3000)}}}}catch(e){{b.textContent=e.message;setTimeout(()=>{{b.disabled=false;b.textContent='Определить имена'}},3500)}}}});</script></body></html>""".format(title=title, content=content, links=links, job_id=job_id)
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")

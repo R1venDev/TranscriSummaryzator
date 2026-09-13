@@ -425,11 +425,12 @@ def meeting_state(records, *, provenance=None):
             "compute_plan": adaptive_compute_plan(record),
         })
     relations = []
-    def add_relation(source, relation, target, evidence_ids=None, **extra):
+    def add_relation(source, relation, target, evidence_ids=None, basis=None, metrics=None, **extra):
         payload = {
             "source_event": source["event_id"], "relation": relation,
             "target_event": target["event_id"],
             "evidence_ids": list(dict.fromkeys(evidence_ids or source["evidence_ids"])),
+            "decision_basis": {"rule": basis or relation, "metrics": metrics or {}},
             **extra,
         }
         payload["relation_id"] = _semantic_id("R", payload)
@@ -452,7 +453,8 @@ def meeting_state(records, *, provenance=None):
                 and (older.get("topic") == current.get("topic") or index - events.index(older) <= 3)
             ]
             if candidates:
-                add_relation(current, "corrects", candidates[-1], current["evidence_ids"] + candidates[-1]["evidence_ids"])
+                target = candidates[-1]
+                add_relation(current, "corrects", target, current["evidence_ids"] + target["evidence_ids"], basis="explicit_revision_scope", metrics={"time_gap_seconds": current["start"] - target["start"], "same_speaker": True, "same_topic": target.get("topic") == current.get("topic"), "lexical_similarity_required": False})
         for older in events[:index]:
             if not _same_proposition(current, older):
                 continue
@@ -470,7 +472,15 @@ def meeting_state(records, *, provenance=None):
             elif "correction" in current.get("risk", {}).get("signals", []) or current.get("revision_cue"):
                 relation = "corrects"
             if relation:
-                add_relation(current, relation, older)
+                basis = {
+                    "contradicts": "same_proposition_opposite_polarity",
+                    "supersedes": "same_proposition_quantity_changed_with_revision_cue",
+                    "conflicts_with": "same_proposition_quantity_changed_without_revision_cue",
+                    "accepts": "decision_accepts_prior_proposition",
+                    "answers": "answer_matches_question_proposition",
+                    "corrects": "same_proposition_with_correction_signal",
+                }.get(relation, relation)
+                add_relation(current, relation, older, basis=basis, metrics={"time_gap_seconds": current["start"] - older["start"], "same_proposition": True, "current_quantity_signature": sorted(quantity_signature(current)), "prior_quantity_signature": sorted(quantity_signature(older)), "current_polarity": current["polarity"], "prior_polarity": older["polarity"], "revision_cue": current.get("revision_cue", False)})
 
         # Question/answer adjacency is a dialogue relation, not a lexical
         # similarity problem.  Link a nearby answer in the same topic.
@@ -481,7 +491,8 @@ def meeting_state(records, *, provenance=None):
                 and older.get("topic") == current.get("topic")
             ]
             if questions:
-                add_relation(current, "answers", questions[-1], current["evidence_ids"] + questions[-1]["evidence_ids"])
+                target = questions[-1]
+                add_relation(current, "answers", target, current["evidence_ids"] + target["evidence_ids"], basis="dialogue_adjacency_same_topic", metrics={"time_gap_seconds": current["start"] - target["start"], "same_topic": True, "speech_act": current.get("speech_act")})
 
     # Explicit question links and assignee confirmations are already grounded by
     # normalize_semantic_record; materialize them in the same global graph.
@@ -493,9 +504,9 @@ def meeting_state(records, *, provenance=None):
         for answer_id in record.get("answer_record_ids", []):
             target = by_record.get(answer_id)
             if target:
-                add_relation(target, "answers", source, target["evidence_ids"] + source["evidence_ids"])
+                add_relation(target, "answers", source, target["evidence_ids"] + source["evidence_ids"], basis="explicit_answer_record_link", metrics={"source_record_id": record.get("record_id"), "answer_record_id": answer_id})
         if record.get("assignment_status") == "confirmed":
-            add_relation(source, "accepted_by", source, record.get("confirmation_evidence_ids", []), participant_ids=record.get("assignees", []))
+            add_relation(source, "accepted_by", source, record.get("confirmation_evidence_ids", []), basis="grounded_assignee_confirmation", metrics={"assignment_status": record.get("assignment_status")}, participant_ids=record.get("assignees", []))
 
     unique_relations = {item["relation_id"]: item for item in relations}
     relations = sorted(unique_relations.values(), key=lambda item: item["relation_id"])
@@ -504,12 +515,14 @@ def meeting_state(records, *, provenance=None):
     conflicted = {value for item in relations if item["relation"] == "conflicts_with" for value in (item["source_event"], item["target_event"])}
     resolved_questions = {item["target_event"] for item in relations if item["relation"] == "answers"}
     for event in events:
+        lifecycle_relations = [item["relation_id"] for item in relations if item["target_event"] == event["event_id"] or (item["relation"] == "conflicts_with" and item["source_event"] == event["event_id"])]
         if event["event_id"] in superseded:
             event["lifecycle"] = "superseded"
         elif event["event_id"] in conflicted:
             event["lifecycle"] = "conflicting"
         elif event["event_id"] in resolved_questions:
             event["lifecycle"] = "resolved"
+        event["lifecycle_basis_relation_ids"] = lifecycle_relations
     decisions = [item for item in events if item["act"] == "decision" and item["lifecycle"] == "active"]
     questions = [{**item, "state": "resolved" if item["event_id"] in resolved_questions else next((record.get("question_status") for record in records if record["record_id"] == item["source_record_id"]), "unclear")} for item in events if item["act"] == "question"]
     active_record_ids = {item["source_record_id"] for item in events if item["lifecycle"] == "active"}

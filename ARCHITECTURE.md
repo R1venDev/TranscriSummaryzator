@@ -161,3 +161,17 @@ on numbers or negation remains CRITICAL and is exposed to all later auditors.
 precision, assignee and condition F1, deadline/number/negation/question
 accuracy, unsupported-relation rate, citation precision, omission rate, and
 end-to-end error attribution.
+
+## Structured diagnostics
+
+All processes append schema-versioned events to one per-job
+`diagnostics.jsonl`. Decision events retain candidates, inputs, measured
+values, thresholds, reasons, evidence references and the selected outcome.
+Stage events retain wall-clock duration, cache selection, model metadata and
+failures. Writes use one `O_APPEND` system call, so isolated ASR/diarization
+environments can safely contribute to the same ledger.
+
+`diagnostics_summary.json` contains counts by component/category/severity and
+the latest error plus the JSONL digest. Both artifacts are copied to the public
+job output after transcription, after summary completion and after summary
+failure. They are downloadable from the UI but remain excluded from Git.

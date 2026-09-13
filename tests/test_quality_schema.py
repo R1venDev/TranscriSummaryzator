@@ -226,6 +226,7 @@ class QualitySchemaTests(unittest.TestCase):
         self.assertIn("full_timeline", state["views"])
         self.assertIn("summary", state["views"])
         self.assertTrue(any(item["relation"] == "conflicts_with" for item in state["relations"]))
+        self.assertTrue(all(item.get("decision_basis", {}).get("rule") for item in state["relations"]))
         self.assertEqual(state["views"]["summary"], [])
         self.assertTrue(all(item["provenance"]["source_word_ids"] for item in state["events"]))
 

@@ -16,6 +16,10 @@ except ModuleNotFoundError:  # direct importlib loading in unit tests
     _speech = importlib.util.module_from_spec(_speech_spec)
     _speech_spec.loader.exec_module(_speech)
     COMMITMENT_RE, CORRECTION_CUE_RE, SCHEDULE_RE = _speech.COMMITMENT_RE, _speech.CORRECTION_CUE_RE, _speech.SCHEDULE_RE
+try:
+    from diagnostics import decision as diagnostic_decision
+except ModuleNotFoundError:
+    diagnostic_decision = lambda *args, **kwargs: None
 
 
 RISK_PATTERNS = {
@@ -63,6 +67,11 @@ def record_resolution(word: dict, speaker, method: str, score=None, risk: str = 
     if score is not None:
         word["speaker_confidence"] = round(float(score), 4)
     word["resolution"] = {"selected": speaker, "method": method, "risk": risk}
+    diagnostic_decision(
+        "speaker_resolution", speaker if speaker is not None else "unresolved",
+        candidates=[previous, speaker], metrics={"score": score, "risk": risk, "start": word.get("start"), "end": word.get("end")},
+        reasons=[method], refs={"word_id": word.get("word_id"), "source_word_ids": word.get("source_word_ids", [])},
+    )
 
 
 def semantic_risks(text: str, *, flags=(), speakers=()) -> list[str]:

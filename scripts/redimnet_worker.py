@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from diagnostics import decision as diagnostic_decision, event as diagnostic_event
 
 
 def normalize(vector):
@@ -60,6 +61,7 @@ def main():
     import torch
 
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    diagnostic_decision("redimnet_device", device, candidates=[args.device, "cuda", "cpu"], reasons=["runtime_device_selection"])
     repository = f"{args.repository}:{args.revision}"
     model = torch.hub.load(repository, "redimnet2", model_name="b6", train_type="lm", dataset="vb2+vox2+cnc2_v0", pretrained=True, trust_repo=True)
     model.eval().to(device)
@@ -89,6 +91,13 @@ def main():
         if embeddings:
             results[group] = {"embedding": robust_centroid(embeddings).tolist(), "references": [v.tolist() for v in embeddings], "chunks": len(embeddings)}
     Path(args.output).write_text(json.dumps({"model": "PalabraAI/ReDimNet2-B6-vb2+vox2+cnc2_v0-lm", "repository": args.repository, "revision": args.revision, "device": device, "groups": results, "errors": errors}, ensure_ascii=False) + "\n", encoding="utf-8")
+    diagnostic_event(
+        "voice_embeddings", outcome="completed" if not errors else "completed_with_errors",
+        inputs={"repository": args.repository, "revision": args.revision, "device": device, "manifest_groups": len(manifest.get("groups", {}))},
+        metrics={"output_groups": len(results), "embedding_chunks": sum(item.get("chunks", 0) for item in results.values()), "errors": len(errors)},
+        reasons=[item.get("error") for item in errors[:20]], refs={"manifest": args.manifest, "output": args.output},
+        severity="WARNING" if errors else "INFO",
+    )
 
 
 if __name__ == "__main__":

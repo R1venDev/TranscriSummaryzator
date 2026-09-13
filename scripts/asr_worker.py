@@ -6,9 +6,11 @@ import gc
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
 
 from model_common import choose_torch_device, write_json
+from diagnostics import decision as diagnostic_decision, event as diagnostic_event
 
 
 def make_chunks(regions: list[dict], max_seconds: float = 22.0, overlap: float = 0.45) -> list[tuple[float, float]]:
@@ -100,6 +102,13 @@ def transcribe(args, device: str) -> dict:
         return_seconds=True,
     )
     chunks = make_chunks(stamps, args.chunk_seconds, args.overlap_seconds)
+    speech_seconds = sum(max(0.0, float(item["end"]) - float(item["start"])) for item in stamps)
+    diagnostic_event(
+        "vad_segmentation", outcome="completed",
+        inputs={"audio_samples": len(audio), "sample_rate": sample_rate},
+        metrics={"audio_seconds": len(audio) / sample_rate, "speech_regions": len(stamps), "speech_seconds": speech_seconds, "chunks": len(chunks)},
+        thresholds={"vad": args.vad_threshold, "min_speech_ms": args.vad_min_speech_ms, "min_silence_ms": args.vad_min_silence_ms, "speech_pad_ms": args.vad_speech_pad_ms, "chunk_seconds": args.chunk_seconds, "overlap_seconds": args.overlap_seconds},
+    )
     print("PIPELINE_PROGRESS " + json.dumps({"current": 0, "total": len(chunks)}), flush=True)
     model = load_model(args.model, device, args.cache)
     words: list[dict] = []
@@ -107,6 +116,7 @@ def transcribe(args, device: str) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="gigaam-chunks-") as temp_dir:
         for index, (start, end) in enumerate(chunks):
+            chunk_started = time.monotonic()
             chunk_path = Path(temp_dir) / f"{index:06d}.wav"
             sf.write(chunk_path, audio[int(start * sample_rate): int(end * sample_rate)], sample_rate, subtype="PCM_16")
             result = model.transcribe(str(chunk_path), word_timestamps=True)
@@ -128,8 +138,21 @@ def transcribe(args, device: str) -> dict:
                     "text": result.text,
                 }
             )
+            confidences = [item["asr_confidence"] for item in chunk_words if item.get("asr_confidence") is not None]
+            diagnostic_event(
+                "asr_chunk", outcome="completed",
+                inputs={"chunk_index": index, "start": start, "end": end},
+                metrics={"duration_seconds": end - start, "words": len(chunk_words), "text_chars": len(result.text or ""), "confidence_min": min(confidences) if confidences else None, "confidence_mean": sum(confidences) / len(confidences) if confidences else None},
+                refs={"boundary_word_count_total": sum("asr_boundary" in item.get("flags", []) for item in words)},
+                duration_ms=round((time.monotonic() - chunk_started) * 1000, 3),
+            )
             print("PIPELINE_PROGRESS " + json.dumps({"current": index + 1, "total": len(chunks)}), flush=True)
     words.sort(key=lambda item: (item["start"], item["end"]))
+    diagnostic_event(
+        "asr_result", outcome="completed",
+        metrics={"segments": len(segments), "words": len(words), "boundary_words": sum("asr_boundary" in item.get("flags", []) for item in words)},
+        refs={"output": args.output},
+    )
     return {
         "model": args.model,
         "device": device,
@@ -160,12 +183,14 @@ def main() -> int:
     args = parser.parse_args()
 
     device = choose_torch_device(args.device)
+    diagnostic_decision("asr_device", device, candidates=[args.device, "cuda", "mps", "cpu"], reasons=["runtime_device_selection"])
     try:
         result = transcribe(args, device)
     except Exception as exc:
         if device != "mps":
             raise
         print(f"Metal inference failed ({exc}); retrying GigaAM on CPU.", flush=True)
+        diagnostic_event("asr_device_fallback", category="decision", outcome="cpu", inputs={"candidates": [device, "cpu"]}, reasons=["mps_inference_failed"], error=exc)
         gc.collect()
         result = transcribe(args, "cpu")
     write_json(args.output, result)
