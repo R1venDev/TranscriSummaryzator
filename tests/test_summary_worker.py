@@ -343,6 +343,103 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(groups[0][0]["fact_id"], "F00001")
         self.assertEqual(groups[1][0]["fact_id"], "F00002")
 
+    def test_detail_keeps_material_before_first_salient_anchor(self):
+        opening = fact(
+            kind="current_state", statement="Имбалансы пока только подсвечиваются на постобработке",
+            evidence=[utterance(1, 10, 14, text="Имбалансы пока только подсвечиваются на постобработке")],
+        )
+        anchor = dict(
+            fact(kind="action", statement="Подготовить размеченные данные для симуляции на M15",
+                 evidence=[utterance(2, 620, 625, text="Подготовить размеченные данные для симуляции на M15")]),
+            fact_id="F00002", start=620, end=625,
+        )
+        groups = summary.detailed_chronology_points([opening, anchor], 700)
+        self.assertEqual(groups[0][0]["fact_id"], "F00001")
+        self.assertEqual(
+            [item["fact_id"] for group in groups for item in group],
+            ["F00001", "F00002"],
+        )
+
+    def test_resolved_question_renders_even_when_public_fact_type_is_observation(self):
+        question = fact(kind="observation", statement="Какой диапазон нужен для симуляции?")
+        answer = dict(
+            fact(kind="constraint", statement="Для симуляции достаточно месяца данных на M15–H4"),
+            fact_id="F00002", start=20, end=22,
+        )
+        state = {"views": {"questions": [{
+            "source_record_id": "F00001", "state": "answered",
+            "question_kind": "discussion", "answer_record_ids": ["F00002"],
+        }]}}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Симуляция", "fact_ids": ["F00001"]},
+             "objective": None, "overview": [], "chronology": [], "topics": [],
+             "decisions": [], "actions": [], "open_questions": []},
+            [question], {"covered_seconds": 30, "total_seconds": 30},
+            meeting_state_document=state, section_facts=[question, answer],
+        )
+        self.assertIn("## Ответы и уточнения", rendered)
+        self.assertIn("Для симуляции достаточно месяца данных", rendered)
+
+    def test_resolved_question_does_not_render_unrelated_late_answer(self):
+        question = fact(kind="question", statement="Какой диапазон используется для открытия сделок?")
+        unrelated = dict(
+            fact(kind="observation", statement="Последняя загрузка содержала данные с Binance"),
+            fact_id="F00002", start=400, end=402,
+        )
+        state = {"views": {"questions": [{
+            "source_record_id": "F00001", "state": "answered",
+            "question_kind": "discussion", "answer_record_ids": ["F00002"],
+        }]}}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Сделки", "fact_ids": ["F00001"]},
+             "objective": None, "overview": [], "chronology": [], "topics": [],
+             "decisions": [], "actions": [], "open_questions": []},
+            [question], {"covered_seconds": 500, "total_seconds": 500},
+            meeting_state_document=state, section_facts=[question, unrelated],
+        )
+        self.assertNotIn("## Ответы и уточнения", rendered)
+
+    def test_resolved_question_rejects_editorial_fallback_without_question_text(self):
+        question = fact(kind="observation", statement="Обсуждалась альтернатива с дневными свечами")
+        answer = dict(
+            fact(kind="proposal", statement="Предложено рассмотреть дневные свечи"),
+            fact_id="F00002", start=20, end=22,
+        )
+        registry = {"records": [{
+            "record_id": "F00001", "kind": "question", "question_status": "answered",
+            "statement": "Миха спрашивает о дневных свечах как альтернативе",
+            "answer_record_ids": ["F00002"], "start": 10,
+        }]}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Свечи", "fact_ids": ["F00001"]},
+             "objective": None, "overview": [], "chronology": [], "topics": [],
+             "decisions": [], "actions": [], "open_questions": []},
+            [question], {"covered_seconds": 30, "total_seconds": 30},
+            semantic_registry=registry, section_facts=[question, answer],
+        )
+        self.assertNotIn("## Ответы и уточнения", rendered)
+
+    def test_resolved_question_is_shortened_and_has_single_question_mark(self):
+        question = fact(kind="question", statement=("Как проверить длинный набор данных " * 20) + "??")
+        answer = dict(
+            fact(kind="observation", statement="Нужно открыть файл и проверить конец набора данных"),
+            fact_id="F00002", start=20, end=22,
+        )
+        state = {"views": {"questions": [{
+            "source_record_id": "F00001", "state": "answered",
+            "question_kind": "discussion", "answer_record_ids": ["F00002"],
+        }]}}
+        rendered = summary.render_markdown(
+            {"main_topic": {"text": "Данные", "fact_ids": ["F00001"]},
+             "objective": None, "overview": [], "chronology": [], "topics": [],
+             "decisions": [], "actions": [], "open_questions": []},
+            [question], {"covered_seconds": 30, "total_seconds": 30},
+            meeting_state_document=state, section_facts=[question, answer],
+        )
+        line = next(line for line in rendered.splitlines() if line.startswith("- **Q-"))
+        self.assertLess(len(line.split("?**", 1)[0]), 285)
+        self.assertNotIn(". ?**", line)
+
     def test_navigation_excludes_admin_schedule_and_audio_review(self):
         schedule = fact(kind="schedule", statement="Обсуждалось время созвона во вторник, 19:00 или 20:00")
         schedule["start"] = 100

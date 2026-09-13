@@ -65,6 +65,13 @@ class MeetingIntelligenceTests(unittest.TestCase):
         item = fact("F00001", "hypothesis", "Когда Dow Jones появился, начало XX века?", 10)
         self.assertFalse(valid_hypothesis(item))
 
+    def test_malformed_proposal_is_not_published_as_hypothesis(self):
+        item = fact(
+            "F00001", "hypothesis",
+            "Обсуждалась возможность инструмент улучшения планировалось внедрить.", 10,
+        )
+        self.assertFalse(valid_hypothesis(item))
+
     def test_tasks_with_same_owner_and_deliverable_are_consolidated(self):
         tasks = [
             {"task_id": "T1", "source_record_id": "F1", "description": "Передать реализацию для симуляции", "assignees": ["@Yachoy"], "start": 10, "evidence_ids": ["U1"]},

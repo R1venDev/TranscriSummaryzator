@@ -32,6 +32,10 @@ FALSIFIABLE_RE = re.compile(
     r"улучш|ухудш|повыс|сниз|уменьш|увелич|влияет|эффект|даст|фильтр|"
     r"предсказ|определ|идентифиц|ожида|шум|качество|винрейт)"
 )
+MALFORMED_HYPOTHESIS_RE = re.compile(
+    r"(?iu)(?:^обсуждалась возможность\s+(?:инструмент|целью)\b|"
+    r"\bпланировалось внедрить\.?$)"
+)
 ACTIONABLE_RE = re.compile(
     r"(?iu)(?:провер|сдела|подготов|предостав|переда|реализ|исправ|добав|"
     r"сравн|запуст|размет|интегр|протест|симуляц|backtest|бэктест)"
@@ -181,7 +185,11 @@ def valid_hypothesis(fact):
     if fact.get("type") != "hypothesis" or is_noise(fact):
         return False
     text = str(fact.get("statement") or "")
-    return bool(FALSIFIABLE_RE.search(text) and (_tokens(text) - {"гипотеза"}))
+    return bool(
+        FALSIFIABLE_RE.search(text)
+        and not MALFORMED_HYPOTHESIS_RE.search(text)
+        and (_tokens(text) - {"гипотеза"})
+    )
 
 
 def salience_score(fact, semantic_record=None, relation_count=0):
