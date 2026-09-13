@@ -1,5 +1,31 @@
 # Архитектура транскрипции и саммари
 
+## v18: meeting intelligence и utility-driven summary
+
+Evidence registry и публичное саммари теперь являются разными представлениями.
+Все содержательные реплики остаются трассируемыми в immutable evidence/semantic
+слоях, а utility planner выбирает компактный публичный view и сохраняет оценки
+и выбранные ID в `summary_plan.json`.
+
+После semantic extraction Global Dialogue Resolver ищет ответы в локальном окне
+и во всём episode без требования lexical/topic equality. Он поддерживает
+multi-record и multi-speaker ответы и статусы `answered`,
+`partially_answered`, `tentatively_answered`, `unanswered`, `deferred`,
+`requires_external_verification`, `superseded`, `rhetorical` и
+`misrecognized_question`. Перед публикацией open question обязателен отдельный
+counterexample pass.
+
+Atomic task records сохраняются для provenance, а task view содержит
+консолидированные graph nodes со всеми source task/fact/evidence ID. Навигация
+строится как semantic chapter index до 12 пунктов и не заполняет временные
+пробелы. Гипотезы проходят проверку фальсифицируемости; acknowledgements и banter
+отсекаются до публичного selection.
+
+Одинаковые LLM-запросы используют content-addressed cache между run roots.
+Output-limit failure не повторяет тот же payload: batch должен быть уменьшен.
+Qwen 9B выполняет широкий dialogue pass, а 27B используется для нерешённых
+counterexamples и других немногочисленных сложных semantic checks.
+
 ## v14: evidence ledger и MeetingState
 
 Markdown-саммари теперь считается представлением, а не источником истины. Новые

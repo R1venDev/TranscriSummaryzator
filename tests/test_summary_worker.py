@@ -160,9 +160,9 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("## Задачи и следующие шаги", rendered)
         self.assertIn("### Требуют подтверждения", rendered)
         self.assertIn("Неясное обещание", rendered)
-        self.assertIn("требуется проверка источника", rendered)
+        self.assertIn("потенциальная задача; требуется подтверждение", rendered)
 
-    def test_unclear_question_is_retained_as_unanswered(self):
+    def test_legacy_unclear_question_is_not_published_without_global_resolution(self):
         item = fact(kind="question", statement="Какой диапазон имеет сессия AM?")
         item["uncertainty"] = {"needs_review": False, "reasons": []}
         registry = {"records": [{
@@ -174,9 +174,8 @@ class SummaryWorkerTests(unittest.TestCase):
              "actions": [], "open_questions": []},
             [item], {"total_seconds": 60}, semantic_registry=registry,
         )
-        self.assertIn("### Нерешённые вопросы встречи", rendered)
-        self.assertIn("Какой диапазон имеет сессия AM?", rendered)
-        self.assertIn("подтверждённый ответ в материалах встречи не найден", rendered)
+        self.assertNotIn("### Нерешённые вопросы встречи", rendered)
+        self.assertNotIn("Какой диапазон имеет сессия AM?", rendered)
 
     def test_speaker_only_uncertainty_keeps_anonymous_content_but_not_attribution(self):
         item = fact(kind="problem", statement="Система создаёт лишние сигналы рядом с паттерном",

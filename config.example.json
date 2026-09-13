@@ -108,6 +108,8 @@
   "summary_repair_padding_after_seconds": 4.0,
   "summary_repair_max_windows": 24,
   "summary_require_immutable_provenance": true,
+  "summary_public_fact_limit": 32,
+  "summary_navigation_max_chapters": 12,
   "summary_min_coverage": 0.995,
   "summary_writer_context": 16384,
   "summary_auditor_context": 16384,

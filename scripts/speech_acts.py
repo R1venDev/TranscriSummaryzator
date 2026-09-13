@@ -56,6 +56,13 @@ def primary_speech_act(text: str, kind: str | None = None) -> str:
 def content_kind(kind: str | None) -> str:
     return {
         "current_state": "state", "observation": "state", "problem": "state",
+        "experimental_result": "experimental_result", "definition": "definition",
+        "target": "goal", "constraint": "constraint", "assumption": "assumption",
+        "trading_rule": "trading_rule", "system_rule": "system_rule",
+        "dataset": "resource", "resource": "resource", "design_choice": "design_choice",
+        "alternative": "alternative", "risk": "risk", "dependency": "dependency",
+        "blocker": "blocker", "follow_up": "task", "correction": "correction",
+        "rejected_option": "rejected_option",
         "metric": "metric", "proposal": "rule", "decision": "rule",
         "hypothesis": "rule", "action": "task", "goal": "goal",
         "schedule": "schedule", "question": "question",

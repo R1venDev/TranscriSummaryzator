@@ -221,7 +221,7 @@ class QualitySchemaTests(unittest.TestCase):
         first = {**base, "record_id": "F00001", "kind": "proposal", "statement": "Предложен порог 0.5", "start": 1, "evidence_ids": ["U1"], "quantities": [{"value": "0.5", "evidence_ids": ["U1"]}], "modality": "proposed"}
         second = {**base, "record_id": "F00002", "kind": "decision", "statement": "Согласован порог 0.7", "start": 20, "evidence_ids": ["U2"], "quantities": [{"value": "0.7", "evidence_ids": ["U2"]}], "modality": "committed"}
         state = quality.meeting_state([first, second], provenance={"audio_sha256": "a" * 64})
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], 4)
         self.assertIn("timeline", state["views"])
         self.assertIn("full_timeline", state["views"])
         self.assertIn("summary", state["views"])

@@ -127,6 +127,8 @@ class PipelineConfig(BaseModel):
     summary_repair_padding_after_seconds: float = Field(4.0, ge=0, le=15)
     summary_repair_max_windows: int = Field(24, ge=0, le=100)
     summary_require_immutable_provenance: bool = True
+    summary_public_fact_limit: int = Field(32, ge=8, le=80)
+    summary_navigation_max_chapters: int = Field(12, ge=4, le=16)
     domain_vocabulary: dict[str, str] = Field(default_factory=dict)
 
     def model_post_init(self, __context) -> None:
@@ -134,6 +136,16 @@ class PipelineConfig(BaseModel):
             raise ValueError("diarization_min_speakers cannot exceed diarization_max_speakers")
         if not self.summary_segment_min_seconds <= self.summary_segment_target_seconds <= self.summary_segment_max_seconds:
             raise ValueError("summary segment bounds must satisfy min <= target <= max")
+        if self.asr_overlap_seconds >= self.asr_chunk_seconds:
+            raise ValueError("asr_overlap_seconds must be smaller than asr_chunk_seconds")
+        if self.redimnet_anchor_min_seconds > self.redimnet_anchor_target_seconds:
+            raise ValueError("redimnet anchor bounds must satisfy min <= target")
+        if self.redimnet_phrase_min_seconds > self.redimnet_phrase_max_seconds:
+            raise ValueError("redimnet phrase bounds must satisfy min <= max")
+        if self.voice_identity_min_phrase_seconds > self.voice_identity_max_phrase_seconds:
+            raise ValueError("voice identity phrase bounds must satisfy min <= max")
+        if self.voice_identity_strong_threshold < self.voice_identity_threshold:
+            raise ValueError("strong voice threshold must not be lower than the normal threshold")
 
 
 def load_config(path: Path, resolved_path: Path | None = None) -> dict:

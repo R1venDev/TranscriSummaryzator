@@ -484,17 +484,9 @@ def meeting_state(records, *, provenance=None):
                 }.get(relation, relation)
                 add_relation(current, relation, older, basis=basis, metrics={"time_gap_seconds": current["start"] - older["start"], "same_proposition": True, "current_quantity_signature": sorted(quantity_signature(current)), "prior_quantity_signature": sorted(quantity_signature(older)), "current_polarity": current["polarity"], "prior_polarity": older["polarity"], "revision_cue": current.get("revision_cue", False)})
 
-        # Question/answer adjacency is a dialogue relation, not a lexical
-        # similarity problem.  Link a nearby answer in the same topic.
-        if current.get("speech_act") in {"answer", "accept", "reject"}:
-            questions = [
-                older for older in events[:index] if older["act"] == "question"
-                and current["start"] - older["start"] <= 180
-                and older.get("topic") == current.get("topic")
-            ]
-            if questions:
-                target = questions[-1]
-                add_relation(current, "answers", target, current["evidence_ids"] + target["evidence_ids"], basis="dialogue_adjacency_same_topic", metrics={"time_gap_seconds": current["start"] - target["start"], "same_topic": True, "speech_act": current.get("speech_act")})
+        # Q/A adjacency is resolved globally before graph construction.  Local
+        # topic equality is intentionally not used: answer turns routinely use
+        # different words and receive a different generated topic.
 
     # Explicit question links and assignee confirmations are already grounded by
     # normalize_semantic_record; materialize them in the same global graph.
@@ -506,7 +498,8 @@ def meeting_state(records, *, provenance=None):
         for answer_id in record.get("answer_record_ids", []):
             target = by_record.get(answer_id)
             if target:
-                add_relation(target, "answers", source, target["evidence_ids"] + source["evidence_ids"], basis="explicit_answer_record_link", metrics={"source_record_id": record.get("record_id"), "answer_record_id": answer_id})
+                answer_relation = record.get("answer_relation") or "answers"
+                add_relation(target, answer_relation, source, target["evidence_ids"] + source["evidence_ids"], basis="global_or_explicit_answer_record_link", metrics={"source_record_id": record.get("record_id"), "answer_record_id": answer_id, "question_status": record.get("question_status")})
         if record.get("assignment_status") == "confirmed":
             add_relation(source, "accepted_by", source, record.get("confirmation_evidence_ids", []), basis="grounded_assignee_confirmation", metrics={"assignment_status": record.get("assignment_status")}, participant_ids=record.get("assignees", []))
 
@@ -515,7 +508,10 @@ def meeting_state(records, *, provenance=None):
 
     superseded = {item["target_event"] for item in relations if item["relation"] in {"supersedes", "corrects"}}
     conflicted = {value for item in relations if item["relation"] == "conflicts_with" for value in (item["source_event"], item["target_event"])}
-    resolved_questions = {item["target_event"] for item in relations if item["relation"] == "answers"}
+    resolved_questions = {
+        item["target_event"] for item in relations
+        if item["relation"] in {"answers", "partially_answers", "tentatively_answers"}
+    }
     for event in events:
         lifecycle_relations = [item["relation_id"] for item in relations if item["target_event"] == event["event_id"] or (item["relation"] == "conflicts_with" and item["source_event"] == event["event_id"])]
         if event["event_id"] in superseded:
@@ -529,7 +525,9 @@ def meeting_state(records, *, provenance=None):
     questions = [
         {
             **item,
-            "state": "resolved" if item["event_id"] in resolved_questions else (item.get("question_status") or "unclear"),
+            "state": item.get("question_status") or ("answered" if item["event_id"] in resolved_questions else "unanswered"),
+            "answer_record_ids": next((record.get("answer_record_ids", []) for record in records if record.get("record_id") == item.get("source_record_id")), []),
+            "answer_resolution_basis": next((record.get("answer_resolution_basis") for record in records if record.get("record_id") == item.get("source_record_id")), None),
         }
         for item in events if item["act"] == "question"
     ]
@@ -541,7 +539,7 @@ def meeting_state(records, *, provenance=None):
         members = [item for item in active if item["topic"] == topic]
         topic_states.append({"topic": topic, "event_ids": [item["event_id"] for item in members], "claim_ids": [item["claim_id"] for item in members]})
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "state_id": _semantic_id("MS", [item["claim_id"] for item in events]),
         "events": events,
         "relations": relations,
