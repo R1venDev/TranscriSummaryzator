@@ -20,12 +20,14 @@ class PipelineConfig(BaseModel):
     asr_device: str = "auto"
     diarization_device: str = "auto"
     diarization_model: str = "BUT-FIT/diarizen-wavlm-large-s80-md-v2"
-    diarization_model_revision: str = "main"
+    diarization_model_revision: str = "027b3e221b9d81dce2be794084f1dbd3ba2da403"
+    diarization_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    diarization_embedding_revision: str = "837717ddb9ff5507820346191109dc79c958d614"
     diarization_batch_size: int = Field(8, ge=1)
     diarization_min_speakers: int = Field(1, ge=1, le=8)
     diarization_max_speakers: int = Field(8, ge=1, le=8)
     ultra_model: str = "mago-ai/ultra_diar_streaming_sortformer_8spk_v1"
-    ultra_model_revision: str = "main"
+    ultra_model_revision: str = "08c94f3d289e426288b15a580f7ce47b93b99bf2"
     ultra_device: str = "auto"
     boundary_tolerance_ms: int = Field(300, ge=0)
     redimnet_repository: str = "PalabraAI/redimnet2"
@@ -128,6 +130,7 @@ class PipelineConfig(BaseModel):
     summary_audio_repair_enabled: bool = True
     summary_independent_asr_enabled: bool = True
     summary_independent_asr_model: str = "large-v3-turbo"
+    summary_independent_asr_revision: str = "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf"
     summary_repair_padding_before_seconds: float = Field(2.0, ge=0, le=10)
     summary_repair_padding_after_seconds: float = Field(4.0, ge=0, le=15)
     summary_repair_max_windows: int = Field(24, ge=0, le=100)
