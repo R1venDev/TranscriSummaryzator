@@ -45,7 +45,7 @@ class DiagnosticAggregationTests(unittest.TestCase):
 class ClosingScheduleRecoveryTests(unittest.TestCase):
     def test_conflicting_end_of_meeting_times_leave_exact_time_open(self):
         utterances = [
-            {"id": "U1", "start": 100, "end": 101, "speaker": "@A", "text": "Когда проведём следующий созвон?", "source_word_ids": ["W1"]},
+            {"id": "U1", "start": 100, "end": 101, "speaker": "@A", "text": "Когда вам будет удобнее провести созвончик?", "source_word_ids": ["W1"]},
             {"id": "U2", "start": 102, "end": 103, "speaker": "@B", "text": "Давайте во вторник", "source_word_ids": ["W2"]},
             {"id": "U3", "start": 104, "end": 105, "speaker": "@A", "text": "В 19:00 или 20:00?", "source_word_ids": ["W3"]},
         ]

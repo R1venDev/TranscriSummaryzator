@@ -147,7 +147,7 @@ def ensure_closing_schedule_question(records, utterances):
         return records
     end = max((float(x.get("end", x.get("start", 0))) for x in utterances), default=0)
     window = [x for x in utterances if float(x.get("start", 0)) >= max(0, end - 180)]
-    candidates = [x for x in window if re.search(r"(?iu)\b(?:созвон|вторник|19(?::00)?|20(?::00)?|девятнадцат|двадцать)\b", x.get("text", ""))]
+    candidates = [x for x in window if re.search(r"(?iu)\b(?:созвон\w*|вторник|19(?::00)?|20(?::00)?|девятнадцат|двадцать)\b", x.get("text", ""))]
     if not candidates or not any("созвон" in x.get("text", "").casefold() for x in candidates):
         return records
     combined = " ".join(x.get("text", "") for x in candidates)
