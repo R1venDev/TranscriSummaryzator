@@ -300,7 +300,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     overview_tokens = set().union(*(tokens(x.get("text")) for x in items if x.get("section") == "overview"))
     task_tokens = set().union(*(tokens(x.get("text")) for x in items if x.get("section") == "tasks"))
     rendered_counts, current = {}, None
-    heading_sections = {"Краткое описание — что изменилось после встречи": "overview", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Открытые вопросы": "questions", "Технические выводы и ограничения": "technical", "Гипотезы и эксперименты": "experiments", "Хронология встречи": "minutes"}
+    heading_sections = {"Краткое описание — что изменилось после встречи": "overview", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Открытые вопросы": "questions", "Технические выводы и ограничения": "technical", "Гипотезы и эксперименты": "experiments", "Хронология встречи": "minutes", "Подробная хронология встречи": "minutes"}
     for line in artifact_text.splitlines():
         if line.startswith("## "): current = heading_sections.get(line[3:].strip())
         elif line.startswith("- ") and current: rendered_counts[current] = rendered_counts.get(current, 0) + 1

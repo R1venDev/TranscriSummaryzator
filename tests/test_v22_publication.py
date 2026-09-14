@@ -80,7 +80,7 @@ class V22PublicationTests(unittest.TestCase):
     def test_runtime_gate_binds_verified_hash(self):
         report = {"audits": [{"passed": True, "errors": []}]}
         item = {"section": "minutes", "text": "ok", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "start": 0}
-        artifact = "## Хронология встречи\n\n- ok\n"
+        artifact = "## Подробная хронология встречи\n\n- ok\n"
         gates = runtime_quality_gates(report, artifact, items=[item])
         self.assertTrue(gates["passed"])
         self.assertFalse(runtime_quality_gates(report, artifact + "changed", gates["verified_artifact_hash"], [item])["passed"])
