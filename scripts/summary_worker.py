@@ -39,7 +39,7 @@ from semantics.ontology import CLAIM_KINDS
 from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_views
-from summary.verifier import alignment_score, audit_realization, verify_generated_items, verify_sentence_plan
+from summary.verifier import alignment_score, audit_realization, source_aware_plan, verify_generated_items, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 
@@ -3950,7 +3950,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     for sentence_plan in summary_plan["sentence_plans"]:
         planned = verify_sentence_plan(sentence_plan, state_v2["claims"], state_v2["relations"])
         claim_text = " ".join(claim_by_id[claim_id]["statement"] for claim_id in sentence_plan["claim_ids"] if claim_id in claim_by_id)
-        realized = audit_realization(claim_text, sentence_plan)
+        cited_claims = [claim_by_id[claim_id] for claim_id in sentence_plan["claim_ids"] if claim_id in claim_by_id]
+        realized = audit_realization(claim_text, source_aware_plan(sentence_plan, cited_claims))
         plan_audits.append({"sentence_id": sentence_plan["sentence_id"], "plan": planned, "realization": realized})
     plan_verification = {"schema_version": 1, "audits": plan_audits}
     atomic_json(run_dir / "plan_verification.json", plan_verification)

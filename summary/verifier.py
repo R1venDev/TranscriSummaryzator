@@ -15,6 +15,16 @@ def relation_markers(text):
     return {match.casefold() for match in CAUSAL_RE.findall(text or "")}
 
 
+def source_aware_plan(plan, claims):
+    """Allow participant references that occur verbatim in cited source claims."""
+    result = dict(plan)
+    source_text = " ".join(str(claim.get("statement") or "") for claim in claims)
+    result["allowed_speakers"] = sorted(
+        set(plan.get("allowed_speakers", [])) | set(re.findall(r"@[\w.-]+", source_text))
+    )
+    return result
+
+
 def verify_sentence_plan(plan, claims, relations):
     by_id = {x.get("claim_id"): x for x in claims}
     errors = []

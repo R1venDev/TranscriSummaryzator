@@ -14,7 +14,7 @@ from semantics.entities import EntityRegistry
 from semantics.questions import retrieve_answer_candidates, verify_slot_entailment
 from semantics.propositions import proposition_from_record
 from summary.planner import plan
-from summary.verifier import audit_realization, verify_generated_items
+from summary.verifier import audit_realization, source_aware_plan, verify_generated_items
 
 
 def record(record_id, kind, statement, act="assert", **extra):
@@ -85,6 +85,8 @@ class V21ArchitectureTests(unittest.TestCase):
             [{"claim_id": "C1", "statement": "@Yachoy / @HoTTaBbicH должен разметить данные."}],
         )
         self.assertTrue(source_backed["passed"])
+        enriched = source_aware_plan({**contract, "allowed_speakers": ["@Misha"]}, [{"statement": "@Yachoy / @HoTTaBbicH размечает данные."}])
+        self.assertTrue(audit_realization("@Yachoy / @HoTTaBbicH размечает данные.", enriched)["passed"])
 
     def test_project_graph_is_persistent_lineage_not_literal_document(self):
         meeting = build_meeting_graph([record("F1", "trading_rule", "Используем M15", subject="entry", predicate="requires", object="BOS")], meeting_id="M1")
