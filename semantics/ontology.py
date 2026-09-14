@@ -135,6 +135,7 @@ class RelationKind(StrEnum):
     REOPENS = "reopens"
     QUALIFIES = "qualifies"
     CONFIRMS = "confirms"
+    REVISES_SCOPE = "revises_scope"
 
 
 class ClaimLifecycle(StrEnum):
@@ -149,6 +150,7 @@ class TaskStatus(StrEnum):
     IDEA = "idea"
     PROPOSED = "proposed"
     ASSIGNED = "assigned"
+    ASSIGNED_PENDING = "assigned_pending"
     TENTATIVE_SELF_COMMITMENT = "tentative_self_commitment"
     EXPLICIT_SELF_COMMITMENT = "explicit_self_commitment"
     SELF_COMMITTED = "self_committed"

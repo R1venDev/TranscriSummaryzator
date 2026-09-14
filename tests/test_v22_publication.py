@@ -51,8 +51,8 @@ class V22PublicationTests(unittest.TestCase):
     def test_automation_unknown_does_not_change_task_status(self):
         graph = build_meeting_graph([record("F1", "action", "Отправить EXE", "commit")])
         task = graph["task_states"][0]
-        self.assertEqual(task["status"], "self_committed")
-        self.assertEqual(task["automation_eligible"], "unknown")
+        self.assertEqual(task["status"], "assigned_pending")
+        self.assertFalse(task["automation_eligible"])
 
     def test_partial_question_remains_public(self):
         graph = build_meeting_graph([

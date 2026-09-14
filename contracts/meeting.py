@@ -117,7 +117,13 @@ class TaskState(StrictModel):
     assignee: Optional[str] = None
     assignment_evidence_ids: list[str] = Field(default_factory=list)
     acceptance_evidence_ids: list[str] = Field(default_factory=list)
-    commitment_strength: Literal["none", "tentative", "explicit"] = "none"
+    commitment_strength: Literal["none", "implicit", "tentative", "explicit"] = "none"
+    commitment_actor: Optional[str] = None
+    assignment_actor: Optional[str] = None
+    assignment_target: Optional[str] = None
+    acceptance_relation_ids: list[str] = Field(default_factory=list)
+    scope_relation_ids: list[str] = Field(default_factory=list)
+    uncertainty_reasons: list[str] = Field(default_factory=list)
     deadline: Optional[TimeExpression] = None
     conditions: list[Condition] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.IDEA
@@ -135,10 +141,11 @@ class DecisionState(StrictModel):
 
 class PublicItemContract(StrictModel):
     public_id: str
-    section: Literal["overview", "decisions", "rules", "tasks", "questions", "experiments", "minutes", "contributions"]
+    section: Literal["overview", "decisions", "rules", "tasks", "questions", "technical", "experiments", "minutes", "contributions"]
     text: str = Field(min_length=1)
     claim_ids: list[str] = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
+    source_word_ids: list[str] = Field(min_length=1)
     content_kind: str
     social_state: str
     lifecycle: ClaimLifecycle = ClaimLifecycle.ACTIVE

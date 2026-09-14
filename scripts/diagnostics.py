@@ -38,7 +38,7 @@ def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path
     value = path or os.environ.get("TRANSCRISUMMARY_DIAGNOSTICS")
     _path = Path(value) if value else None
     trace_value = trace_path or os.environ.get("TRANSCRISUMMARY_DIAGNOSTICS_TRACE")
-    _trace_path = Path(trace_value) if trace_value else (_path.with_name("diagnostics.trace.jsonl") if _path and os.environ.get("TRANSCRISUMMARY_DEBUG_TRACE") == "1" else None)
+    _trace_path = Path(trace_value) if trace_value else (_path.with_name("diagnostics.trace.jsonl") if _path else None)
     if component:
         _component = str(component)
     if run_id:
@@ -58,7 +58,9 @@ def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path
 
 
 def _safe(value, key="", depth=0):
-    if any(marker in key.casefold() for marker in _SENSITIVE):
+    lowered = key.casefold()
+    telemetry_token_key = lowered in {"prompt_tokens", "output_tokens", "prompt_eval_count", "eval_count", "tokens"}
+    if not telemetry_token_key and any(marker in lowered for marker in _SENSITIVE):
         return "[REDACTED]"
     if depth > 8:
         return "[MAX_DEPTH]"
@@ -95,7 +97,8 @@ def event(name, *, category="observation", outcome=None, inputs=None, metrics=No
           thresholds=None, reasons=None, refs=None, severity="INFO", duration_ms=None,
           component=None, error=None):
     path = _path or configure()
-    if category in {"trace", "word", "candidate", "voice_id_phrase", "low_level_arbitration"}:
+    item_ref_keys = {"fact_id", "claim_id", "event_id", "relation_id", "source_event", "target_event"}
+    if category in {"trace", "word", "candidate", "voice_id_phrase", "low_level_arbitration"} or (category == "decision" and item_ref_keys & set((refs or {}).keys())):
         path = _trace_path
     if not path:
         return None
@@ -175,6 +178,7 @@ def summarize(path):
     counters = {name: Counter() for name in ("components", "categories", "severities", "outcomes")}
     first = last = last_error = None
     total = malformed = 0
+    durations, slow, tokens, calls, retries, cache_hits, cache_total = [], [], Counter(), 0, 0, 0, 0
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -190,6 +194,20 @@ def summarize(path):
                     counters[bucket][str(item[field])] += 1
             if item.get("severity") == "ERROR" or item.get("error"):
                 last_error = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
+            duration = item.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                durations.append(float(duration)); slow.append({"name": item.get("name"), "component": item.get("component"), "duration_ms": duration, "outcome": item.get("outcome")})
+            if item.get("name") == "llm_request":
+                calls += item.get("outcome") == "completed"
+                retries += item.get("outcome") in {"retryable_output_limit", "failed"}
+                for key in ("prompt_eval_count", "eval_count", "prompt_tokens", "output_tokens"):
+                    value = item.get("metrics", {}).get(key)
+                    if isinstance(value, (int, float)): tokens[key] += value
+            if item.get("name") in {"llm_cache", "stage_cache.audio", "stage_cache.diarizen", "stage_cache.ultra", "stage_cache.consensus", "stage_cache.asr"}:
+                cache_total += 1; cache_hits += item.get("outcome") == "hit"
+    durations.sort()
+    def percentile(p):
+        return durations[min(len(durations)-1, int((len(durations)-1)*p))] if durations else None
     return {
         "schema_version": SCHEMA_VERSION, "events": total, "malformed_lines": malformed,
         "first_timestamp": first, "last_timestamp": last,
@@ -197,6 +215,10 @@ def summarize(path):
         "last_error": last_error,
         "jsonl_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
         "jsonl_bytes": path.stat().st_size if path.is_file() else 0,
+        "calls": calls, "tokens": dict(tokens), "retries": retries,
+        "cache_hit_ratio": cache_hits / cache_total if cache_total else None,
+        "latency_ms": {"p50": percentile(.50), "p95": percentile(.95), "max": max(durations) if durations else None},
+        "top_slow_requests": sorted(slow, key=lambda x: x["duration_ms"], reverse=True)[:10],
     }
 
 
@@ -214,6 +236,11 @@ def publish(source, output_dir):
     trace = source.with_name("diagnostics.trace.jsonl")
     if trace.is_file():
         shutil.copy2(trace, output_dir / "diagnostics.trace.jsonl")
+        summary["trace_sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
+        summary["trace_bytes"] = trace.stat().st_size
+        temporary = output_dir / "diagnostics_summary.json.tmp"
+        temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, output_dir / "diagnostics_summary.json")
     return summary
 
 

@@ -47,6 +47,10 @@ class SemanticRecordResponse(StrictModel):
     proposed_by: list[str] = Field(default_factory=list)
     assignees: list[str] = Field(default_factory=list)
     confirmation_evidence_ids: list[str] = Field(default_factory=list)
+    commitment_strength: Literal["explicit", "implicit", "none"] = "none"
+    commitment_actor: Optional[str] = None
+    assignment_actor: Optional[str] = None
+    assignment_target: Optional[str] = None
     question_status: Literal["resolved", "unresolved", "unclear"] = "unclear"
     answer_evidence_ids: list[str] = Field(default_factory=list)
     answer_record_ids: list[str] = Field(default_factory=list)

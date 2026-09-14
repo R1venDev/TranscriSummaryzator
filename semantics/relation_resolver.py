@@ -8,6 +8,7 @@ ACCEPT_RE = re.compile(r"(?iu)^\s*(?:да|согласен|делаем|ок(?:�
 REJECT_RE = re.compile(r"(?iu)^\s*(?:нет|не согласен|не делаем|отклоняем)\b")
 CAUSE_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|в результате|привел[оа]? к)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|при условии|после того как)\b")
+SCOPE_RE = re.compile(r"(?iu)\b(?:месяц|год|недел|день|час|минут|период|объём|объем)\b")
 
 
 def _tokens(value):
@@ -59,7 +60,7 @@ def resolve_relations(propositions, events, records):
         # Short replies are only safe inside a very small dialogue window.
         prior_events = ordered[max(0, index - 3):index]
         if event["speech_act"] in {"accept", "reject"} or ACCEPT_RE.search(text) or REJECT_RE.search(text):
-            candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask"}]
+            candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask", "commit"}]
             same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
             candidates = same_thread or candidates
             target_event = candidates[0] if len(candidates) == 1 else None
@@ -73,6 +74,14 @@ def resolve_relations(propositions, events, records):
             similarity = _similarity(text, target["statement"])
             shared_entities = {x["entity_id"] for x in source["entities"]} & {x["entity_id"] for x in target["entities"]}
             if similarity < .18 and not shared_entities:
+                # Scope clarifications often change content kind (action ->
+                # proposal/constraint) and use different surface words.
+                if not (target["content_kind"] in {"action", "follow_up"}
+                        and source["content_kind"] in {"proposal", "constraint", "correction", "decision"}
+                        and SCOPE_RE.search(text)
+                        and event.get("timestamp", 0) - prior.get("timestamp", 0) <= 45):
+                    continue
+                add("revises_scope", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .86, "bounded_cross_kind_scope")
                 continue
             if event["speech_act"] == "correct": add("corrects", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .92, "bounded_semantic_candidate")
             elif source["polarity"] != target["polarity"]: add("contradicts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .82, "polarity_conflict")

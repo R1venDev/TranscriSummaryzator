@@ -8,13 +8,14 @@ import hashlib
 import json
 
 try:
-    from speech_acts import CORRECTION_CUE_RE, content_kind, modality_axis, primary_speech_act
+    from speech_acts import COMMITMENT_RE, CORRECTION_CUE_RE, content_kind, modality_axis, primary_speech_act
 except ModuleNotFoundError:  # direct importlib loading in unit tests
     import importlib.util
     from pathlib import Path
     _speech_spec = importlib.util.spec_from_file_location("speech_acts", Path(__file__).with_name("speech_acts.py"))
     _speech = importlib.util.module_from_spec(_speech_spec)
     _speech_spec.loader.exec_module(_speech)
+    COMMITMENT_RE = _speech.COMMITMENT_RE
     CORRECTION_CUE_RE = _speech.CORRECTION_CUE_RE
     content_kind = _speech.content_kind
     modality_axis = _speech.modality_axis
@@ -260,6 +261,7 @@ def normalize_semantic_record(raw, fact):
     if raw_act in {"assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"}:
         detected_act = raw_act if detected_act == "assert" else detected_act
     legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
+    explicit_commitment = fact.get("type") == "action" and bool(COMMITMENT_RE.search(evidence_text)) and len(owners) == 1
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
@@ -289,6 +291,10 @@ def normalize_semantic_record(raw, fact):
         "assignment_status": assignment_status,
         "confirmation_evidence_ids": confirmation_ids,
         "confirmation_utterances": confirmations,
+        "commitment_strength": "explicit" if explicit_commitment else "implicit" if detected_act == "commit" else "none",
+        "commitment_actor": owners[0] if explicit_commitment else None,
+        "assignment_actor": proposed_by[0] if len(proposed_by) == 1 else None,
+        "assignment_target": owners[0] if len(owners) == 1 else None,
         "question_status": question_status,
         "question_kind": question_kind,
         "answer_evidence_ids": answer_ids,

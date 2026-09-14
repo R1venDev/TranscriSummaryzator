@@ -21,7 +21,7 @@ def _tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(
 def _mandatory(claim):
     kind = _kind(claim)
     if kind == "decision": return claim.get("decision_status") == "accepted"
-    if kind in {"action", "follow_up"}: return claim.get("task_status") in {"accepted", "self_committed", "explicit_self_commitment", "in_progress", "blocked", "completed"}
+    if kind in {"action", "follow_up"}: return claim.get("task_status") in {"accepted", "self_committed", "explicit_self_commitment", "in_progress", "blocked", "completed"} and claim.get("canonical_task_anchor", True)
     if kind == "question": return claim.get("question_status") not in {"answered", "rhetorical", "superseded"}
     return kind in {"blocker", "correction", "experimental_result"}
 
@@ -38,19 +38,26 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes")
 
 def _utility(claim, score_fn, view):
     risk = max([float(v or 0) for v in claim.get("risk", {}).values() if isinstance(v, (int, float))] or [0])
-    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + 2 * (1-risk) + 2 * _mandatory(claim)
+    closing_schedule = 8 if view == "questions" and _kind(claim) == "schedule" else 0
+    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + 2 * (1-risk) + 2 * _mandatory(claim) + closing_schedule
 
 
 def _select(claims, score_fn, view, budget):
     eligible = [x for x in claims if x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view])]
+    if view == "tasks":
+        eligible = [x for x in eligible if x.get("canonical_task_anchor", True)]
+    if view == "questions":
+        eligible = [x for x in eligible if x.get("question_status") not in {"answered", "rhetorical", "superseded"}]
     ranked = sorted(eligible, key=lambda x: (-_utility(x, score_fn, view), float(x.get("start", 0))))
     selected, token_sets = [], []
     for item in ranked:
         tokens = _tokens(item.get("statement"))
         if max((len(tokens & old) / max(1, min(len(tokens), len(old))) for old in token_sets), default=0) >= .78 and not _mandatory(item): continue
-        if len(selected) >= budget and not _mandatory(item): continue
+        if len(selected) >= budget: continue
         selected.append(item); token_sets.append(tokens)
-    return selected
+    if view == "minutes":
+        selected.sort(key=lambda x: (float(x.get("start", 0)), x.get("claim_id", "")))
+    return selected, max(0, len(eligible) - len(selected))
 
 
 def _units(selected, claims, relations):
@@ -80,13 +87,13 @@ def plan(claims, episodes, relations, score_fn, max_units=None):
     by_id = {x["claim_id"]: x for x in claims}
     for view in VIEW_KINDS:
         budget = max_units or adaptive_budget(claims, episodes, view=view)
-        selected = _select(claims, score_fn, view, budget)
+        selected, overflow = _select(claims, score_fn, view, budget)
         view_units = _units(selected, claims, relations)
-        view_plans[view] = {"objective": view, "budget": budget, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)]}
+        view_plans[view] = {"objective": view, "budget": budget, "selected_count": len(selected), "overflow_count": overflow, "exclusion_reason": "hard_budget_or_duplicate" if overflow else None, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)]}
         if view in {"executive", "minutes"}: union.update({x["claim_id"]: x for x in selected})
     ordered = sorted(union.values(), key=lambda x: float(x.get("start", 0)))
     units = _units(ordered, claims, relations)
     sentences = [_sentence(i, unit, by_id) for i, unit in enumerate(units, 1)]
     assert all(cross_episode_allowed(x["claim_ids"], x["relation_ids"], claims, relations) for x in sentences)
     public_sentence_plans = [sentence for view in view_plans.values() for sentence in view["sentence_plans"]]
-    return {"schema": "SummaryPlanSchema", "schema_version": 3, "strategy": "purpose-specific-subgraph-utility-v3", "adaptive_budget": view_plans["minutes"]["budget"], "selected_claim_ids": [x["claim_id"] for x in ordered], "channels": {"mandatory": [x["claim_id"] for x in ordered if _mandatory(x)], "balanced_core": [x["claim_id"] for x in ordered if not _mandatory(x)], "optional_detail": []}, "episode_coverage": sorted({x.get("episode_id") for x in ordered if x.get("episode_id")}), "summary_units": units, "sentence_plans": sentences, "public_sentence_plans": public_sentence_plans, "paragraph_plans": [{"paragraph_id": f"P{i:02d}", **u} for i, u in enumerate(units, 1)], "view_plans": view_plans}
+    return {"schema": "SummaryPlanSchema", "schema_version": 4, "strategy": "canonical-state-hard-budget-v4", "adaptive_budget": view_plans["minutes"]["budget"], "selected_claim_ids": [x["claim_id"] for x in ordered], "channels": {"mandatory": [x["claim_id"] for x in ordered if _mandatory(x)], "balanced_core": [x["claim_id"] for x in ordered if not _mandatory(x)], "optional_detail": []}, "episode_coverage": sorted({x.get("episode_id") for x in ordered if x.get("episode_id")}), "summary_units": units, "sentence_plans": sentences, "public_sentence_plans": public_sentence_plans, "paragraph_plans": [{"paragraph_id": f"P{i:02d}", **u} for i, u in enumerate(units, 1)], "view_plans": view_plans}

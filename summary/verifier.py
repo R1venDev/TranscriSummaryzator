@@ -19,6 +19,7 @@ class PublicItem:
     text: str
     claim_ids: list[str]
     evidence_ids: list[str]
+    source_word_ids: list[str]
     content_kind: str
     social_state: str
     lifecycle: str = "active"
@@ -39,18 +40,21 @@ def build_public_items(meeting_graph, summary_plan):
     """Create the complete public contract before formatting Markdown."""
     claims = {x["claim_id"]: x for x in meeting_graph.get("claims", [])}
     view_plans = summary_plan.get("view_plans", {})
-    task_states = {x["proposition_id"]: x for x in meeting_graph.get("task_states", [])}
+    task_states = {x["task_id"]: x for x in meeting_graph.get("task_states", [])}
     question_states = {x["proposition_id"]: x for x in meeting_graph.get("question_states", [])}
     sections = []
     def add(section, claim, social_state=None, text=None):
         if claim.get("lifecycle", "active") != "active" or not claim.get("evidence_ids"):
             return
+        task_state = task_states.get(claim.get("canonical_task_state_id"), {})
+        evidence_ids = task_state.get("evidence_ids", claim.get("evidence_ids", [])) if section == "tasks" else claim.get("evidence_ids", [])
+        source_word_ids = task_state.get("source_word_ids", claim.get("source_word_ids", [])) if section == "tasks" else claim.get("source_word_ids", [])
         sections.append(PublicItem(
             public_id=f"PI{len(sections)+1:05d}", section=section,
             text=str(text or claim.get("statement") or "").strip(), claim_ids=[claim["claim_id"]],
-            evidence_ids=list(claim.get("evidence_ids", [])), content_kind=claim.get("content_kind") or claim.get("kind"),
+            evidence_ids=list(evidence_ids), source_word_ids=list(source_word_ids), content_kind=claim.get("content_kind") or claim.get("kind"),
             social_state=social_state or claim.get("social_state", "candidate"), lifecycle=claim.get("lifecycle", "active"),
-        ).as_dict() | {"start": claim.get("start", 0), "task_state": task_states.get(claim.get("proposition_id"), {}), "question_state": question_states.get(claim.get("proposition_id"), {})})
+        ).as_dict() | {"start": claim.get("start", 0), "task_state_id": claim.get("canonical_task_state_id"), "task_state": task_state, "question_state": question_states.get(claim.get("proposition_id"), {}), "topic_entities": [x.get("canonical_name") or x.get("name") for x in claim.get("entities", []) if isinstance(x, dict) and (x.get("canonical_name") or x.get("name"))]})
     def selected(view):
         return [claims[x] for x in view_plans.get(view, {}).get("selected_claim_ids", []) if x in claims]
 
@@ -61,7 +65,17 @@ def build_public_items(meeting_graph, summary_plan):
         if claim.get("risk", {}).get("recognition", 0) >= .65:
             text += " ⚠ Формулировка или термин требуют проверки."
         return text
-    for claim in selected("executive")[:7]:
+    # Overview is an outcome view, not a duplicate task/question feed.
+    overview = []
+    for claim in selected("executive"):
+        if claim.get("content_kind") in {"action", "follow_up", "question", "schedule"} or claim.get("risk", {}).get("recognition", 0) >= .65:
+            continue
+        tokens = set(re.findall(r"(?iu)[a-zа-яё0-9]+", claim.get("statement", "").casefold()))
+        if any(len(tokens & old) / max(1, min(len(tokens), len(old))) >= .55 for old in (x[1] for x in overview)):
+            continue
+        overview.append((claim, tokens))
+        if len(overview) == 5: break
+    for claim, _ in overview:
         add("overview", claim, text=attributed_text(claim))
     for claim in selected("executive"):
         if can_publish_as_decision(claim):
@@ -69,12 +83,17 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in selected("technical"):
         if claim.get("content_kind") in {"trading_rule", "system_rule"}:
             add("rules", claim, "accepted" if can_publish_as_decision(claim) else "described", attributed_text(claim))
-    proposed = 0
+    proposed, emitted_tasks = 0, set()
     confirmed = {"self_committed", "explicit_self_commitment", "assigned", "accepted", "in_progress", "blocked", "completed"}
     for claim in selected("tasks"):
-        status = claim.get("task_status", "idea")
-        state = task_states.get(claim.get("proposition_id"), {})
-        details = [attributed_text(claim)]
+        state = task_states.get(claim.get("canonical_task_state_id"), {})
+        if not state or state.get("task_id") in emitted_tasks: continue
+        emitted_tasks.add(state["task_id"])
+        status = state.get("status", "idea")
+        description = str(state.get("deliverable") or state.get("description") or claim.get("statement") or "")
+        if state.get("superseded_scopes"):
+            description = re.sub(r"(?iu)\s+за\s+2021\s+год", "", description).rstrip(". ")
+        details = [description]
         if state.get("assignee"):
             details.append(f"исполнитель: {state['assignee']}")
         if state.get("current_scope"):
@@ -82,24 +101,28 @@ def build_public_items(meeting_graph, summary_plan):
         conditions = [x.get("antecedent") or x.get("text") for x in state.get("conditions", []) if isinstance(x, dict) and (x.get("antecedent") or x.get("text"))]
         if conditions:
             details.append("условие: если " + "; ".join(conditions))
-        details.append(f"статус: {status}")
+        labels = {"self_committed": "участник подтвердил", "proposed": "предложено, не подтверждено", "idea": "идея, не подтверждена", "assigned_pending": "назначение ожидает подтверждения", "assigned": "назначено", "accepted": "подтверждено", "completed": "выполнено", "blocked": "заблокировано"}
+        details.append(f"статус: {labels.get(status, 'не определён')}")
         task_text = " — ".join(details)
         if status in confirmed:
             add("tasks", claim, status, task_text)
-        elif status in {"proposed", "idea"} and proposed < 3:
+        elif status in {"proposed", "idea", "assigned_pending"} and proposed < 3:
             add("tasks", claim, status, task_text); proposed += 1
-    for claim in selected("questions")[:10]:
+    for claim in selected("questions"):
         if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") not in {"answered", "rhetorical", "superseded"}:
             state = question_states.get(claim.get("proposition_id"), {})
-            missing = state.get("missing_slots", [])
-            suffix = f" — остаются открыты поля: {', '.join(missing)}" if missing else ""
+            missing = state.get("missing_slot_labels", [])
+            suffix = f" — не уточнено: {', '.join(missing)}" if missing else ""
             add("questions", claim, claim.get("question_status", "unanswered"), attributed_text(claim) + suffix)
     for claim in selected("experiments"):
-        add("experiments", claim, text=attributed_text(claim))
+        if claim.get("content_kind") == "hypothesis" and re.search(r"(?iu)\b(?:нельзя|невозможно|ограничен)\b", claim.get("statement", "")):
+            add("technical", claim, "constraint", attributed_text(claim))
+        else:
+            add("experiments", claim, text=attributed_text(claim))
     seen_minutes = set()
-    for claim in selected("minutes"):
+    for claim in sorted(selected("minutes"), key=lambda x: (float(x.get("start", 0)), x.get("claim_id", ""))):
         key = (claim.get("proposition_id"), claim.get("social_state"), tuple(claim.get("evidence_ids", [])))
-        if key not in seen_minutes and len(seen_minutes) < 16:
+        if key not in seen_minutes:
             add("minutes", claim, text=attributed_text(claim)); seen_minutes.add(key)
     return sections
 
@@ -178,7 +201,9 @@ def verify_generated_items(items, sentence_plans, claims):
         merged = {"claim_ids": claim_ids, "relation_ids": sorted({r for p in plans for r in p.get("relation_ids", [])}), "allowed_numbers": [n for p in plans for n in p.get("allowed_numbers", [])], "allowed_relation_markers": sorted({r for p in plans for r in p.get("allowed_relation_markers", [])}), "allowed_speakers": sorted({s for p in plans for s in p.get("allowed_speakers", [])} | source_mentions), "allowed_assignees": sorted({s for p in plans for s in p.get("allowed_assignees", [])}), "polarity": [v for p in plans for v in p.get("polarity", [])], "modality": [v for p in plans for v in p.get("modality", [])], "conditions": [v for p in plans for v in p.get("conditions", [])], "time_scope": [v for p in plans for v in p.get("time_scope", [])]}
         realization = audit_realization(text, merged)
         cited = [by_claim[x] for x in claim_ids]
-        if item.get("section") and not all(str(x.get("statement") or "").casefold().strip(". ") in text.casefold() for x in cited):
+        source_tokens = {v for x in cited for v in re.findall(r"(?iu)[a-zа-яё0-9]+", str(x.get("statement") or "").casefold()) if len(v) > 2}
+        text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", text.casefold()) if len(v) > 2}
+        if item.get("section") and len(source_tokens & text_tokens) / max(1, min(len(source_tokens), len(text_tokens))) < .45:
             realization["errors"].append("cleaned_text_semantic_drift")
         if any(x.get("lifecycle", "active") != "active" for x in cited):
             realization["errors"].append("inactive_claim_published")
@@ -196,7 +221,9 @@ def verify_generated_items(items, sentence_plans, claims):
     return {"passed": all(x["passed"] for x in audits), "audits": audits, "abstentions": [x for x in audits if not x["passed"]]}
 
 
-def runtime_quality_gates(report, artifact_text, verified_hash=None):
+def publication_audit(report, artifact_text, items=None, summary_plan=None, verified_hash=None):
+    items = items or []
+    summary_plan = summary_plan or {}
     audits = report.get("audits", [])
     counters = {
         "unsupported_public_items": sum(not x.get("passed") for x in audits),
@@ -207,10 +234,55 @@ def runtime_quality_gates(report, artifact_text, verified_hash=None):
         "cross_episode_merges_without_relation": sum("cross_episode_without_relation" in x.get("errors", []) for x in audits),
         "unknown_assignee_publications": sum("speaker_or_assignee_not_preserved" in x.get("errors", []) for x in audits),
     }
+    def tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 3}
+    duplicates = 0
+    for index, left in enumerate(items):
+        for right in items[index + 1:]:
+            if left.get("section") != right.get("section"): continue
+            a, b = tokens(left.get("text")), tokens(right.get("text"))
+            duplicates += bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= .8)
+    minute_starts = [float(x.get("start", 0)) for x in items if x.get("section") == "minutes"]
+    task_ids = [x.get("task_state_id") for x in items if x.get("section") == "tasks"]
+    internal = re.compile(r"(?iu)\b(?:self_committed|assigned_pending|additional_tools|rhythmic_entry_implementation|high_tf_result|stop_loss_options)\b")
+    overview_tokens = set().union(*(tokens(x.get("text")) for x in items if x.get("section") == "overview"))
+    task_tokens = set().union(*(tokens(x.get("text")) for x in items if x.get("section") == "tasks"))
+    rendered_counts, current = {}, None
+    heading_sections = {"Краткое описание — что изменилось после встречи": "overview", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Открытые вопросы": "questions", "Технические выводы и ограничения": "technical", "Гипотезы и эксперименты": "experiments", "Хронология встречи": "minutes"}
+    for line in artifact_text.splitlines():
+        if line.startswith("## "): current = heading_sections.get(line[3:].strip())
+        elif line.startswith("- ") and current: rendered_counts[current] = rendered_counts.get(current, 0) + 1
+    item_counts = {section: sum(x.get("section") == section for x in items) for section in sorted({x.get("section") for x in items})}
+    state_conflicts = sum(bool(
+        x.get("section") == "tasks" and (not x.get("task_state_id") or x.get("social_state") != x.get("task_state", {}).get("status") or (x.get("task_state", {}).get("current_scope") and str(x["task_state"]["current_scope"]).casefold() not in str(x.get("text") or "").casefold()))
+    )
+        for x in items
+    )
+    counters.update({
+        "duplicate_items": duplicates,
+        "answered_questions_published_as_open": sum(x.get("section") == "questions" and x.get("question_state", {}).get("status") in {"answered", "rhetorical", "superseded"} for x in items),
+        "unconfirmed_tasks_published_as_committed": sum(x.get("section") == "tasks" and x.get("social_state") == "self_committed" and x.get("task_state", {}).get("commitment_strength") != "explicit" for x in items),
+        "duplicate_task_states": len([x for x in task_ids if x]) - len({x for x in task_ids if x}),
+        "chronology_inversions": sum(a > b for a, b in zip(minute_starts, minute_starts[1:])),
+        "internal_labels_exposed": sum(bool(internal.search(str(x.get("text") or ""))) for x in items),
+        "missing_public_provenance": sum(not x.get("evidence_ids") or not x.get("source_word_ids") for x in items),
+        "planner_budget_violations": sum(int(v.get("selected_count", len(v.get("selected_claim_ids", [])))) > int(v.get("budget", 0)) for v in summary_plan.get("view_plans", {}).values()),
+        "state_conflicts": state_conflicts,
+        "task_without_deliverable": sum(x.get("section") == "tasks" and not str(x.get("task_state", {}).get("deliverable") or "").strip() for x in items),
+        "overview_task_overlap": (len(overview_tokens & task_tokens) / max(1, len(overview_tokens))) if overview_tokens else 0,
+        "section_count_mismatches": sum(item_counts.get(k, 0) != rendered_counts.get(k, 0) for k in set(item_counts) | set(rendered_counts)),
+    })
+    counters["section_counts"] = item_counts
+    counters["rendered_section_counts"] = rendered_counts
+    counters["planner_overflow"] = {name: value.get("overflow_count", 0) for name, value in summary_plan.get("view_plans", {}).items()}
     artifact_hash = hashlib.sha256(artifact_text.encode("utf-8")).hexdigest()
     counters["verified_artifact_hash"] = verified_hash or artifact_hash
     counters["final_artifact_hash"] = artifact_hash
-    return {"passed": all(value == 0 for key, value in counters.items() if key.endswith("items") or key.endswith("upgrades") or key.endswith("published") or key.endswith("mismatches") or key.endswith("relation") or key.endswith("publications")) and counters["verified_artifact_hash"] == artifact_hash, **counters}
+    failing = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "task_without_deliverable", "section_count_mismatches"}
+    return {"schema": "PublicationAudit", "schema_version": 1, "passed": all(counters.get(key, 0) == 0 for key in failing) and counters["overview_task_overlap"] <= .5 and counters["verified_artifact_hash"] == artifact_hash, **counters}
+
+
+def runtime_quality_gates(report, artifact_text, verified_hash=None, items=None, summary_plan=None):
+    return publication_audit(report, artifact_text, items, summary_plan, verified_hash)
 
 
 def diff_public_items(previous, current):

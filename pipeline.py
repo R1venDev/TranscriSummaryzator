@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parent
 INBOX = ROOT / "inbox"
 STATE = ROOT / "state"
 JOBS = ROOT / "work" / "jobs"
+GLOBAL_STAGE_CACHE = ROOT / "work" / "stage-cache"
 OUTPUTS = ROOT / "outputs"
 VOICE_PROFILES = ROOT / "voice_profiles"
 DB_PATH = STATE / "queue.sqlite3"
@@ -68,6 +69,7 @@ def write_json(path, value):
 def diagnostic_environment(job_id, job_dir, component):
     return {
         "TRANSCRISUMMARY_DIAGNOSTICS": str(Path(job_dir) / "diagnostics.jsonl"),
+        "TRANSCRISUMMARY_DIAGNOSTICS_TRACE": str(Path(job_dir) / "diagnostics.trace.jsonl"),
         "TRANSCRISUMMARY_COMPONENT": component,
         "TRANSCRISUMMARY_JOB_ID": str(job_id),
         "TRANSCRISUMMARY_RUN_ID": str(getattr(diagnostic_environment, "run_id", "")),
@@ -96,7 +98,32 @@ def stage_cache_key(stage, inputs):
 def stage_cache_valid(job_dir, stage, key, artifacts):
     path = Path(job_dir) / "stage_cache.json"
     metadata = load_json(path) if path.is_file() else {}
-    return metadata.get(stage, {}).get("key") == key and all(Path(job_dir, name).is_file() for name in artifacts)
+    if metadata.get(stage, {}).get("key") == key and all(Path(job_dir, name).is_file() for name in artifacts):
+        return True
+    shared = GLOBAL_STAGE_CACHE / key[:2] / key
+    manifest_path = shared / "manifest.json"
+    if not manifest_path.is_file():
+        return False
+    manifest = load_json(manifest_path)
+    if manifest.get("key") != key or sorted(manifest.get("artifacts", {})) != sorted(artifacts):
+        return False
+    for name in artifacts:
+        source = shared / name
+        expected = manifest["artifacts"].get(name)
+        if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+            return False
+    for name in artifacts:
+        target = Path(job_dir, name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + ".cache-tmp")
+        try:
+            os.link(shared / name, temporary)
+        except OSError:
+            shutil.copy2(shared / name, temporary)
+        os.replace(temporary, target)
+    metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now(), "source": "global_content_addressed"}
+    write_json(path, metadata)
+    return True
 
 
 def mark_stage_cached(job_dir, stage, key, artifacts):
@@ -104,6 +131,27 @@ def mark_stage_cached(job_dir, stage, key, artifacts):
     metadata = load_json(path) if path.is_file() else {}
     metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now()}
     write_json(path, metadata)
+    shared = GLOBAL_STAGE_CACHE / key[:2] / key
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = shared.parent / (key + ".lock")
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        manifest_path = shared / "manifest.json"
+        if not manifest_path.is_file():
+            temporary = shared.parent / (key + ".tmp-" + uuid.uuid4().hex)
+            temporary.mkdir(parents=True)
+            hashes = {}
+            for name in artifacts:
+                source = Path(job_dir, name)
+                destination = temporary / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                hashes[name] = hashlib.sha256(destination.read_bytes()).hexdigest()
+            write_json(temporary / "manifest.json", {"schema_version": 1, "key": key, "stage": stage, "artifacts": hashes, "created_at": now()})
+            try:
+                os.replace(temporary, shared)
+            except OSError:
+                shutil.rmtree(temporary, ignore_errors=True)
 
 
 def artifact_provenance(path, producer, inputs=None, model=None):
@@ -2472,7 +2520,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
         if parsed.path == "/download":
             job_id = parse_qs(parsed.query).get("id", [""])[0]
             name = parse_qs(parsed.query).get("file", [""])[0]
-            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics_summary.json"}
+            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics.trace.jsonl", "diagnostics_summary.json", "public_items.json", "publication_audit.json", "summary_plan.json"}
             row = connect().execute("SELECT output_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
             target = Path(row["output_dir"]) / name if row and row["output_dir"] and name in allowed else None
             if not target or not target.is_file():
@@ -2507,7 +2555,10 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 ("tasks.json", "Задачи", False),
                 ("semantic_records.json", "Тезисы", False),
                 ("summary_audit.json", "Аудит", False),
+                ("publication_audit.json", "Аудит публикации", False),
+                ("public_items.json", "Public items", False),
                 ("diagnostics.jsonl", "Подробная диагностика", False),
+                ("diagnostics.trace.jsonl", "Per-item trace", False),
                 ("diagnostics_summary.json", "Сводка диагностики", False),
                 ("run_manifest.json", "Manifest", False),
             ]
