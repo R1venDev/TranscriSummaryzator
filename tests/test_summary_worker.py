@@ -1327,6 +1327,54 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual([item["fact_id"] for item in accepted], ["F00001", "F00002"])
         self.assertEqual(rejected, [])
 
+    def test_primary_validation_bisects_a_zero_progress_batch(self):
+        facts = [fact(), dict(fact(statement="Второй подтверждённый тезис"), fact_id="F00002")]
+
+        class Client:
+            def chat(self, _model, _system, prompt, **_kwargs):
+                payload = json.loads(prompt.split("\n", 1)[1].split("\n\nФормат:", 1)[0])
+                if len(payload) > 1:
+                    return json.dumps({"reviews": []}), {}
+                item = payload[0]
+                return json.dumps({"reviews": [{
+                    "fact_id": item["fact_id"], "verdict": "supported",
+                    "type": item["type"], "statement": item["statement"],
+                    "evidence_ids": item["evidence_ids"], "confidence": .9,
+                }]}), {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            accepted, rejected = summary.validate_facts_adaptive(
+                Client(), "model", facts, Path(directory)
+            )
+        self.assertEqual([item["fact_id"] for item in accepted], ["F00001", "F00002"])
+        self.assertEqual(rejected, [])
+
+    def test_arbitration_bisects_a_zero_progress_batch(self):
+        facts = [fact(), dict(fact(statement="Второй подтверждённый тезис"), fact_id="F00002")]
+        original = summary.call_json_with_retries
+
+        def response(_client, _model, _system, prompt, _cache_path, **_kwargs):
+            payload = json.loads(
+                prompt.split("Независимо перепроверь критичные и сомнительные факты:\n", 1)[1]
+                .split("\nВерни строго", 1)[0]
+            )
+            reviews = [] if len(payload) > 1 else [{
+                "fact_id": payload[0]["fact_id"], "verdict": "supported",
+                "type": payload[0]["type"], "statement": payload[0]["statement"],
+                "evidence_ids": payload[0]["evidence_ids"], "confidence": .9,
+            }]
+            return {"response": {"reviews": reviews}}
+
+        summary.call_json_with_retries = response
+        try:
+            accepted, rejected = summary.arbitrate(
+                object(), "model", facts, Path("batch.json")
+            )
+        finally:
+            summary.call_json_with_retries = original
+        self.assertEqual([item["fact_id"] for item in accepted], ["F00001", "F00002"])
+        self.assertEqual(rejected, [])
+
     def test_semantic_registry_splits_incomplete_response(self):
         facts = [fact(), dict(fact(statement="Второй подтверждённый тезис"), fact_id="F00002")]
 

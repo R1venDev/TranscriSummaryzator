@@ -1073,6 +1073,19 @@ def validate_facts_adaptive(client, model, facts, cache_dir, offset=0):
             raise RuntimeError("Модель валидации не проверила факт: " + next(iter(missing)))
         present_facts = [x for x in facts if x.get("fact_id") not in missing]
         missing_facts = [x for x in facts if x.get("fact_id") in missing]
+        if not present_facts:
+            # A cached empty/invalid batch must never recurse with the same
+            # arguments and cache key.  Bisecting guarantees strict progress;
+            # a still-missing singleton fails explicitly above.
+            middle = len(facts) // 2
+            diagnostic_event(
+                "batch_item_accounting", category="stage", outcome="split",
+                metrics={"expected_items": len(facts), "left_items": middle, "right_items": len(facts) - middle},
+                reasons=["no_progress_bisect"],
+            )
+            left = validate_facts_adaptive(client, model, facts[:middle], cache_dir, offset)
+            right = validate_facts_adaptive(client, model, facts[middle:], cache_dir, offset + middle)
+            return left[0] + right[0], left[1] + right[1]
         accepted, rejected = apply_reviews(present_facts, reviews, strict=True)
         retried = validate_facts_adaptive(client, model, missing_facts, cache_dir, offset + len(present_facts))
         return accepted + retried[0], rejected + retried[1]
@@ -1112,6 +1125,16 @@ def arbitrate(client, model, facts, cache_path, progress=None):
             raise RuntimeError("Арбитр не проверил факт: " + next(iter(missing)))
         present = [x for x in facts if x.get("fact_id") not in missing]
         tail = [x for x in facts if x.get("fact_id") in missing]
+        if not present:
+            middle = len(facts) // 2
+            diagnostic_event(
+                "batch_item_accounting", category="stage", outcome="split",
+                metrics={"expected_items": len(facts), "left_items": middle, "right_items": len(facts) - middle},
+                reasons=["no_progress_bisect"],
+            )
+            left = arbitrate(client, model, facts[:middle], cache_path.with_name(cache_path.stem + "-missing-left.json"), progress)
+            right = arbitrate(client, model, facts[middle:], cache_path.with_name(cache_path.stem + "-missing-right.json"), progress)
+            return left[0] + right[0], left[1] + right[1]
         accepted, rejected = apply_reviews(present, reviews, strict=True)
         retried = arbitrate(client, model, tail, cache_path.with_name(cache_path.stem + "-missing.json"), progress)
         return accepted + retried[0], rejected + retried[1]
