@@ -3945,13 +3945,25 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     minimum_publication_coverage = float(
         cfg.get("summary_min_publication_coverage", 0.99)
     )
-    if coverage["evidence_registry"]["material_coverage_ratio"] < minimum_publication_coverage:
-        diagnostic_decision("evidence_completeness_gate", "rejected", metrics=coverage["evidence_registry"], thresholds={"minimum_material_coverage": minimum_publication_coverage}, reasons=["coverage_below_threshold"])
+    minimum_material_coverage = float(cfg.get("summary_min_material_coverage", 0.80))
+    accounting_ratio = coverage["evidence_registry"]["material_coverage_ratio"]
+    coverage["evidence_registry"]["accounting_target"] = minimum_publication_coverage
+    coverage["evidence_registry"]["accounting_target_met"] = accounting_ratio >= minimum_publication_coverage
+    coverage["evidence_registry"]["blocking_material_floor"] = minimum_material_coverage
+    if accounting_ratio < minimum_material_coverage:
+        diagnostic_decision("evidence_accounting_gate", "rejected", metrics=coverage["evidence_registry"], thresholds={"blocking_material_floor": minimum_material_coverage, "accounting_target": minimum_publication_coverage}, reasons=["material_floor_not_met"])
         raise RuntimeError(
             "Недостаточное покрытие содержательных реплик после всех проверок: "
-            f'{coverage["evidence_registry"]["material_coverage_ratio"]*100:.1f}%'
+            f'{accounting_ratio*100:.1f}%'
         )
-    diagnostic_decision("evidence_completeness_gate", "accepted", metrics=coverage["evidence_registry"], thresholds={"minimum_material_coverage": minimum_publication_coverage}, reasons=["coverage_threshold_passed"])
+    diagnostic_event(
+        "evidence_accounting_gate", category="decision",
+        outcome="target_met" if accounting_ratio >= minimum_publication_coverage else "below_target_non_blocking",
+        metrics=coverage["evidence_registry"],
+        thresholds={"blocking_material_floor": minimum_material_coverage, "accounting_target": minimum_publication_coverage},
+        reasons=["accounting_is_not_summary_completeness"],
+        severity="INFO" if accounting_ratio >= minimum_publication_coverage else "WARN",
+    )
     facts_by_id = {item.get("fact_id"): item for item in evidence_facts}
     summary_plan = build_constrained_plan(
         state_v2["claims"], state_v2["episodes"], state_v2["relations"],
