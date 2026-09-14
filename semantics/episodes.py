@@ -60,11 +60,11 @@ def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
             "topic": topic,
             "initiating_event_ids": [group[0].get("claim_id")],
             "claim_ids": [x.get("claim_id") for x in group],
-            "question_ids": [x.get("claim_id") for x in group if x.get("kind") == "question"],
-            "decision_ids": [x.get("claim_id") for x in group if x.get("kind") == "decision"],
-            "task_ids": [x.get("claim_id") for x in group if x.get("kind") == "action"],
+            "question_ids": [x.get("claim_id") for x in group if x.get("content_kind") == "question"],
+            "decision_ids": [x.get("claim_id") for x in group if x.get("content_kind") == "decision" and x.get("decision_status") == "accepted"],
+            "task_ids": [x.get("claim_id") for x in group if x.get("content_kind") in {"action", "follow_up"}],
             "participants": sorted({s for x in group for s in x.get("speaker_refs", [])}),
-            "outcome_claim_ids": [x.get("claim_id") for x in group if x.get("kind") in {"decision", "action", "experimental_result"}],
+            "outcome_claim_ids": [x.get("claim_id") for x in group if (x.get("content_kind") == "decision" and x.get("decision_status") == "accepted") or (x.get("content_kind") in {"action", "follow_up"} and x.get("task_status") in {"accepted", "self_committed", "in_progress", "blocked", "completed"}) or x.get("content_kind") == "experimental_result"],
             "open_threads": [],
         })
     return result
@@ -94,7 +94,7 @@ def build_threads(episodes, claims, relations=None):
             claim["thread_id"] = matched["thread_id"]
             if claim.get("lifecycle", "active") == "active":
                 matched["active_claim_ids"].append(claim_id)
-            if claim.get("kind") == "question" and claim.get("question_status") not in {"answered", "rhetorical", "superseded"}:
+            if claim.get("content_kind") == "question" and claim.get("question_status") not in {"answered", "rhetorical", "superseded"}:
                 matched["open_question_ids"].append(claim_id)
     for thread in threads:
         thread["state"] = "open" if thread["open_question_ids"] else "resolved"

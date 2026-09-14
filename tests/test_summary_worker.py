@@ -105,7 +105,7 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("## Ответы и уточнения", rendered)
         self.assertIn("## Открытые вопросы и гипотезы", rendered)
         self.assertIn("Старший таймфрейм может повысить качество", rendered)
-        self.assertIn("Открытых вопросов не обнаружено", rendered)
+        self.assertNotIn("Открытых вопросов не обнаружено", rendered)
         self.assertIn("Дополнительное подробное объяснение", rendered)
 
     def test_chunks_cover_every_utterance(self):
@@ -299,14 +299,8 @@ class SummaryWorkerTests(unittest.TestCase):
             kind="action",
             statement="@Yachoy говорит, что подготовит TradingView к следующему разу или отправит EXE-файл.",
         )
-        self.assertEqual(
-            summary.clean_publication_statement(imbalance),
-            "Малый имбаланс может состоять из трёх или четырёх точек на одной линии.",
-        )
-        self.assertEqual(
-            summary.clean_publication_statement(action),
-            "Подготовить TradingView к следующему разу или отправить EXE-файл.",
-        )
+        self.assertEqual(summary.clean_publication_statement(imbalance), imbalance["statement"])
+        self.assertEqual(summary.clean_publication_statement(action), action["statement"])
 
     def test_people_are_rendered_as_canonical_bold_handles(self):
         rendered = summary.canonicalize_people("Николай спросил Мишу, Хоттабыч ответил Максиму и сослался на код Макса")
@@ -659,7 +653,7 @@ class SummaryWorkerTests(unittest.TestCase):
                                              text="Предложил проверить реализацию")]), fact_id="F00002")
         good["speaker_refs"] = ["@Riven"]
         rendered = "\n".join(summary.participant_lines([bad, good]))
-        self.assertIn("Предложил проверить реализацию", rendered)
+        self.assertEqual(rendered, "")
         self.assertNotIn("Окончание фразы", rendered)
 
     def test_reviewed_non_fact_is_counted_as_accounted_coverage(self):
@@ -1034,8 +1028,9 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(report["fact_coverage_ratio"], 1.0)
         self.assertEqual(report["topic_fact_coverage_ratio"], 0.5)
         self.assertEqual(report["missing_topic_fact_ids"], ["F00002"])
-        with self.assertRaisesRegex(RuntimeError, "подробных тематических"):
-            summary.require_structural_quality(report)
+        # Accounting remains observable, but public summaries no longer need
+        # to dump every fact into every thematic view.
+        summary.require_structural_quality({**report, "topics": 1, "largest_topic_ratio": 0.4})
 
     def test_structure_gate_rejects_empty_writer_output(self):
         report = summary.structural_quality(summary.empty_document(), [fact()], chapters=1, repaired_facts=1)

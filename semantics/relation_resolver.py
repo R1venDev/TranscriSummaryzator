@@ -47,16 +47,25 @@ def resolve_relations(propositions, events, records):
                 slot_check = verify_slot_entailment(record.get("requested_slots", []), by_record.get(answer_id, {}))
                 kind = "answers" if slot_check["passed"] else "partially_answers"
                 add(kind, answer["proposition_id"], source["proposition_id"], answer["evidence_ids"] + source["evidence_ids"], .98 if slot_check["passed"] else .75, "explicit_slot_entailment")
-        for target_id in record.get("corrects_record_ids", []) + record.get("supersedes_record_ids", []):
+        for target_id in record.get("corrects_record_ids", []):
             target = prop_by_record.get(target_id)
             if target: add("corrects", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "explicit_revision")
+        for target_id in record.get("supersedes_record_ids", []) + record.get("revises_record_ids", []):
+            target = prop_by_record.get(target_id)
+            if target: add("supersedes", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "explicit_revision")
     for index, event in enumerate(ordered):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]
-        prior_events = ordered[max(0, index - 8):index]
+        # Short replies are only safe inside a very small dialogue window.
+        prior_events = ordered[max(0, index - 3):index]
         if event["speech_act"] in {"accept", "reject"} or ACCEPT_RE.search(text) or REJECT_RE.search(text):
-            target_event = next((x for x in reversed(prior_events) if x["speech_act"] in {"propose", "ask"}), None)
-            if target_event:
+            candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask"}]
+            same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
+            candidates = same_thread or candidates
+            target_event = candidates[0] if len(candidates) == 1 else None
+            # A speaker's own acknowledgement is not evidence that another
+            # participant accepted the proposition.
+            if target_event and (not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
                 kind = "rejects" if event["speech_act"] == "reject" or REJECT_RE.search(text) else "accepts"
                 add(kind, source["proposition_id"], target_event["proposition_id"], source["evidence_ids"], .96, "coreference_short_reply")
         for prior in reversed(prior_events):
@@ -69,7 +78,7 @@ def resolve_relations(propositions, events, records):
             elif source["polarity"] != target["polarity"]: add("contradicts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .82, "polarity_conflict")
             elif CONDITION_RE.search(text): add("condition_for", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .78, "condition_marker")
             elif CAUSE_RE.search(text): add("explains", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .75, "causal_marker")
-            elif source["content_kind"] == "experiment" and target["content_kind"] in {"rule", "design"}: add("tests", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .74, "experiment_candidate")
+            elif source["content_kind"] in {"hypothesis", "experimental_result"} and target["content_kind"] in {"trading_rule", "system_rule", "design_choice"}: add("tests", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .74, "experiment_candidate")
             break
     return relations
 

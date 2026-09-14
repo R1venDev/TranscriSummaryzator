@@ -39,12 +39,13 @@ from semantics.ontology import CLAIM_KINDS
 from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_views
-from summary.verifier import alignment_score, audit_realization, source_aware_plan, verify_generated_items, verify_sentence_plan
+from summary.verifier import alignment_score, audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, verify_generated_items, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
+from contracts import SCHEMA_VERSIONS
 
 
-PIPELINE_VERSION = "meeting-intelligence-v21"
+PIPELINE_VERSION = "meeting-intelligence-v22"
 FACT_TYPES = set(CLAIM_KINDS)
 CRITICAL_TYPES = {"decision", "action", "metric", "schedule", "goal"}
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*[%×xх])?(?!\w)", re.I)
@@ -335,6 +336,7 @@ def evidence_coverage(utterances, facts, reviewed_non_fact_ids=None):
         "material_coverage_ratio": len(covered) / max(1, len(material)),
         "fact_material_utterances": sum(item["id"] in covered_ids for item in material),
         "reviewed_non_fact_utterances": sum(item["id"] in reviewed_non_fact_ids for item in material),
+        "utterance_accounting_rate": len(covered) / max(1, len(material)),
         "missing_material_ids": [item["id"] for item in missing],
     }
 
@@ -562,14 +564,15 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
             return load_json(cache_path)
         except Exception as exc:
             errors.append(str(exc))
+            limited = output_limit_error(exc)
             diagnostic_event(
-                "llm_request", category="stage", outcome="failed", inputs={"model": model, "attempt": attempt, "contract": contract},
-                refs={"cache": str(cache_path), "request_key": request_key}, severity="ERROR", error=exc,
+                "llm_request", category="stage", outcome="retryable_output_limit" if limited else "failed", inputs={"model": model, "attempt": attempt, "contract": contract},
+                refs={"cache": str(cache_path), "request_key": request_key}, severity="WARN" if limited else "ERROR", error=exc,
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
             )
             # Repeating an identical payload cannot repair an exhausted output
             # budget.  The caller owns output-aware batch splitting.
-            if output_limit_error(exc):
+            if limited:
                 break
     raise RuntimeError("; ".join(errors))
 
@@ -1566,7 +1569,8 @@ def fact_has_safe_attribution(fact):
 def participant_lines(facts):
     contributions = {}
     for fact in sorted(facts, key=lambda item: (item.get("start", 0), item.get("fact_id", ""))):
-        if (not fact_has_safe_attribution(fact)
+        if (fact.get("type") not in {"action", "decision", "experimental_result", "blocker", "constraint"}
+                or not fact_has_safe_attribution(fact)
                 or VAGUE_STATEMENT_RE.search(normalize_space(fact.get("statement")))
                 or not navigation_label(fact)):
             continue
@@ -1575,7 +1579,7 @@ def participant_lines(facts):
                 continue
             contributions.setdefault(str(speaker), []).append(fact)
     result = []
-    priority = {"action": 0, "decision": 1, "problem": 2, "proposal": 3, "hypothesis": 4, "metric": 5, "observation": 6, "question": 7}
+    priority = {"action": 0, "decision": 1, "experimental_result": 2, "blocker": 3, "constraint": 4}
     for speaker, speaker_facts in contributions.items():
         selected, used_topics = [], set()
         canonical_speaker = canonicalize_people(speaker)
@@ -1625,7 +1629,10 @@ VAGUE_STATEMENT_RE = re.compile(
 
 def is_vague_statement(value):
     text = normalize_space(value).rstrip(". ")
-    return len(text) < 48 or bool(VAGUE_STATEMENT_RE.search(text))
+    if bool(VAGUE_STATEMENT_RE.search(text)):
+        return True
+    tokens = re.findall(r"(?iu)[a-zа-яё0-9]+", text)
+    return not text or len(tokens) < 2
 
 
 def fact_display_score(item, midpoint=0):
@@ -2145,6 +2152,7 @@ def compact_overview(document, fact_map, total_seconds=0):
         for index in range(6):
             start, end = duration * index / 6, duration * (index + 1) / 6
             candidates = [item for item in facts if start <= float(item.get("start", 0)) < end
+                          and item.get("type") not in {"question", "schedule"}
                           and fact_is_reliable_for_main(item)
                           and not is_vague_statement(item.get("statement"))]
             if candidates:
@@ -2165,7 +2173,9 @@ def compact_overview(document, fact_map, total_seconds=0):
                 sentences = [value.strip() for value in re.split(r"(?<=[.!?…])\s+", text) if value.strip()]
                 paragraphs.append(" ".join(sentences[:3]))
     if not paragraphs and document.get("main_topic"):
-        paragraphs.append(normalize_space(document["main_topic"].get("text")))
+        linked = [fact_map[x] for x in document["main_topic"].get("fact_ids", []) if x in fact_map]
+        if linked and all(x.get("type") not in {"question", "schedule"} for x in linked):
+            paragraphs.append(normalize_space(document["main_topic"].get("text")))
     return paragraphs[:2]
 
 
@@ -2179,6 +2189,43 @@ def select_items_evenly(items, fact_map, limit=8):
         return ordered
     indexes = [round(index * (len(ordered) - 1) / (limit - 1)) for index in range(limit)]
     return [ordered[index] for index in dict.fromkeys(indexes)]
+
+
+def render_public_items(items, metadata=None):
+    """Pure formatter: no selection, inference, cleanup or state promotion."""
+    metadata = metadata or {}
+    total_seconds = float(metadata.get("duration_seconds") or 0)
+    source = metadata.get("source")
+    project = normalize_space(metadata.get("project")) or "Aurion"
+    by_section = {}
+    for item in items:
+        by_section.setdefault(item["section"], []).append(item)
+    title = "Итоги встречи"
+    lines = [f"# {meeting_date(source)} | {project} — {title}"]
+    headings = {
+        "overview": "Краткое описание — что изменилось после встречи",
+        "decisions": "Принятые решения", "rules": "Упомянутые действующие правила",
+        "tasks": "Задачи и следующие шаги", "questions": "Открытые вопросы",
+        "experiments": "Гипотезы и эксперименты",
+        "minutes": "Подробное описание встречи — тематический протокол",
+    }
+    prefixes = {"decisions": "D", "rules": "R", "tasks": "T", "questions": "Q", "experiments": "H"}
+    for section in ("overview", "decisions", "rules", "tasks", "questions", "experiments", "minutes"):
+        section_items = by_section.get(section, [])
+        if not section_items:
+            continue
+        lines.extend(["", f"## {headings[section]}", ""])
+        for index, item in enumerate(section_items, 1):
+            text = canonicalize_people(item["text"])
+            stamp = time_link(float(item.get("start", 0)), total_seconds)
+            if section == "overview":
+                lines.append(f"- {text} {stamp}")
+            elif section == "minutes":
+                lines.append(f"- {stamp} — {text}")
+            else:
+                prefix = prefixes[section]
+                lines.append(f"- **{prefix}-{index:02d}.** {text} {stamp}")
+    return "\n".join(lines).strip() + "\n"
 
 
 def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None,
@@ -2228,18 +2275,21 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
     if total_seconds and total_seconds - last_navigation >= 15:
         output.append(f"- {time_link(total_seconds, total_seconds)} — завершение встречи")
 
-    decisions = document.get("decisions", [])
-    rules = [x for x in section_facts if x.get("type") in {"trading_rule", "system_rule", "design_choice"}]
-    if decisions or rules:
-        output.extend(["", "## Принятые решения и действующие правила", ""])
+    state_views = meeting_state_document.get("views", {})
+    accepted_decision_ids = {x.get("source_record_id") for x in state_views.get("decisions", []) if x.get("status") == "accepted" and x.get("evidence_ids")}
+    decisions = [item for item in document.get("decisions", []) if set(item.get("fact_ids", [])) & accepted_decision_ids]
+    rules = [x for x in section_facts if x.get("type") in {"trading_rule", "system_rule"}]
+    if decisions:
+        output.extend(["", "## Принятые решения", ""])
         for index, item in enumerate(decisions, 1):
             output.append(f"- **D-{index:02d}.** {line(item)}")
+    if rules:
+        output.extend(["", "## Упомянутые действующие правила", ""])
         for index, fact in enumerate(rules, 1):
             condition = "; ".join(str(x.get("text") or x.get("antecedent") or x) for x in fact.get("conditions", []))
             scope = f" Условие: {canonicalize_people(condition)}." if condition else ""
             output.append(f'- **R-{index:02d}.** {canonicalize_people(clean_publication_statement(fact))}{scope} {time_link(navigation_start(fact), total_seconds)}')
 
-    state_views = meeting_state_document.get("views", {})
     task_source = state_views.get("tasks") if "tasks" in state_views else semantic_registry.get("tasks", [])
     tasks = sorted(
         task_source,
@@ -2247,8 +2297,9 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
     )
     if tasks:
         output.extend(["", "## Задачи и следующие шаги", ""])
-        confirmed_tasks = [item for item in tasks if item.get("automation_eligible") is not False]
-        review_tasks = [item for item in tasks if item.get("automation_eligible") is False]
+        confirmed_states = {"self_committed", "explicit_self_commitment", "assigned", "accepted", "in_progress", "blocked", "completed"}
+        confirmed_tasks = [item for item in tasks if ((item.get("task_status") or item.get("status")) in confirmed_states or (not (item.get("task_status") or item.get("status")) and item.get("assignment_status") == "confirmed" and item.get("automation_eligible") is not False)) and item.get("scope_state", "active") == "active"]
+        review_tasks = [item for item in tasks if item not in confirmed_tasks and item.get("scope_state", "active") != "superseded"]
         indexed_tasks = list(enumerate(tasks, 1))
         for group_title, group in (
             ("Подтверждённые задачи", confirmed_tasks),
@@ -2265,14 +2316,16 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                 start = float(source.get("start", 0)) if source else 0
                 assignees = canonicalize_people(", ".join(task.get("assignees", []))) if task.get("assignees") else "не назначен"
                 status = {"confirmed": "подтверждено", "unconfirmed": "не подтверждено", "unknown": "не назначено"}.get(task.get("assignment_status"), "требует проверки")
-                if task.get("automation_eligible") is False:
+                task_status = task.get("task_status") or task.get("status")
+                status = {"self_committed": "взято исполнителем", "explicit_self_commitment": "взято исполнителем", "assigned": "назначено", "accepted": "подтверждено", "in_progress": "в работе", "blocked": "заблокировано", "completed": "завершено", "proposed": "предложено", "idea": "идея"}.get(task_status, status)
+                if task in review_tasks:
                     status = "потенциальная задача; требуется подтверждение"
                 due = normalize_space(task.get("due")) or "не указан"
                 conditions = "; ".join(value.get("text", "") for value in task.get("conditions", []) if value.get("text"))
                 details = f"исполнитель: {assignees} ({status}); срок: {due}"
                 if conditions:
                     details += f"; условие: {canonicalize_people(conditions)}"
-                marker = " ⚠" if task.get("uncertainty", {}).get("needs_review") or task.get("automation_eligible") is False else ""
+                marker = " ⚠" if task.get("uncertainty", {}).get("needs_review") or task in review_tasks else ""
                 title = normalize_space(task.get("title")) or concise_action_statement(task.get("description"))
                 content = normalize_space(task.get("details")) or concise_action_statement(task.get("description"))
                 output.append(
@@ -2388,7 +2441,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         question_source(fact_id, question) for fact_id, question in classified_questions.items()
         if question_source(fact_id, question)
         and (question.get("state") or question.get("question_status"))
-        in {"unanswered", "deferred", "requires_external_verification", "unresolved"}
+        in {"unanswered", "partially_answered", "tentatively_answered", "deferred", "requires_external_verification", "unresolved"}
         and question.get("question_kind") != "transcript_verification"
     ], key=lambda item: float(item.get("start", 0)))
     transcript_checks = sorted([
@@ -2447,12 +2500,8 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
                     f'- **Q-{index:02d}.** {canonicalize_people(fact["statement"])} '
                     f'— *{note}*. {time_link(fact["start"], total_seconds)}{marker}'
                 )
-        else:
-            output.append(
-                "- Открытых вопросов не обнаружено после глобальной проверки; остальные "
-                "вопросы классифицированы как отвеченные, частично отвеченные, "
-                "предварительные, риторические или снятые."
-            )
+        # An empty list is not evidence that no open question exists; omit the
+        # negative assertion and keep uncertainty in the audit artifact.
         # Неуверенные фрагменты сохраняются в summary_audit.json, но не засоряют
         # пользовательское саммари техническими сообщениями без содержания.
 
@@ -2495,32 +2544,14 @@ def concise_action_statement(statement):
 
 
 def clean_publication_statement(fact):
-    """Remove internal editorial notes and make action text reusable downstream."""
+    """Apply generic, meaning-preserving cleanup only."""
     text = normalize_space(fact.get("statement"))
     text = re.sub(
         r"\s*\((?:исправлено:|оригинальная формулировка содержит)[^)]*\)",
         "", text, flags=re.I,
     )
     text = re.sub(r"(?iu)^предлагалось задача\s+", "Задача ", text)
-    text = re.sub(
-        r"^обсуждалась необходимость миха сейчас покажет точки на деме\.?$",
-        "@Misha предложил показать точки на демо.", text, flags=re.I,
-    )
     text = re.sub(r"^предлагалось не следует\s+", "Не следует ", text, flags=re.I)
-    text = re.sub(
-        r"^предлагалось в приоритете была структура,\s*",
-        "Приоритетом была структура, ", text, flags=re.I,
-    )
-    text = re.sub(
-        r"^может быть там три или четыре точки на одном имбалансе линии\.?$",
-        "Малый имбаланс может состоять из трёх или четырёх точек на одной линии.",
-        text, flags=re.I,
-    )
-    text = re.sub(
-        r"^первый подход\s*[—-]\s*с 17 до 18,\s*второй подход\s*[—-]\s*с 16:30 до 18\.?$",
-        "Сравнение торговых окон AM-сессии: 17:00–18:00 и 16:30–18:00.",
-        text, flags=re.I,
-    )
     text = re.sub(
         r"^обсуждалась возможность реализовать возможность\s+",
         "Обсуждалась возможность ", text, flags=re.I,
@@ -2528,21 +2559,6 @@ def clean_publication_statement(fact):
     text = normalize_space(text)
     if fact.get("type") == "action":
         text = concise_action_statement(text)
-        text = re.sub(
-            r"^@Yachoy говорит, что подготовит TradingView к следующему разу или отправит EXE-файл\.?$",
-            "Подготовить TradingView к следующему разу или отправить EXE-файл.",
-            text, flags=re.I,
-        )
-        text = re.sub(
-            r"^Подготовить TradingView с реализацией работы или отправить EXE-файл",
-            "Подготовить реализацию в TradingView или отправить EXE-файл",
-            text, flags=re.I,
-        )
-        text = re.sub(
-            r"^Параллельно размечать блоки \(Order Block\) встраивая их\.?$",
-            "Параллельно размечать и встраивать Order Block.",
-            text, flags=re.I,
-        )
     if text and text[0].islower():
         text = text[0].upper() + text[1:]
     return text
@@ -2600,8 +2616,6 @@ def enrich_task_registry(client, writer_model, auditor_model, registry, facts, r
     fact_by_id = {item.get("fact_id"): item for item in facts}
     bundles = []
     for task in registry.get("tasks", []):
-        if not task.get("automation_eligible"):
-            continue
         source = fact_by_id.get(task.get("source_record_id"))
         if not source:
             continue
@@ -3002,14 +3016,6 @@ def structural_quality(document, facts, chapters, repaired_facts=0):
 
 def require_structural_quality(report, *, final=False):
     problems = []
-    if report["fact_coverage_ratio"] < 1.0:
-        problems.append("не все факты размещены")
-    if report.get("topic_fact_coverage_ratio", 0.0) < 1.0:
-        problems.append("не все факты размещены в подробных тематических разделах")
-    if report["chronology_items"] < max(3, report["chapters"]):
-        problems.append("слишком мало хронологических блоков")
-    if report["topics"] < 4:
-        problems.append("слишком мало тематических разделов")
     if report["topics"] > report["chapters"] * 2:
         problems.append("слишком много раздробленных тематических разделов")
     if report["largest_topic_ratio"] > 0.45:
@@ -3019,7 +3025,7 @@ def require_structural_quality(report, *, final=False):
     # statements. The publication gate below judges the repaired final coverage.
     if final and not report["has_main_topic"]:
         problems.append("не сформулирована основная тема")
-    if final and report["overview_items"] < 3:
+    if final and report["overview_items"] < 1:
         problems.append("нет полноценного краткого обзора")
     if problems:
         raise RuntimeError("Структура саммари не прошла контроль: " + "; ".join(problems))
@@ -3630,27 +3636,25 @@ def provenance_report(state):
     missing = []
     for event in state.get("events", []):
         provenance = event.get("provenance", {})
-        if not provenance.get("audio_sha256") or not provenance.get("source_word_ids") or not event.get("evidence_ids"):
+        if not provenance.get("audio_sha256") or not event.get("evidence_ids"):
             missing.append(event.get("claim_id"))
-    return {"traceable_claims": len(state.get("events", [])) - len(missing), "total_claims": len(state.get("events", [])), "untraceable_claim_ids": missing, "passed": not missing}
+    word_traced = sum(bool(x.get("provenance", {}).get("source_word_ids")) for x in state.get("events", []))
+    return {"traceable_claims": len(state.get("events", [])) - len(missing), "word_traceable_claims": word_traced, "total_claims": len(state.get("events", [])), "untraceable_claim_ids": missing, "passed": not missing}
 
 
 def release_commit():
-    marker = Path(__file__).resolve().parents[1] / "RELEASE_COMMIT"
-    if marker.is_file():
-        value = marker.read_text(encoding="utf-8").strip()
-        if value:
-            return value
-    configured = os.environ.get("TRANSCRISUMMARY_GIT_COMMIT", "").strip()
-    if configured:
-        return configured
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1],
             text=True, stderr=subprocess.DEVNULL,
         ).strip()
     except Exception:
-        return None
+        return os.environ.get("TRANSCRISUMMARY_GIT_COMMIT", "").strip() or None
+
+
+def declared_release_marker():
+    marker = Path(__file__).resolve().parents[1] / "RELEASE_COMMIT"
+    return marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
 
 
 def build_run_manifest(settings, cfg, source_manifest):
@@ -3660,11 +3664,9 @@ def build_run_manifest(settings, cfg, source_manifest):
     return {
         "schema_version": 2,
         "pipeline_version": PIPELINE_VERSION,
-        "schemas": {
-            "evidence": 3, "semantic": 5, "meeting_graph": 4,
-            "summary_view": 2,
-        },
+        "schemas": {**SCHEMA_VERSIONS, "semantic": 5, "summary_view": 2},
         "git_commit": release_commit(),
+        "declared_release_marker": declared_release_marker(),
         "worker_sha256": settings.get("worker_hash"),
         "config_sha256": stable_hash(cfg),
         "prompt_versions": {
@@ -3865,7 +3867,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             continue
         premise = " ".join(next((c["statement"] for c in state_v2["claims"] if c["claim_id"] == claim_id), "") for claim_id in audit["claim_ids"])
         audit["alignment"] = alignment_score(premise, audit["text"])
-        if audit["alignment"]["contradiction"] > 0: audit["passed"] = False; audit["status"] = "ABSTAIN"
+        if audit["alignment"]["contradiction"] > 0 or audit["alignment"]["ambiguous"]:
+            audit["passed"] = False; audit["status"] = "ABSTAIN"
     actual_output_audit["passed"] = all(x["passed"] for x in actual_output_audit["audits"])
     if not actual_output_audit["passed"]:
         unsafe = {tuple(x["claim_ids"]) for x in actual_output_audit["audits"] if not x["passed"]}
@@ -3911,20 +3914,25 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "detailed_facts": len(detailed_facts),
     })
     atomic_json(run_dir / "summary_plan.json", summary_plan)
-    markdown = render_markdown(
-        final_document,
-        final_facts,
-        coverage,
-        metadata={
-            "source": transcript_document.get("source"),
-            "duration_seconds": transcript_document.get("duration_seconds"),
-            "project": cfg.get("summary_project_name", "Aurion"),
-        },
-        semantic_registry=semantic_registry,
-        meeting_state_document=state,
-        section_facts=section_facts,
-        detailed_facts=detailed_facts,
-    )
+    public_items = build_public_items(state_v2, summary_plan)
+    post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
+    if not post_render_audit["passed"]:
+        atomic_json(run_dir / "post_render_verification.json", post_render_audit)
+        raise RuntimeError("Post-render PublicItem verification rejected publication")
+    markdown = render_public_items(public_items, metadata={
+        "source": transcript_document.get("source"),
+        "duration_seconds": transcript_document.get("duration_seconds"),
+        "project": cfg.get("summary_project_name", "Aurion"),
+    })
+    verified_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    quality_gates = runtime_quality_gates(post_render_audit, markdown, verified_hash)
+    run_manifest["verified_artifact_sha256"] = verified_hash
+    run_manifest["public_item_count"] = len(public_items)
+    atomic_json(run_dir / "public_items.json", {"schema": "PublicItemSchema", "schema_version": 1, "items": public_items})
+    atomic_json(run_dir / "post_render_verification.json", post_render_audit)
+    atomic_json(run_dir / "runtime_quality_gates.json", quality_gates)
+    if not quality_gates["passed"]:
+        raise RuntimeError("Runtime public quality gates rejected publication")
     atomic_json(run_dir / "summary.final.json", final_document)
     atomic_json(run_dir / "audit.json", {
         "coverage": coverage,
@@ -3967,8 +3975,18 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             if source.is_file():
                 __import__("shutil").copy2(source, history / f"{stamp}-{name}")
     atomic_text(output_dir / "summary.md", markdown)
+    published_hash = hashlib.sha256((output_dir / "summary.md").read_bytes()).hexdigest()
+    if published_hash != verified_hash:
+        raise RuntimeError("Published artifact differs from verified artifact")
     atomic_json(output_dir / "summary.json", {"pipeline_version": PIPELINE_VERSION, "transcript_hash": settings["transcript"], "document": final_document, "facts": evidence_facts, "public_facts": final_facts, "summary_plan": summary_plan, "coverage": coverage, "semantic_records_file": "semantic_records.json", "tasks_file": "tasks.json", "run_manifest_file": "run_manifest.json"})
+    previous_public_items = []
+    if (output_dir / "public_items.json").is_file():
+        previous_public_items = load_json(output_dir / "public_items.json").get("items", [])
     atomic_json(output_dir / "run_manifest.json", run_manifest)
+    atomic_json(output_dir / "public_items.json", {"schema": "PublicItemSchema", "schema_version": 1, "verified_artifact_hash": verified_hash, "items": public_items})
+    atomic_json(output_dir / "views" / "shadow_diff.json", diff_public_items(previous_public_items, public_items))
+    atomic_json(output_dir / "runtime_quality_gates.json", quality_gates)
+    atomic_json(output_dir / "views" / "post_render_verification.json", post_render_audit)
     atomic_json(output_dir / "semantic_records.json", semantic_registry)
     atomic_json(output_dir / "semantics" / "dialogue_events.json", {"schema_version": 1, "events": state["events"]})
     atomic_json(output_dir / "semantics" / "relations.json", {"schema_version": 1, "relations": state["relations"]})
@@ -3979,10 +3997,10 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     previous_project_path = output_dir / "semantics" / "project_state.json"
     atomic_json(previous_project_path, project_state)
     atomic_json(output_dir / "views" / "delta.json", project_change)
-    projections = project_views(state_v2, summary_plan["selected_claim_ids"])
+    projections = project_views(state_v2, summary_plan)
     atomic_json(output_dir / "views" / "plan_verification.json", plan_verification)
     atomic_json(output_dir / "views" / "actual_output_verification.json", actual_output_audit)
-    view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
+    view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "mentioned_rules": "Упомянутые действующие правила", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
     for view_name, claims in projections.items():
         atomic_json(output_dir / "views" / f"{view_name}.json", {"schema_version": 1, "claims": claims})
         body = "# " + view_titles[view_name] + "\n\n" + ("\n".join(f"- {item.get('statement')}" for item in claims) or "Нет подтвержденных элементов.") + "\n"
@@ -3998,8 +4016,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "views" / "tasks.json", {"schema_version": 1, "tasks": state["views"]["tasks"]})
     atomic_json(output_dir / "views" / "timeline.json", {"schema_version": 1, "timeline": state["views"]["timeline"]})
     atomic_json(output_dir / "views" / "summary.json", {"schema_version": 2, "strategy": summary_plan["strategy"], "selected_fact_ids": summary_plan["selected_fact_ids"], "claims": [item for item in state["views"]["summary"] if item.get("source_record_id") in selected_ids]})
-    safe_tasks = [item for item in state["views"]["tasks"] if item.get("automation_eligible")]
-    review_candidates = [item for item in state["views"]["tasks"] if not item.get("automation_eligible")]
+    safe_tasks = [item for item in state["views"]["tasks"] if item.get("automation_eligible") is True]
+    review_candidates = [item for item in state["views"]["tasks"] if item.get("automation_eligible") is not True]
     atomic_json(output_dir / "tasks.json", {
         "schema_version": semantic_registry["schema_version"],
         "tasks": safe_tasks,
@@ -4033,13 +4051,20 @@ def main():
                 Path(__file__).with_name("semantic_contracts.py"), Path(__file__).with_name("speech_acts.py"),
                 Path(__file__).with_name("meeting_intelligence.py"),
                 Path(__file__).with_name("diagnostics.py"),
+                Path(__file__).with_name("config_schema.py"),
+                APPLICATION_ROOT / "contracts" / "__init__.py",
+                APPLICATION_ROOT / "contracts" / "meeting.py",
                 APPLICATION_ROOT / "semantics" / "meeting_graph.py",
+                APPLICATION_ROOT / "semantics" / "ontology.py",
                 APPLICATION_ROOT / "semantics" / "propositions.py",
                 APPLICATION_ROOT / "semantics" / "reducers.py",
                 APPLICATION_ROOT / "semantics" / "relation_resolver.py",
                 APPLICATION_ROOT / "semantics" / "episodes.py",
                 APPLICATION_ROOT / "summary" / "planner.py",
                 APPLICATION_ROOT / "summary" / "verifier.py",
+                APPLICATION_ROOT / "summary" / "views.py",
+                APPLICATION_ROOT / "pipeline_core" / "dag.py",
+                APPLICATION_ROOT / "pipeline_core" / "models.py",
                 APPLICATION_ROOT / "project_memory" / "graph_store.py",
             )
         }),

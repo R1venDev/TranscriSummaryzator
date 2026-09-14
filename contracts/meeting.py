@@ -133,6 +133,18 @@ class DecisionState(StrictModel):
     status: DecisionStatus = DecisionStatus.CANDIDATE
 
 
+class PublicItemContract(StrictModel):
+    public_id: str
+    section: Literal["overview", "decisions", "rules", "tasks", "questions", "experiments", "minutes", "contributions"]
+    text: str = Field(min_length=1)
+    claim_ids: list[str] = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+    content_kind: str
+    social_state: str
+    lifecycle: ClaimLifecycle = ClaimLifecycle.ACTIVE
+    relation_ids: list[str] = Field(default_factory=list)
+
+
 class SentencePlan(StrictModel):
     sentence_id: str
     episode_id: Optional[str] = None

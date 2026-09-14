@@ -11,7 +11,8 @@ SCHEMA_VERSIONS = {
     "SummaryPlanSchema": 3,
     "PropositionSchema": 3,
     "DialogueActSchema": 2,
-    "MeetingGraphSchema": 3,
+    "MeetingGraphSchema": 4,
+    "PublicItemSchema": 1,
     "ProjectGraphSchema": 2,
     "VerificationReportSchema": 3,
 }

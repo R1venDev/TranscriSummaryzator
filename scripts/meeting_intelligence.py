@@ -24,8 +24,7 @@ NOISE_RE = re.compile(
     r"ладно|да|нет|ок(?:ей)?|спасибо))*[\s.,!?…]*$"
 )
 BANTER_RE = re.compile(
-    r"(?iu)(?:когда\s+dow\s+jones\s+появ|начал[оа]?\s+(?:xx|xvii|\d{1,2})\s+век|"
-    r"я\s+bitcoin\s+\d{4}\s+года\s+тебе\s+дам)"
+    r"(?iu)(?:когда\s+dow\s+jones\s+появ|начал[оа]?\s+(?:xx|xvii|\d{1,2})\s+век)"
 )
 FALSIFIABLE_RE = re.compile(
     r"(?iu)(?:если|может|должн|вероят|гипотез|предполож|провер|тест|сравн|"
@@ -296,12 +295,13 @@ def consolidate_tasks(tasks):
             anchor = group[0]
             anchor_text = " ".join(str(anchor.get(key) or "") for key in ("title", "description", "details"))
             same_owner = owners and owners == tuple(sorted(anchor.get("assignees", [])))
-            close = abs(float(task.get("start", 0)) - float(anchor.get("start", 0))) <= 600
-            related = _overlap(text, anchor_text) >= 0.22 or (
-                ACTIONABLE_RE.search(text) and ACTIONABLE_RE.search(anchor_text)
-                and bool(_tokens(text) & _tokens(anchor_text))
+            explicit = bool(set(task.get("revises_task_ids", []) + task.get("supersedes_task_ids", [])) & {x.get("task_id") for x in group})
+            same_object = bool(task.get("object") and task.get("object") == anchor.get("object"))
+            same_action = bool(task.get("action") and task.get("action") == anchor.get("action"))
+            related = explicit or (same_owner and same_action and same_object) or (
+                same_owner and _overlap(text, anchor_text) >= 0.55
             )
-            if same_owner and close and related:
+            if related:
                 matched = group
                 break
         if matched is None:
@@ -313,7 +313,10 @@ def consolidate_tasks(tasks):
     for index, group in enumerate(groups, 1):
         # Prefer the later, more concrete formulation (often the commitment that
         # refines an earlier general request).
-        source = max(group, key=lambda item: (len(_tokens(" ".join(str(item.get(k) or "") for k in ("title", "description", "details")))), float(item.get("start", 0))))
+        explicitly_revised = {value for item in group for value in item.get("revises_task_ids", []) + item.get("supersedes_task_ids", [])}
+        active = [item for item in group if item.get("task_id") not in explicitly_revised] or group
+        confirmed = [item for item in active if item.get("task_status") in {"self_committed", "accepted", "assigned", "in_progress", "blocked", "completed"} or item.get("assignment_status") == "confirmed"] or active
+        source = max(confirmed, key=lambda item: (float(item.get("start", 0)), len(_tokens(" ".join(str(item.get(k) or "") for k in ("title", "description", "details"))))))
         merged = dict(source)
         merged["task_id"] = f"TK{index:05d}"
         merged["source_record_ids"] = list(dict.fromkeys(item.get("source_record_id") for item in group if item.get("source_record_id")))
@@ -322,6 +325,9 @@ def consolidate_tasks(tasks):
         merged["confirmation_evidence_ids"] = list(dict.fromkeys(value for item in group for value in item.get("confirmation_evidence_ids", [])))
         merged["context_fact_ids"] = list(dict.fromkeys(value for item in group for value in (item.get("context_fact_ids", []) or [item.get("source_record_id")]) if value))
         merged["consolidation"] = {"source_count": len(group), "method": "owner-time-semantic"}
+        merged["current_scope"] = source.get("scope") or source.get("time_scope") or source.get("due")
+        merged["superseded_scopes"] = list(dict.fromkeys(str(item.get("scope") or item.get("time_scope") or item.get("due")) for item in group if item is not source and (item.get("scope") or item.get("time_scope") or item.get("due"))))
+        merged["scope_state"] = "active"
         result.append(merged)
     return result
 

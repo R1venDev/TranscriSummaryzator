@@ -27,10 +27,10 @@ class V21ArchitectureTests(unittest.TestCase):
         a = record("F1", "trading_rule", "На M15 подтверждаем BOS", subject="entry", predicate="requires", object="BOS", scope={"timeframe": "M15"}, conditions=[{"antecedent": "M15 confirmed"}])
         b = {**a, "record_id": "F2", "statement": "Слом подтверждается пятнадцатиминутной структурой"}
         self.assertEqual(proposition_from_record(a)["proposition_id"], proposition_from_record(b)["proposition_id"])
-        self.assertEqual(proposition_from_record(a)["content_kind"], "rule")
+        self.assertEqual(proposition_from_record(a)["content_kind"], "trading_rule")
 
     def test_meeting_graph_is_authoritative_and_decision_requires_acceptance(self):
-        records = [record("F1", "proposal", "Предлагаю использовать M15", "propose"), record("F2", "observation", "Да", "accept")]
+        records = [record("F1", "proposal", "Предлагаю использовать M15", "propose"), {**record("F2", "observation", "Да", "accept"), "attributed_speakers": ["@B"]}]
         graph = build_meeting_graph(records, {"audio_sha256": "abc"})
         self.assertTrue(graph["authoritative"]); self.assertEqual(graph["schema"], "MeetingGraphSchema")
         self.assertTrue(any(x["type"] == "accepts" for x in graph["relations"]))
@@ -75,7 +75,7 @@ class V21ArchitectureTests(unittest.TestCase):
         contract = {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [], "allowed_relation_markers": [], "polarity": ["positive"], "modality": ["certain"], "conditions": [], "allowed_speakers": ["@Yachoy / @HoTTaBbicH"], "allowed_assignees": []}
         claim = {"claim_id": "C1"}
         navigation = verify_generated_items([{"text": "Обсуждение торгового подхода", "claim_ids": ["C1"], "_semantic_role": "overview"}], [contract], [claim])
-        self.assertTrue(navigation["passed"]); self.assertEqual(navigation["audits"][0]["status"], "NAVIGATION")
+        self.assertTrue(navigation["passed"]); self.assertEqual(navigation["audits"][0]["status"], "SUPPORTED")
         statement = verify_generated_items([{"text": "@Yachoy / @HoTTaBbicH должен проверить подход.", "claim_ids": ["C1"]}], [contract], [claim])
         self.assertTrue(statement["passed"])
 

@@ -39,18 +39,40 @@ class ClaimKind(StrEnum):
 
 
 class ContentKind(StrEnum):
+    """Lossless content axis. Values intentionally mirror ClaimKind.
+
+    Speech act, epistemic modality and social state are independent fields; a
+    proposal therefore remains a proposal and never becomes a design/decision
+    merely because a downstream consumer needs a coarser view.
+    """
     OBSERVATION = "observation"
-    RULE = "rule"
-    METRIC = "metric"
-    EXPERIMENT = "experiment"
-    DESIGN = "design"
+    CURRENT_STATE = "current_state"
     PROBLEM = "problem"
-    RESOURCE = "resource"
-    SCHEDULE = "schedule"
-    QUESTION_CONTENT = "question_content"
+    DEFINITION = "definition"
+    METRIC = "metric"
+    EXPERIMENTAL_RESULT = "experimental_result"
+    HYPOTHESIS = "hypothesis"
+    PROPOSAL = "proposal"
+    ALTERNATIVE = "alternative"
+    DECISION = "decision"
     ACTION = "action"
-    STATE = "state"
-    OTHER = "other"
+    GOAL = "goal"
+    TARGET = "target"
+    CONSTRAINT = "constraint"
+    ASSUMPTION = "assumption"
+    TRADING_RULE = "trading_rule"
+    SYSTEM_RULE = "system_rule"
+    DESIGN_CHOICE = "design_choice"
+    DATASET = "dataset"
+    RESOURCE = "resource"
+    RISK = "risk"
+    DEPENDENCY = "dependency"
+    BLOCKER = "blocker"
+    FOLLOW_UP = "follow_up"
+    CORRECTION = "correction"
+    REJECTED_OPTION = "rejected_option"
+    SCHEDULE = "schedule"
+    QUESTION = "question"
 
 
 class SpeechAct(StrEnum):
@@ -129,6 +151,7 @@ class TaskStatus(StrEnum):
     ASSIGNED = "assigned"
     TENTATIVE_SELF_COMMITMENT = "tentative_self_commitment"
     EXPLICIT_SELF_COMMITMENT = "explicit_self_commitment"
+    SELF_COMMITTED = "self_committed"
     ACCEPTED = "accepted"
     IN_PROGRESS = "in_progress"
     BLOCKED = "blocked"
@@ -165,3 +188,10 @@ CONTENT_KINDS = tuple(item.value for item in ContentKind)
 SPEECH_ACTS = tuple(item.value for item in SpeechAct)
 EPISTEMIC_MODALITIES = tuple(item.value for item in EpistemicModality)
 SOCIAL_STATES = tuple(item.value for item in SocialState)
+
+
+def require_content_kind(value):
+    """Reject schema drift instead of silently weakening an unknown kind."""
+    if value not in CONTENT_KINDS:
+        raise ValueError(f"unknown content kind: {value!r}")
+    return value

@@ -4,14 +4,14 @@ import math, re
 from semantics.graph import cross_episode_allowed
 from summary.verifier import relation_markers
 
-TECHNICAL = {"rule", "trading_rule", "system_rule", "experiment", "experimental_result", "metric", "design", "design_choice"}
+TECHNICAL = {"trading_rule", "system_rule", "definition", "experimental_result", "metric", "design_choice", "constraint", "dependency"}
 VIEW_KINDS = {
-    "executive": {"decision", "state", "problem", "blocker", "action", "question", "question_content", "rule", "design"},
-    "technical": TECHNICAL, "tasks": {"action"},
-    "experiments": {"experiment", "hypothesis", "experimental_result", "metric"},
-    "questions": {"question", "question_content", "blocker"}, "minutes": set(),
+    "executive": {"decision", "current_state", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
+    "technical": TECHNICAL, "tasks": {"action", "follow_up"},
+    "experiments": {"hypothesis", "experimental_result", "metric"},
+    "questions": {"question", "blocker", "schedule"}, "minutes": set(),
 }
-VIEW_BOOST = {"executive": {"decision": 5, "state": 5, "problem": 4, "blocker": 5, "action": 4}, "technical": {x: 5 for x in TECHNICAL}, "tasks": {"action": 8}, "experiments": {"experiment": 7, "hypothesis": 7, "experimental_result": 7}, "questions": {"question": 8, "question_content": 8}, "minutes": {}}
+VIEW_BOOST = {"executive": {"decision": 5, "current_state": 5, "problem": 4, "blocker": 5, "action": 4}, "technical": {x: 5 for x in TECHNICAL}, "tasks": {"action": 8, "follow_up": 8}, "experiments": {"hypothesis": 7, "experimental_result": 7}, "questions": {"question": 8, "schedule": 6}, "minutes": {}}
 
 
 def _kind(claim): return claim.get("content_kind") or claim.get("kind")
@@ -20,10 +20,10 @@ def _tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(
 
 def _mandatory(claim):
     kind = _kind(claim)
-    if kind in {"decision", "state"}: return claim.get("decision_status") == "accepted"
-    if kind == "action": return claim.get("task_status") in {"accepted", "self_committed", "explicit_self_commitment", "in_progress", "blocked", "completed"}
-    if kind in {"question", "question_content"}: return claim.get("question_status") not in {"answered", "rhetorical", "superseded"}
-    return kind in {"blocker", "correction", "experimental_result", "metric"}
+    if kind == "decision": return claim.get("decision_status") == "accepted"
+    if kind in {"action", "follow_up"}: return claim.get("task_status") in {"accepted", "self_committed", "explicit_self_commitment", "in_progress", "blocked", "completed"}
+    if kind == "question": return claim.get("question_status") not in {"answered", "rhetorical", "superseded"}
+    return kind in {"blocker", "correction", "experimental_result"}
 
 
 def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes"):
@@ -31,7 +31,9 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes")
     minutes = max([float(x.get("end", x.get("start", 0))) for x in active] or [0]) / 60
     threads = len({x.get("thread_id") for x in active if x.get("thread_id")}) or len(episodes)
     base = math.ceil(math.sqrt(max(1, minutes)) + 1.5 * threads + sum(_mandatory(x) for x in active) + len({_kind(x) for x in active}))
-    return max(minimum, min(maximum, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 1.35}.get(view, 1))))
+    configured = {"executive": (5, 7), "technical": (6, 16), "tasks": (3, 120), "experiments": (3, 12), "questions": (3, 10), "minutes": (8, 16)}
+    low, high = configured.get(view, (minimum, maximum))
+    return max(low, min(high, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 1.35}.get(view, 1))))
 
 
 def _utility(claim, score_fn, view):
@@ -69,18 +71,22 @@ def _units(selected, claims, relations):
 
 def _sentence(index, unit, by_id):
     items = [by_id[x] for x in unit["claim_ids"]]
-    return {"sentence_id": f"S{index:05d}", "summary_unit_id": unit["unit_id"], "episode_id": items[0].get("episode_id"), "claim_ids": unit["claim_ids"], "relation_ids": unit["relation_ids"], "intent": unit["role"], "allowed_numbers": [n for x in items for n in re.findall(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?", x.get("statement", ""))], "allowed_quantities": [q for x in items for q in x.get("quantities", [])], "allowed_entities": [e.get("entity_id") for x in items for e in x.get("entities", []) if isinstance(e, dict)], "allowed_relation_markers": sorted(set().union(*(relation_markers(x.get("statement")) for x in items))), "allowed_speakers": sorted({s for x in items for s in x.get("speaker_refs", [])}), "allowed_assignees": sorted({x.get("assignee") for x in items if x.get("assignee")}), "polarity": [x.get("polarity") for x in items], "modality": [x.get("modality") for x in items], "conditions": [c for x in items for c in x.get("conditions", [])], "time_scope": [x.get("time_scope") for x in items if x.get("time_scope")], "decision_state": [x.get("decision_status") for x in items if x.get("decision_status")], "task_state": [x.get("task_status") for x in items if x.get("task_status")], "question_slots": [x.get("question_slots") for x in items if x.get("question_slots")], "forbidden_inferences": ["modality_upgrade", "condition_drop", "new_assignee", "new_quantity_binding", "unsupported_causality", "superseded_claim"], "max_sentences": max(1, len(items))}
+    sources = [str(x.get("statement", "")) + " " + str(x.get("time_scope") or "") for x in items]
+    return {"sentence_id": f"S{index:05d}", "summary_unit_id": unit["unit_id"], "episode_id": items[0].get("episode_id"), "claim_ids": unit["claim_ids"], "relation_ids": unit["relation_ids"], "intent": unit["role"], "allowed_numbers": [n for source in sources for n in re.findall(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?", source)], "allowed_quantities": [q for x in items for q in x.get("quantities", [])], "allowed_entities": [e.get("entity_id") for x in items for e in x.get("entities", []) if isinstance(e, dict)], "allowed_relation_markers": sorted(set().union(*(relation_markers(x.get("statement")) for x in items))), "allowed_speakers": sorted({s for x in items for s in x.get("speaker_refs", [])}), "allowed_assignees": sorted({x.get("assignee") for x in items if x.get("assignee")}), "polarity": [x.get("polarity") for x in items], "modality": [x.get("modality") for x in items], "conditions": [c for x in items for c in x.get("conditions", [])], "time_scope": [x.get("time_scope") for x in items if x.get("time_scope")], "decision_state": [x.get("decision_status") for x in items if x.get("decision_status")], "task_state": [x.get("task_status") for x in items if x.get("task_status")], "question_slots": [x.get("question_slots") for x in items if x.get("question_slots")], "forbidden_inferences": ["modality_upgrade", "condition_drop", "new_assignee", "new_quantity_binding", "unsupported_causality", "superseded_claim"], "max_sentences": max(1, len(items))}
 
 
 def plan(claims, episodes, relations, score_fn, max_units=None):
     view_plans, union = {}, {}
+    by_id = {x["claim_id"]: x for x in claims}
     for view in VIEW_KINDS:
         budget = max_units or adaptive_budget(claims, episodes, view=view)
         selected = _select(claims, score_fn, view, budget)
-        view_plans[view] = {"objective": view, "budget": budget, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": _units(selected, claims, relations)}
+        view_units = _units(selected, claims, relations)
+        view_plans[view] = {"objective": view, "budget": budget, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)]}
         if view in {"executive", "minutes"}: union.update({x["claim_id"]: x for x in selected})
     ordered = sorted(union.values(), key=lambda x: float(x.get("start", 0)))
-    units, by_id = _units(ordered, claims, relations), {x["claim_id"]: x for x in claims}
+    units = _units(ordered, claims, relations)
     sentences = [_sentence(i, unit, by_id) for i, unit in enumerate(units, 1)]
     assert all(cross_episode_allowed(x["claim_ids"], x["relation_ids"], claims, relations) for x in sentences)
-    return {"schema": "SummaryPlanSchema", "schema_version": 3, "strategy": "purpose-specific-subgraph-utility-v3", "adaptive_budget": view_plans["minutes"]["budget"], "selected_claim_ids": [x["claim_id"] for x in ordered], "channels": {"mandatory": [x["claim_id"] for x in ordered if _mandatory(x)], "balanced_core": [x["claim_id"] for x in ordered if not _mandatory(x)], "optional_detail": []}, "episode_coverage": sorted({x.get("episode_id") for x in ordered if x.get("episode_id")}), "summary_units": units, "sentence_plans": sentences, "paragraph_plans": [{"paragraph_id": f"P{i:02d}", **u} for i, u in enumerate(units, 1)], "view_plans": view_plans}
+    public_sentence_plans = [sentence for view in view_plans.values() for sentence in view["sentence_plans"]]
+    return {"schema": "SummaryPlanSchema", "schema_version": 3, "strategy": "purpose-specific-subgraph-utility-v3", "adaptive_budget": view_plans["minutes"]["budget"], "selected_claim_ids": [x["claim_id"] for x in ordered], "channels": {"mandatory": [x["claim_id"] for x in ordered if _mandatory(x)], "balanced_core": [x["claim_id"] for x in ordered if not _mandatory(x)], "optional_detail": []}, "episode_coverage": sorted({x.get("episode_id") for x in ordered if x.get("episode_id")}), "summary_units": units, "sentence_plans": sentences, "public_sentence_plans": public_sentence_plans, "paragraph_plans": [{"paragraph_id": f"P{i:02d}", **u} for i, u in enumerate(units, 1)], "view_plans": view_plans}

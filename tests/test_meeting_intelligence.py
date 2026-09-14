@@ -33,7 +33,7 @@ class MeetingIntelligenceTests(unittest.TestCase):
         bundles = question_candidate_bundles(records)
         self.assertEqual(bundles[0]["candidates"][0]["record_id"], "F00002")
 
-    def test_partial_answer_is_not_open(self):
+    def test_partial_answer_preserves_partial_state(self):
         records = [
             record("F00001", "question", "Что делать?", 10),
             record("F00002", "proposal", "Сначала проверить фильтр", 12),
@@ -72,14 +72,23 @@ class MeetingIntelligenceTests(unittest.TestCase):
         )
         self.assertFalse(valid_hypothesis(item))
 
-    def test_tasks_with_same_owner_and_deliverable_are_consolidated(self):
+    def test_tasks_are_not_merged_by_owner_and_one_shared_word(self):
         tasks = [
             {"task_id": "T1", "source_record_id": "F1", "description": "Передать реализацию для симуляции", "assignees": ["@Yachoy"], "start": 10, "evidence_ids": ["U1"]},
             {"task_id": "T2", "source_record_id": "F2", "description": "Подготовить TradingView или EXE для симуляции", "assignees": ["@Yachoy"], "start": 30, "evidence_ids": ["U2"]},
         ]
         consolidated = consolidate_tasks(tasks)
+        self.assertEqual(len(consolidated), 2)
+
+    def test_explicit_late_revision_wins_over_long_old_wording(self):
+        tasks = [
+            {"task_id": "T1", "source_record_id": "F1", "description": "Передать полный набор данных Bitcoin за весь 2021 год для длительной проверки", "assignees": ["@A"], "scope": "2021 год", "start": 10},
+            {"task_id": "T2", "source_record_id": "F2", "description": "Передать Bitcoin за месяц", "assignees": ["@A"], "scope": "месяц", "start": 20, "supersedes_task_ids": ["T1"]},
+        ]
+        consolidated = consolidate_tasks(tasks)
         self.assertEqual(len(consolidated), 1)
-        self.assertEqual(consolidated[0]["source_record_ids"], ["F1", "F2"])
+        self.assertEqual(consolidated[0]["current_scope"], "месяц")
+        self.assertIn("2021 год", consolidated[0]["superseded_scopes"])
 
     def test_summary_plan_is_selective_and_suppresses_acknowledgement(self):
         facts = [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from .ontology import require_content_kind
 
 TOKEN_RE = re.compile(r"(?iu)[a-zа-яё0-9]+")
 NEGATION_RE = re.compile(r"(?iu)\b(?:не|нет|нельзя|без|никогда)\b")
@@ -12,15 +13,13 @@ MODALITY = {
     "tentative": "possible", "possible": "possible", "hypothetical": "hypothetical",
     "uncertain": "unknown", "unknown": "unknown", "probable": "probable",
 }
-CONTENT_MAP = {
-    "trading_rule": "rule", "system_rule": "rule", "definition": "rule",
-    "metric": "metric", "experimental_result": "experiment", "hypothesis": "experiment",
-    "design_choice": "design", "proposal": "design", "alternative": "design",
-    "problem": "problem", "blocker": "problem", "risk": "problem",
-    "resource": "resource", "dataset": "resource", "schedule": "schedule",
-    "question": "question_content", "action": "action", "follow_up": "action",
-    "current_state": "state", "decision": "state",
-}
+CONTENT_MAP = {kind: kind for kind in (
+    "observation", "current_state", "problem", "definition", "metric",
+    "experimental_result", "hypothesis", "proposal", "alternative", "decision",
+    "action", "goal", "target", "constraint", "assumption", "trading_rule",
+    "system_rule", "design_choice", "dataset", "resource", "risk", "dependency",
+    "blocker", "follow_up", "correction", "rejected_option", "schedule", "question",
+)}
 
 
 def _clean(value):
@@ -79,10 +78,15 @@ def proposition_signature(record, registry=None):
 def proposition_from_record(record, registry=None):
     signature, entities, quantities, conditions = proposition_signature(record, registry)
     digest = hashlib.sha256(json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # `kind` is the lossless canonical axis. `content_kind` is accepted only
+    # for records produced by the new schema that omit the legacy field.
+    raw_kind = record.get("kind") or record.get("content_kind")
+    content_kind = require_content_kind(CONTENT_MAP.get(raw_kind, raw_kind))
     return {
         "proposition_id": "P" + digest[:16], "semantic_signature": signature,
         "subject": record.get("subject"), "predicate": record.get("predicate"), "object": record.get("object"),
-        "statement": record.get("statement") or "", "content_kind": CONTENT_MAP.get(record.get("kind"), record.get("content_kind") or "other"),
+        "statement": record.get("statement") or "", "content_kind": content_kind,
+        "claim_kind": record.get("kind") or content_kind,
         "entities": entities, "quantities": quantities, "conditions": conditions,
         "polarity": signature["polarity"], "scope": signature["scope"], "time_scope": signature["time_scope"],
         "evidence_ids": list(record.get("evidence_ids", [])), "source_record_ids": [record.get("record_id")],

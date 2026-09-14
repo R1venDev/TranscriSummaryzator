@@ -1,8 +1,10 @@
 # Архитектура транскрипции и саммари
 
-## v21: canonical MeetingGraph и declarative DAG
+## v22: state-safe publication и PublicItem contract
 
-Единственный источник семантической истины — `MeetingGraphSchema/v3`, который строится напрямую из проверенных `SemanticRecord` и immutable evidence. Старый `MeetingState` больше не участвует в вычислении: для прежних renderer/API он создаётся только как read-only compatibility projection. Полный путь публикации описан 19 стадиями в `pipeline_core/dag.py`, где у каждой стадии объявлены входы, выходы, версии схем, модельный digest, retry/failure/degradation policy и метрики.
+Единственный источник семантической истины — `MeetingGraphSchema/v4`, который строится напрямую из проверенных `SemanticRecord` и immutable evidence. Старый `MeetingState` больше не участвует в вычислении: для прежних renderer/API он создаётся только как read-only compatibility projection. Полный путь публикации описан declarative DAG в `pipeline_core/dag.py`, где у каждой стадии объявлены входы, выходы, версии схем, модельный digest, retry/failure/degradation policy и метрики.
+
+Публикация проходит через `PublicItemSchema/v1`: planner задаёт допустимые claims и relations для каждого view, verifier проверяет уже сформированные public items, и только после этого pure renderer создаёт Markdown. Runtime gate блокирует orphan claims, выход за пределы plan, повышение статуса решения/задачи, неактивные claims и изменения чисел, отрицаний, условий, сроков и исполнителей. Опубликованный файл привязан к проверенному SHA-256; shadow diff сравнивает новый и compatibility пути.
 
 Модель смысла разделяет стабильную `Proposition` и ситуативный `DialogueEvent`. Content kind, speech act, epistemic modality, social state и lifecycle являются независимыми осями. Условия, количества и сущности структурированы; `EntityRegistry` объединяет алиасы. Решения, задачи и вопросы вычисляются отдельными state machines. Вопрос считается закрытым только после slot-level entailment, отдельно от широкого candidate retrieval. Relation resolver поддерживает явные ответы/принятия, короткие coreference-реплики, corrections, supersession, conditions, causal links и conflict sets.
 
