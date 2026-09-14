@@ -79,6 +79,13 @@ class V21ArchitectureTests(unittest.TestCase):
         statement = verify_generated_items([{"text": "@Yachoy / @HoTTaBbicH должен проверить подход.", "claim_ids": ["C1"]}], [contract], [claim])
         self.assertTrue(statement["passed"])
 
+        source_backed = verify_generated_items(
+            [{"text": "@Yachoy / @HoTTaBbicH должен разметить данные.", "claim_ids": ["C1"]}],
+            [{**contract, "allowed_speakers": ["@Misha"]}],
+            [{"claim_id": "C1", "statement": "@Yachoy / @HoTTaBbicH должен разметить данные."}],
+        )
+        self.assertTrue(source_backed["passed"])
+
     def test_project_graph_is_persistent_lineage_not_literal_document(self):
         meeting = build_meeting_graph([record("F1", "trading_rule", "Используем M15", subject="entry", predicate="requires", object="BOS")], meeting_id="M1")
         with tempfile.TemporaryDirectory() as root:
