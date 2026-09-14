@@ -32,9 +32,9 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes")
     minutes = max([float(x.get("end", x.get("start", 0))) for x in active] or [0]) / 60
     threads = len({x.get("thread_id") for x in active if x.get("thread_id")}) or len(episodes)
     base = math.ceil(math.sqrt(max(1, minutes)) + 1.5 * threads + sum(_mandatory(x) for x in active) + len({_kind(x) for x in active}))
-    configured = {"executive": (5, 7), "technical": (6, 16), "tasks": (3, 120), "experiments": (3, 12), "questions": (3, 10), "minutes": (8, 16)}
+    configured = {"executive": (5, 7), "technical": (6, 16), "tasks": (3, 120), "experiments": (3, 12), "questions": (3, 10), "minutes": (16, 32)}
     low, high = configured.get(view, (minimum, maximum))
-    return max(low, min(high, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 1.35}.get(view, 1))))
+    return max(low, min(high, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 2.0}.get(view, 1))))
 
 
 def _utility(claim, score_fn, view):

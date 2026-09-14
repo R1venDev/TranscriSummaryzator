@@ -88,10 +88,10 @@ def build_public_items(meeting_graph, summary_plan):
     overview = []
     executive_claims = selected("executive")
     category_order = (
-        {"current_state", "observation", "experimental_result"},
         {"problem", "blocker", "constraint"},
         {"action", "follow_up", "decision"},
         set(TECHNICAL_KINDS),
+        {"current_state", "observation", "experimental_result"},
     )
     overview_order, overview_seen = [], set()
     for kinds in category_order:
@@ -102,13 +102,17 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in overview_order:
         if claim.get("content_kind") in {"question", "schedule"} or claim.get("risk", {}).get("recognition", 0) >= .65:
             continue
+        if claim.get("risk", {}).get("number", 0) >= .45:
+            continue
+        if re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", claim.get("statement", "")):
+            continue
         if re.search(r"(?iu)^\s*(?:это|так|вот\s+эт\w+|они|он|она)\b", claim.get("statement", "")) and not claim.get("entities"):
             continue
         tokens = set(re.findall(r"(?iu)[a-zа-яё0-9]+", claim.get("statement", "").casefold()))
         if any(len(tokens & old) / max(1, min(len(tokens), len(old))) >= .55 for old in (x[1] for x in overview)):
             continue
         overview.append((claim, tokens))
-        if len(overview) == 5: break
+        if len(overview) == 4: break
     for claim, _ in overview:
         add("overview", claim, text=attributed_text(claim))
     for claim in selected("executive"):
@@ -153,7 +157,12 @@ def build_public_items(meeting_graph, summary_plan):
             state = question_states.get(claim.get("proposition_id"), {})
             missing = [x for x in state.get("missing_slot_labels", []) if x]
             suffix = f" — не уточнено: {', '.join(missing)}" if missing else ""
-            add("questions", claim, claim.get("question_status", "unanswered"), attributed_text(claim) + suffix, relation_ids=state.get("answer_relation_ids", []), extra_evidence=state.get("answer_evidence_ids", []))
+            question_text = attributed_text(claim)
+            speakers = list(claim.get("speaker_refs", []))
+            if len(speakers) == 1 and speakers[0] not in question_text:
+                question_text = re.sub(r"(?iu)^\s*(?:участник\s+)?(?:спрашивает|зада[её]т\s+вопрос)(?:\s+о\s+том)?[, :] *", "", question_text)
+                question_text = f"{speakers[0]} спрашивает: {question_text[:1].lower() + question_text[1:]}"
+            add("questions", claim, claim.get("question_status", "unanswered"), question_text + suffix, relation_ids=state.get("answer_relation_ids", []), extra_evidence=state.get("answer_evidence_ids", []))
     for claim in selected("experiments"):
         if claim.get("content_kind") == "hypothesis" and re.search(r"(?iu)\b(?:нельзя|невозможно|ограничен)\b", claim.get("statement", "")):
             add("technical", claim, "constraint", attributed_text(claim))
@@ -313,7 +322,9 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "state_conflicts": state_conflicts,
         "task_without_deliverable": sum(x.get("section") == "tasks" and not str(x.get("task_state", {}).get("deliverable") or "").strip() for x in items),
         "overview_task_overlap": (len(overview_tokens & task_tokens) / max(1, len(overview_tokens))) if overview_tokens else 0,
-        "section_count_mismatches": sum(item_counts.get(k, 0) != rendered_counts.get(k, 0) for k in set(item_counts) | set(rendered_counts)),
+        # Overview items are intentionally merged into prose paragraphs rather
+        # than rendered one bullet per PublicItem.
+        "section_count_mismatches": sum(item_counts.get(k, 0) != rendered_counts.get(k, 0) for k in (set(item_counts) | set(rendered_counts)) - {"overview"}),
     })
     counters["section_counts"] = item_counts
     counters["rendered_section_counts"] = rendered_counts

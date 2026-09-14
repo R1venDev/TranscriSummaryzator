@@ -163,6 +163,23 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("[00:00:10](#transcript-time=10.125)", rendered)
         self.assertNotIn("F00001", rendered)
 
+    def test_public_renderer_has_prose_overview_timecode_index_and_detailed_chronology(self):
+        base = {"claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "observation", "social_state": "candidate", "lifecycle": "active", "relation_ids": [], "topic_entities": ["Order Block", "Bitcoin"]}
+        items = [
+            dict(base, public_id="PI1", section="overview", text="Обсудили фильтрацию сигналов", start=10),
+            dict(base, public_id="PI2", section="overview", text="Зафиксировали следующий шаг", start=20),
+            dict(base, public_id="PI3", section="minutes", text="Разобрали текущую реализацию", start=10),
+            dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
+        ]
+        rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
+        self.assertIn("Итоги встречи по развитию торговой системы: Order Block, Bitcoin", rendered)
+        overview = rendered.split("## Краткое описание", 1)[1].split("## Таймкоды", 1)[0]
+        self.assertNotIn("\n- ", overview)
+        self.assertNotIn("/result?", overview)
+        self.assertIn("## Таймкоды", rendered)
+        self.assertIn("## Подробная хронология встречи", rendered)
+        self.assertIn("/result?id=8#t-10000", rendered)
+
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
         item = fact()
         document = {

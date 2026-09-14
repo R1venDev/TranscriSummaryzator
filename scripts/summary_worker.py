@@ -2345,7 +2345,10 @@ def render_public_items(items, metadata=None):
     source_text = " ".join(str(x.get("text") or "") for x in items)
     if not topic_entities:
         topic_entities = list(dict.fromkeys(re.findall(r"(?iu)\b(?:Bitcoin|Order Block|Take Profit|SMC|TPO|M15|swing)\b", source_text)))
-    title = "Итоги встречи" + (": " + " и ".join(topic_entities[:2]) if topic_entities else " по ключевым темам")
+    title = (
+        "Итоги встречи по развитию торговой системы: " + ", ".join(topic_entities[:3])
+        if topic_entities else "Итоги встречи по развитию торговой системы и рабочим задачам"
+    )
     lines = [f"# {meeting_date(source)} | {project} — {title}"]
     headings = {
         "overview": "Краткое описание — что изменилось после встречи",
@@ -2353,7 +2356,7 @@ def render_public_items(items, metadata=None):
         "tasks": "Задачи и следующие шаги", "questions": "Открытые вопросы",
         "experiments": "Гипотезы и эксперименты",
         "technical": "Технические выводы и ограничения",
-        "minutes": "Хронология встречи",
+        "minutes": "Подробная хронология встречи",
     }
     prefixes = {"decisions": "D", "rules": "R", "tasks": "T", "questions": "Q", "experiments": "H", "technical": "X"}
     for section in ("overview", "decisions", "rules", "tasks", "questions", "technical", "experiments", "minutes"):
@@ -2361,14 +2364,34 @@ def render_public_items(items, metadata=None):
         if not section_items:
             continue
         lines.extend(["", f"## {headings[section]}", ""])
+        if section == "overview":
+            texts = []
+            for item in section_items:
+                text = canonicalize_people(item["text"])
+                text = re.sub(r"(?iu)^\s*говорящий\s+(@[\w.-]+)\s+", r"\1 ", text)
+                text = re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text)
+                texts.append(terminate_sentence(text))
+            split = min(2, len(texts))
+            lines.append("В центре обсуждения были текущие ограничения и результаты работы торговой системы. " + " ".join(texts[:split]))
+            if texts[split:]:
+                lines.extend(["", "Отдельно участники рассмотрели дополнительные ограничения, технические выводы и следующие шаги. " + " ".join(texts[split:])])
+            timeline = by_section.get("minutes", [])
+            if timeline:
+                limit = min(12, len(timeline))
+                indexes = [round(index * (len(timeline) - 1) / max(1, limit - 1)) for index in range(limit)]
+                lines.extend(["", "## Таймкоды", ""])
+                for item_index in dict.fromkeys(indexes):
+                    item = timeline[item_index]
+                    text = canonicalize_people(item["text"])
+                    stamp = time_link(float(item.get("start", 0)), total_seconds, job_id)
+                    lines.append(f"- {stamp} — {text}")
+            continue
         for index, item in enumerate(section_items, 1):
             text = canonicalize_people(item["text"])
             text = re.sub(r"(?iu)^\s*говорящий\s+(@[\w.-]+)\s+", r"\1 ", text)
             text = re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text)
             stamp = time_link(float(item.get("start", 0)), total_seconds, job_id)
-            if section == "overview":
-                lines.append(f"- {text} {stamp}")
-            elif section == "minutes":
+            if section == "minutes":
                 lines.append(f"- {stamp} — {text}")
             else:
                 prefix = prefixes[section]

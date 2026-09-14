@@ -95,6 +95,12 @@ class CanonicalStateTests(unittest.TestCase):
         p = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
         self.assertFalse(any(x["section"] == "questions" for x in build_public_items(graph, p)))
 
+    def test_open_question_names_its_known_asker(self):
+        graph = build_meeting_graph([rec(1, "question", "Удалось реализовать вход?", "ask", speaker="@Misha", requested_slots=["result"])])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        question = next(x for x in build_public_items(graph, planned) if x["section"] == "questions")
+        self.assertTrue(question["text"].startswith("@Misha спрашивает:"))
+
     def test_hard_budgets_and_chronology_order(self):
         graph = build_meeting_graph([rec(i, "observation", f"Технический вывод номер {i}") for i in range(1, 40)])
         result = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1, max_units=5)
