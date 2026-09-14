@@ -71,6 +71,14 @@ class V21ArchitectureTests(unittest.TestCase):
         verified = verify_generated_items([{"text": "Если рынок открыт, нельзя входить.", "fact_ids": ["F1"], "claim_ids": ["C1"]}], [plan_contract], [claim])
         self.assertTrue(verified["passed"])
 
+    def test_navigation_and_composite_people_are_verified_by_role(self):
+        contract = {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [], "allowed_relation_markers": [], "polarity": ["positive"], "modality": ["certain"], "conditions": [], "allowed_speakers": ["@Yachoy / @HoTTaBbicH"], "allowed_assignees": []}
+        claim = {"claim_id": "C1"}
+        navigation = verify_generated_items([{"text": "Обсуждение торгового подхода", "claim_ids": ["C1"], "_semantic_role": "overview"}], [contract], [claim])
+        self.assertTrue(navigation["passed"]); self.assertEqual(navigation["audits"][0]["status"], "NAVIGATION")
+        statement = verify_generated_items([{"text": "@Yachoy / @HoTTaBbicH должен проверить подход.", "claim_ids": ["C1"]}], [contract], [claim])
+        self.assertTrue(statement["passed"])
+
     def test_project_graph_is_persistent_lineage_not_literal_document(self):
         meeting = build_meeting_graph([record("F1", "trading_rule", "Используем M15", subject="entry", predicate="requires", object="BOS")], meeting_id="M1")
         with tempfile.TemporaryDirectory() as root:

@@ -46,9 +46,10 @@ def audit_realization(text, plan):
         errors.append("modality_upgraded")
     if plan.get("conditions") and not CONDITION_RE.search(text or ""):
         errors.append("condition_not_preserved")
-    allowed_speakers = set(plan.get("allowed_speakers", []))
+    allowed_values = list(plan.get("allowed_speakers", [])) + list(plan.get("allowed_assignees", []))
+    allowed_speakers = set(allowed_values) | set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))
     mentioned = set(re.findall(r"@[\w.-]+", text or ""))
-    if not mentioned.issubset(allowed_speakers | set(plan.get("allowed_assignees", []))):
+    if not mentioned.issubset(allowed_speakers):
         errors.append("speaker_or_assignee_not_preserved")
     return {"passed": not errors, "errors": sorted(set(errors)), "atomic_claims": list(plan.get("claim_ids", [])), "relations": list(plan.get("relation_ids", [])), "status": "SUPPORTED" if not errors else "ABSTAIN"}
 
@@ -63,6 +64,9 @@ def verify_generated_items(items, sentence_plans, claims):
         claim_ids = [x for x in (item.get("claim_ids") or item.get("fact_ids", [])) if x in by_claim]
         plans = [plan_by_claim[x] for x in claim_ids if x in plan_by_claim]
         if not text or not claim_ids or not plans:
+            continue
+        if item.get("_semantic_role") in {"main_topic", "overview"}:
+            audits.append({"text": text, "claim_ids": claim_ids, "passed": True, "errors": [], "atomic_claims": claim_ids, "relations": [], "status": "NAVIGATION", "qa": {"passed": True, "checks": {}}})
             continue
         merged = {"claim_ids": claim_ids, "relation_ids": sorted({r for p in plans for r in p.get("relation_ids", [])}), "allowed_numbers": [n for p in plans for n in p.get("allowed_numbers", [])], "allowed_relation_markers": sorted({r for p in plans for r in p.get("allowed_relation_markers", [])}), "allowed_speakers": sorted({s for p in plans for s in p.get("allowed_speakers", [])}), "allowed_assignees": sorted({s for p in plans for s in p.get("allowed_assignees", [])}), "polarity": [v for p in plans for v in p.get("polarity", [])], "modality": [v for p in plans for v in p.get("modality", [])], "conditions": [v for p in plans for v in p.get("conditions", [])]}
         realization = audit_realization(text, merged)
@@ -87,5 +91,8 @@ def alignment_score(premise, hypothesis):
 def qa_verify(text, plan):
     """Independent slot checks for who/quantity/condition/state questions."""
     assignment_claimed = bool(re.search(r"(?iu)\b(?:поручено|ответственн(?:ый|ая)|должен|владелец)\b", text or ""))
-    checks = {"who": not assignment_claimed or any(x in text for x in plan.get("allowed_assignees", [])), "quantity": not plan.get("allowed_numbers") or set(NUMBER_RE.findall(text)).issubset(set(plan["allowed_numbers"])), "condition": not plan.get("conditions") or bool(CONDITION_RE.search(text)), "decision_state": not plan.get("decision_state") or not ("решено" in text.casefold() and "accepted" not in plan["decision_state"])}
+    allowed_values = list(plan.get("allowed_assignees", [])) + list(plan.get("allowed_speakers", []))
+    allowed_people = set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))
+    mentioned_people = set(re.findall(r"@[\w.-]+", text or ""))
+    checks = {"who": not assignment_claimed or (bool(mentioned_people) and mentioned_people.issubset(allowed_people)), "quantity": not plan.get("allowed_numbers") or set(NUMBER_RE.findall(text)).issubset(set(plan["allowed_numbers"])), "condition": not plan.get("conditions") or bool(CONDITION_RE.search(text)), "decision_state": not plan.get("decision_state") or not ("решено" in text.casefold() and "accepted" not in plan["decision_state"])}
     return {"passed": all(checks.values()), "checks": checks}

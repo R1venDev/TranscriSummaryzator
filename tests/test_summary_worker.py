@@ -55,6 +55,23 @@ class SummaryWorkerTests(unittest.TestCase):
         )
         self.assertTrue(all(batch for batch in batches))
 
+    def test_clustered_chapter_anchors_are_rebalanced(self):
+        facts = []
+        for index in range(168):
+            item = fact(statement=f"Тезис {index}")
+            item.update({"fact_id": f"F{index:05d}", "start": index * 10})
+            facts.append(item)
+        batches = summary.semantic_chapter_batches(facts, [f"F{index:05d}" for index in range(12)])
+        self.assertEqual(len(batches), 12)
+        self.assertLessEqual(max(map(len, batches)), 14)
+        self.assertEqual(sum(map(len, batches)), 168)
+
+    def test_empty_writer_chapter_has_one_deterministic_topic(self):
+        facts = [dict(fact(statement=f"Тезис {index}"), fact_id=f"F{index:05d}", topic="Имбалансы") for index in range(1, 6)]
+        topic = summary.deterministic_chapter(facts, 3)
+        self.assertEqual(topic["title"], "Имбалансы")
+        self.assertEqual(len(topic["items"]), 5)
+
     def test_section_and_detailed_views_are_not_limited_to_executive_facts(self):
         core = fact(statement="Основной результат встречи")
         hypothesis = dict(

@@ -2828,6 +2828,25 @@ def add_missing_to_named_topics(document, facts):
     return result
 
 
+def deterministic_chapter(facts, index):
+    """Create one evidence-safe chapter when the model returns no usable title.
+
+    A failed large tail batch used to fan out into one topic per extractor label,
+    which then tripped the fragmentation gate.  Keep the semantic batch intact
+    and select its most frequent source topic as a deterministic heading.
+    """
+    counts, first_seen = {}, {}
+    for position, fact in enumerate(facts):
+        title = normalize_topic_title(fact.get("topic")) or f"Тематический блок {index}"
+        key = title.casefold()
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, (position, title))
+    key = min(counts, key=lambda value: (-counts[value], first_seen[value][0]))
+    return {"title": first_seen[key][1], "items": [
+        {"text": fact["statement"], "fact_ids": [fact["fact_id"]]} for fact in facts
+    ]}
+
+
 def merge_chapters(chapters):
     merged = empty_document()
     by_title = {}
@@ -3425,7 +3444,21 @@ def semantic_chapter_batches(facts, chapter_fact_ids=None):
             key=lambda index: (abs(position - float(anchors[index].get("start", 0))), index),
         )
         groups[nearest].append(fact)
-    return [group for group in groups if group]
+    groups = [group for group in groups if group]
+    # Planner anchors are semantic hints, not permission to create a 150-fact
+    # tail chapter.  If anchors cluster in one part of the meeting, fall back to
+    # balanced chronological chapters while keeping the requested chapter count.
+    expected = math.ceil(len(ordered) / max(1, len(groups)))
+    if groups and max(map(len, groups)) > max(24, expected * 2):
+        count = len(groups)
+        diagnostic_decision(
+            "chapter_anchor_distribution", "rebalanced",
+            metrics={"facts": len(ordered), "chapters": count, "largest_before": max(map(len, groups)), "expected": expected},
+            thresholds={"largest_allowed": max(24, expected * 2)},
+            reasons=["clustered_planner_anchors"],
+        )
+        groups = [ordered[index * len(ordered) // count:(index + 1) * len(ordered) // count] for index in range(count)]
+    return groups
 
 
 def build_document(client, settings, cfg, run_dir, final_facts, generation_suffix, chapter_fact_ids=None):
@@ -3468,7 +3501,13 @@ def build_document(client, settings, cfg, run_dir, final_facts, generation_suffi
                 if fact["fact_id"] in missing:
                     clean["topics"][0]["items"].append({"text": fact["statement"], "fact_ids": [fact["fact_id"]]})
         elif missing:
-            clean = add_missing_to_named_topics(clean, batch)
+            diagnostic_decision(
+                "chapter_generation", "deterministic_fallback",
+                metrics={"chapter": index, "facts": len(batch), "missing_facts": len(missing)},
+                reasons=["model_returned_no_usable_topic"],
+                refs={"artifact": str(run_dir / f"chapter-{index:03d}{generation_suffix}.json")},
+            )
+            clean["topics"] = [deterministic_chapter(batch, index)]
         clean = ensure_chapter_chronology(clean, batch)
         chapters.append(clean)
         emit(79 + 12 * index / len(batches), "summary_write", f"Документ: часть {index} из {len(batches)} готова")
@@ -3806,20 +3845,24 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         writer_details["chapter_repairs"],
     )
     require_structural_quality(final_quality, final=True)
-    def generated_items(value):
+    def generated_items(value, role="content"):
         result = []
         if isinstance(value, dict):
             if isinstance(value.get("text"), str) and isinstance(value.get("fact_ids"), list):
-                result.append(value)
-            for nested in value.values(): result.extend(generated_items(nested))
+                result.append((value, role))
+            for key, nested in value.items(): result.extend(generated_items(nested, key))
         elif isinstance(value, list):
-            for nested in value: result.extend(generated_items(nested))
+            for nested in value: result.extend(generated_items(nested, role))
         return result
     fact_to_claim = {x.get("source_record_id"): x.get("claim_id") for x in state_v2["claims"]}
-    generated_refs = generated_items(final_document)
-    actual_items = [{**x, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x in generated_refs]
+    generated_pairs = generated_items(final_document)
+    generated_refs = [x for x, _ in generated_pairs]
+    actual_items = [{**x, "_semantic_role": role, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x, role in generated_pairs]
     actual_output_audit = verify_generated_items(actual_items, summary_plan["sentence_plans"], state_v2["claims"])
     for audit in actual_output_audit["audits"]:
+        if audit["status"] == "NAVIGATION":
+            audit["alignment"] = {"entailment": None, "contradiction": 0, "ambiguous": False, "skipped": "non_assertive_navigation"}
+            continue
         premise = " ".join(next((c["statement"] for c in state_v2["claims"] if c["claim_id"] == claim_id), "") for claim_id in audit["claim_ids"])
         audit["alignment"] = alignment_score(premise, audit["text"])
         if audit["alignment"]["contradiction"] > 0: audit["passed"] = False; audit["status"] = "ABSTAIN"
@@ -3830,7 +3873,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         for target, item in zip(generated_refs, actual_items):
             if tuple(item.get("claim_ids", [])) in unsafe:
                 target["text"] = " ".join(claim_by_id[x]["statement"] for x in item["claim_ids"] if x in claim_by_id)
-        actual_items = [{**x, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x in generated_refs]
+        actual_items = [{**x, "_semantic_role": role, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x, role in generated_pairs]
         retried = verify_generated_items(actual_items, summary_plan["sentence_plans"], state_v2["claims"])
         actual_output_audit["fallback"] = "atomic_source_abstention"
         actual_output_audit["fallback_audits"] = retried["audits"]
