@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", default="v3_e2e_rnnt")
     parser.add_argument("--secondary-model")
+    parser.add_argument("--secondary-revision")
     parser.add_argument("--cache", required=True)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
@@ -69,8 +70,13 @@ def main():
                 torch.cuda.empty_cache()
         except ImportError:
             pass
+        if not args.secondary_revision:
+            raise ValueError("--secondary-revision is required for immutable ASR provenance")
+        from huggingface_hub import snapshot_download
         from faster_whisper import WhisperModel
-        secondary = WhisperModel(args.secondary_model, device="cuda" if device != "cpu" else "cpu", compute_type="float16" if device != "cpu" else "int8", download_root=args.cache)
+        repository = args.secondary_model if "/" in args.secondary_model else f"mobiuslabsgmbh/faster-whisper-{args.secondary_model}"
+        snapshot = snapshot_download(repo_id=repository, revision=args.secondary_revision, cache_dir=args.cache, allow_patterns=["config.json", "model.bin", "preprocessor_config.json", "tokenizer.json", "vocabulary.json"])
+        secondary = WhisperModel(snapshot, device="cuda" if device != "cpu" else "cpu", compute_type="float16" if device != "cpu" else "int8")
         for repair in repairs:
             start, end = float(repair["start"]), float(repair["end"])
             clip = audio[int(start * rate):int(end * rate)]
@@ -78,7 +84,7 @@ def main():
                 sf.write(temporary.name, clip, rate, subtype="PCM_16")
                 segments, _ = secondary.transcribe(temporary.name, language="ru", word_timestamps=True, vad_filter=False)
                 alternative = " ".join(segment.text.strip() for segment in segments).strip()
-            repair["alternatives"] = [{"text": alternative, "source": "faster_whisper", "model": args.secondary_model}] if alternative else []
+            repair["alternatives"] = [{"text": alternative, "source": "faster_whisper", "model": args.secondary_model, "revision": args.secondary_revision, "resolved_path": snapshot}] if alternative else []
             repair["status"] = "disputed" if alternative and alternative.casefold() != str(repair.get("text", "")).casefold() else "agreed"
     write_json(args.output, {"schema_version": 2, "repairs": repairs})
 

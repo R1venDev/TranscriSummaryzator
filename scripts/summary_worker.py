@@ -22,7 +22,7 @@ APPLICATION_ROOT = Path(__file__).resolve().parents[1]
 if str(APPLICATION_ROOT) not in sys.path:
     sys.path.insert(0, str(APPLICATION_ROOT))
 
-from quality_schema import adaptive_compute_plan, evidence_uncertainty, meeting_state, normalize_semantic_record, task_records
+from quality_schema import adaptive_compute_plan, evidence_uncertainty, normalize_semantic_record, task_records
 from semantic_contracts import json_schema as contract_schema, validate_response
 from evidence_ledger import risk_level, semantic_risks
 from evidence_repair import reconcile_repairs, repair_requests
@@ -36,15 +36,15 @@ from meeting_intelligence import (
     valid_hypothesis,
 )
 from semantics.ontology import CLAIM_KINDS
-from semantics.core import build_meeting_state
+from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_views
-from summary.verifier import audit_realization, verify_sentence_plan
-from project_memory.project_state import delta as project_delta, update_project_state
+from summary.verifier import alignment_score, audit_realization, verify_generated_items, verify_sentence_plan
+from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 
 
-PIPELINE_VERSION = "meeting-intelligence-v20"
+PIPELINE_VERSION = "meeting-intelligence-v21"
 FACT_TYPES = set(CLAIM_KINDS)
 CRITICAL_TYPES = {"decision", "action", "metric", "schedule", "goal"}
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*[%×xх])?(?!\w)", re.I)
@@ -190,6 +190,7 @@ class Ollama:
     def __init__(self, url="http://127.0.0.1:11434", timeout=7200):
         self.url = url.rstrip("/")
         self.timeout = timeout
+        self._inventory = None
 
     def chat(self, model, system, prompt, *, json_mode=True, json_schema=None, temperature=0.0, num_predict=5000, num_ctx=16384, progress=None):
         payload = {
@@ -251,10 +252,12 @@ class Ollama:
         return set(self.model_inventory())
 
     def model_inventory(self):
+        if self._inventory is not None:
+            return self._inventory
         try:
             with urllib.request.urlopen(self.url + "/api/tags", timeout=30) as response:
                 payload = json.loads(response.read())
-            return {
+            self._inventory = {
                 item.get("name"): {
                     "digest": item.get("digest"),
                     "modified_at": item.get("modified_at"),
@@ -263,8 +266,12 @@ class Ollama:
                 }
                 for item in payload.get("models", []) if item.get("name")
             }
+            return self._inventory
         except Exception:
             return {}
+
+    def model_digest(self, model):
+        return self.model_inventory().get(model, {}).get("digest")
 
 
 def parse_json_response(text):
@@ -517,7 +524,8 @@ def apply_resolution_response(response, focused, targets, facts, rejected_dir):
 
 def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3, progress=None, num_predict=5000, num_ctx=16384, contract=None):
     schema = contract_schema(contract) if contract else None
-    request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx, "schema": schema})
+    digest = client.model_digest(model) if hasattr(client, "model_digest") else "nonproduction-client:" + client.__class__.__name__
+    request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "model_digest": digest, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx, "schema": schema})
     run_root = next((parent for parent in cache_path.parents if parent.name.startswith("summary-state-")), None)
     global_cache = (run_root.parent / "_global_llm_cache" / request_key[:2] / f"{request_key}.json") if run_root else None
     for candidate, reason in ((cache_path, "run_cache"), (global_cache, "global_content_addressed")):
@@ -605,7 +613,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     manifest = directory / "manifest.json"
     output = directory / "repairs.json"
-    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "secondary_model": cfg.get("summary_independent_asr_model") if cfg.get("summary_independent_asr_enabled", True) else None, "audio_size": audio.stat().st_size})
+    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "secondary_model": cfg.get("summary_independent_asr_model") if cfg.get("summary_independent_asr_enabled", True) else None, "secondary_revision": cfg.get("summary_independent_asr_revision") if cfg.get("summary_independent_asr_enabled", True) else None, "audio_size": audio.stat().st_size})
     if output.is_file():
         cached = load_json(output)
         if cached.get("request_key") == request_key:
@@ -625,6 +633,7 @@ def run_evidence_repair(facts, cache_root, cfg):
     ]
     if cfg.get("summary_independent_asr_enabled", True):
         command.extend(["--secondary-model", str(cfg.get("summary_independent_asr_model", "large-v3-turbo"))])
+        command.extend(["--secondary-revision", str(cfg["summary_independent_asr_revision"])])
     environment = evidence_repair_environment(application_root)
     completed = subprocess.run(command, text=True, capture_output=True, env=environment)
     if completed.returncode:
@@ -2195,7 +2204,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
 
     title = canonicalize_people(concise_title(document))
     project = normalize_space(metadata.get("project")) or "Aurion"
-    output = [f'# {meeting_date(metadata.get("source"))} | {project} — {title}', "", "## Краткое описание", ""]
+    output = [f'# {meeting_date(metadata.get("source"))} | {project} — {title}', "", "## Краткое описание — что изменилось после встречи", ""]
     overview = compact_overview(document, fact_map, total_seconds)
     if overview:
         for index, item in enumerate(overview):
@@ -2204,10 +2213,6 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
             output.append(canonicalize_people(item))
     else:
         output.append("Содержательных тезисов для краткого описания не обнаружено.")
-
-    output.extend(["", "## Участники", ""])
-    participants = participant_lines(section_facts)
-    output.extend(participants or ["- Участники не определены."])
 
     output.extend(["", "## Таймкоды", ""])
     output.append(f"- {time_link(0, total_seconds)} — начало встречи: {title}")
@@ -2224,10 +2229,15 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         output.append(f"- {time_link(total_seconds, total_seconds)} — завершение встречи")
 
     decisions = document.get("decisions", [])
-    if decisions:
-        output.extend(["", "## Решения", ""])
+    rules = [x for x in section_facts if x.get("type") in {"trading_rule", "system_rule", "design_choice"}]
+    if decisions or rules:
+        output.extend(["", "## Принятые решения и действующие правила", ""])
         for index, item in enumerate(decisions, 1):
             output.append(f"- **D-{index:02d}.** {line(item)}")
+        for index, fact in enumerate(rules, 1):
+            condition = "; ".join(str(x.get("text") or x.get("antecedent") or x) for x in fact.get("conditions", []))
+            scope = f" Условие: {canonicalize_people(condition)}." if condition else ""
+            output.append(f'- **R-{index:02d}.** {canonicalize_people(clean_publication_statement(fact))}{scope} {time_link(navigation_start(fact), total_seconds)}')
 
     state_views = meeting_state_document.get("views", {})
     task_source = state_views.get("tasks") if "tasks" in state_views else semantic_registry.get("tasks", [])
@@ -2446,7 +2456,7 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
         # Неуверенные фрагменты сохраняются в summary_audit.json, но не засоряют
         # пользовательское саммари техническими сообщениями без содержания.
 
-    output.extend(["", "## Подробное описание встречи", ""])
+    output.extend(["", "## Подробное описание встречи — тематический протокол", ""])
     detailed = detailed_chronology_points(detailed_facts, total_seconds)
     if detailed:
         for selected in detailed:
@@ -2459,6 +2469,9 @@ def render_markdown(document, facts, coverage, metadata=None, semantic_registry=
     else:
         output.append("Подробное описание не сформировано: содержательных хронологических блоков не обнаружено.")
 
+    output.extend(["", "## Приложение", "", "### Участники", ""])
+    participants = participant_lines(section_facts)
+    output.extend(participants or ["- Участники не определены."])
     return "\n".join(output).strip() + "\n"
 
 
@@ -3674,14 +3687,14 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     semantic_counts = semantic_metrics(semantic_registry, final_facts)
     source_manifest = load_json(output_dir / "source.manifest.json") if (output_dir / "source.manifest.json").is_file() else {}
     run_manifest = build_run_manifest(settings, cfg, source_manifest)
-    state = meeting_state(semantic_registry.get("records", []), provenance={"audio_sha256": source_manifest.get("audio_sha256")})
+    state_v2 = build_meeting_graph(
+        semantic_registry.get("records", []),
+        provenance={"audio_sha256": source_manifest.get("audio_sha256")},
+    )
+    state = compatibility_state(state_v2)
     state["views"]["atomic_tasks"] = list(state["views"].get("tasks", []))
     state["views"]["tasks"] = list(semantic_registry.get("tasks", []))
     atomic_json(run_dir / "meeting_state.json", state)
-    state_v2 = build_meeting_state(
-        state, semantic_registry.get("records", []),
-        provenance={"audio_sha256": source_manifest.get("audio_sha256")},
-    )
     atomic_json(run_dir / "meeting_state.v2.json", state_v2)
     lifecycle_counts = {}
     for item in state.get("events", []):
@@ -3793,6 +3806,38 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         writer_details["chapter_repairs"],
     )
     require_structural_quality(final_quality, final=True)
+    def generated_items(value):
+        result = []
+        if isinstance(value, dict):
+            if isinstance(value.get("text"), str) and isinstance(value.get("fact_ids"), list):
+                result.append(value)
+            for nested in value.values(): result.extend(generated_items(nested))
+        elif isinstance(value, list):
+            for nested in value: result.extend(generated_items(nested))
+        return result
+    fact_to_claim = {x.get("source_record_id"): x.get("claim_id") for x in state_v2["claims"]}
+    generated_refs = generated_items(final_document)
+    actual_items = [{**x, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x in generated_refs]
+    actual_output_audit = verify_generated_items(actual_items, summary_plan["sentence_plans"], state_v2["claims"])
+    for audit in actual_output_audit["audits"]:
+        premise = " ".join(next((c["statement"] for c in state_v2["claims"] if c["claim_id"] == claim_id), "") for claim_id in audit["claim_ids"])
+        audit["alignment"] = alignment_score(premise, audit["text"])
+        if audit["alignment"]["contradiction"] > 0: audit["passed"] = False; audit["status"] = "ABSTAIN"
+    actual_output_audit["passed"] = all(x["passed"] for x in actual_output_audit["audits"])
+    if not actual_output_audit["passed"]:
+        unsafe = {tuple(x["claim_ids"]) for x in actual_output_audit["audits"] if not x["passed"]}
+        claim_by_id = {x["claim_id"]: x for x in state_v2["claims"]}
+        for target, item in zip(generated_refs, actual_items):
+            if tuple(item.get("claim_ids", [])) in unsafe:
+                target["text"] = " ".join(claim_by_id[x]["statement"] for x in item["claim_ids"] if x in claim_by_id)
+        actual_items = [{**x, "claim_ids": [fact_to_claim[f] for f in x.get("fact_ids", []) if f in fact_to_claim]} for x in generated_refs]
+        retried = verify_generated_items(actual_items, summary_plan["sentence_plans"], state_v2["claims"])
+        actual_output_audit["fallback"] = "atomic_source_abstention"
+        actual_output_audit["fallback_audits"] = retried["audits"]
+        actual_output_audit["passed"] = retried["passed"]
+    atomic_json(run_dir / "actual_output_verification.json", actual_output_audit)
+    if not actual_output_audit["passed"]:
+        raise RuntimeError("Actual-output semantic verification rejected generated text")
     coverage = dict(coverage, document=document_coverage)
     question_ids = {
         item.get("source_record_id")
@@ -3885,13 +3930,14 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "semantics" / "relations.json", {"schema_version": 1, "relations": state["relations"]})
     atomic_json(output_dir / "semantics" / "meeting_state.json", state)
     atomic_json(output_dir / "semantics" / "meeting_state.v2.json", state_v2)
+    project_store = ProjectGraphStore(APPLICATION_ROOT / "state" / "projects", cfg.get("summary_project_name", "Aurion"))
+    project_state, project_change = project_store.publish(state_v2)
     previous_project_path = output_dir / "semantics" / "project_state.json"
-    previous_project = load_json(previous_project_path) if previous_project_path.is_file() else None
-    project_state = update_project_state(previous_project, state_v2)
     atomic_json(previous_project_path, project_state)
-    atomic_json(output_dir / "views" / "delta.json", project_delta(previous_project, project_state))
+    atomic_json(output_dir / "views" / "delta.json", project_change)
     projections = project_views(state_v2, summary_plan["selected_claim_ids"])
     atomic_json(output_dir / "views" / "plan_verification.json", plan_verification)
+    atomic_json(output_dir / "views" / "actual_output_verification.json", actual_output_audit)
     view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
     for view_name, claims in projections.items():
         atomic_json(output_dir / "views" / f"{view_name}.json", {"schema_version": 1, "claims": claims})
@@ -3936,13 +3982,21 @@ def main():
         "version": PIPELINE_VERSION,
         "config": {k: v for k, v in cfg.items() if k.startswith("summary_")},
         "worker_hash": stable_hash({
-            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            str(path.relative_to(APPLICATION_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (
                 Path(__file__), Path(__file__).with_name("quality_schema.py"),
                 Path(__file__).with_name("evidence_ledger.py"), Path(__file__).with_name("evidence_repair.py"),
                 Path(__file__).with_name("semantic_contracts.py"), Path(__file__).with_name("speech_acts.py"),
                 Path(__file__).with_name("meeting_intelligence.py"),
                 Path(__file__).with_name("diagnostics.py"),
+                APPLICATION_ROOT / "semantics" / "meeting_graph.py",
+                APPLICATION_ROOT / "semantics" / "propositions.py",
+                APPLICATION_ROOT / "semantics" / "reducers.py",
+                APPLICATION_ROOT / "semantics" / "relation_resolver.py",
+                APPLICATION_ROOT / "semantics" / "episodes.py",
+                APPLICATION_ROOT / "summary" / "planner.py",
+                APPLICATION_ROOT / "summary" / "verifier.py",
+                APPLICATION_ROOT / "project_memory" / "graph_store.py",
             )
         }),
         "transcript": stable_hash(transcript),

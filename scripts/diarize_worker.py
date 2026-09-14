@@ -17,6 +17,9 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--rttm", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--embedding-model", required=True)
+    parser.add_argument("--embedding-revision", required=True)
     parser.add_argument("--cache", required=True)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -26,6 +29,7 @@ def main() -> int:
     args = parser.parse_args()
 
     import torch
+    from huggingface_hub import hf_hub_download, snapshot_download
     from diarizen.pipelines.inference import DiariZenPipeline
 
     device = choose_torch_device(args.device)
@@ -35,9 +39,11 @@ def main() -> int:
     rttm_path.parent.mkdir(parents=True, exist_ok=True)
     session = rttm_path.stem
 
-    pipeline = DiariZenPipeline.from_pretrained(
-        args.model,
-        cache_dir=None,
+    model_root = snapshot_download(repo_id=args.model, revision=args.revision, cache_dir=args.cache)
+    embedding_model = hf_hub_download(repo_id=args.embedding_model, filename="pytorch_model.bin", revision=args.embedding_revision, cache_dir=args.cache)
+    pipeline = DiariZenPipeline(
+        diarizen_hub=Path(model_root).expanduser().absolute(),
+        embedding_model=embedding_model,
         rttm_out_dir=str(rttm_path.parent),
     )
     pipeline.segmentation_batch_size = args.batch_size
@@ -85,6 +91,9 @@ def main() -> int:
         args.output,
         {
             "model": args.model,
+            "revision": args.revision,
+            "embedding_model": args.embedding_model,
+            "embedding_revision": args.embedding_revision,
             "device": device,
             "min_speakers": args.min_speakers,
             "max_speakers": args.max_speakers,

@@ -1605,7 +1605,7 @@ def process_job(job_id):
     final_dir = OUTPUTS / ("{}-{}".format(safe_name(source), job["fingerprint"][:8]))
     publishing = final_dir.with_name(final_dir.name + ".publishing")
     audio_key = stage_cache_key("audio-v1", {"source": content_sha256, "track": cfg["audio_track"], "rate": 16000, "channels": 1})
-    diar_key = stage_cache_key("diarizen-v1", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "batch": cfg["diarization_batch_size"], "min": cfg["diarization_min_speakers"], "max": cfg["diarization_max_speakers"], "exact": job["speaker_count"]})
+    diar_key = stage_cache_key("diarizen-v2", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "embedding_model": cfg["diarization_embedding_model"], "embedding_revision": cfg["diarization_embedding_revision"], "batch": cfg["diarization_batch_size"], "min": cfg["diarization_min_speakers"], "max": cfg["diarization_max_speakers"], "exact": job["speaker_count"]})
     ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
     asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
@@ -1664,7 +1664,10 @@ def process_job(job_id):
             diarization_command = [
                 str(ROOT / ".venv-diarizen" / "bin" / "python"), str(ROOT / "scripts" / "diarize_worker.py"),
                 "--audio", str(audio), "--output", str(diar_json), "--rttm", str(rttm),
-                "--model", cfg["diarization_model"], "--cache", str(ROOT / "work" / "cache" / "huggingface"),
+                "--model", cfg["diarization_model"], "--cache", str(ROOT / "work" / "cache" / "huggingface" / "hub"),
+                "--revision", cfg["diarization_model_revision"],
+                "--embedding-model", cfg["diarization_embedding_model"],
+                "--embedding-revision", cfg["diarization_embedding_revision"],
                 "--device", cfg["diarization_device"],
                 "--batch-size", str(cfg.get("diarization_batch_size", 8)),
                 "--min-speakers", str(cfg.get("diarization_min_speakers", 1)),

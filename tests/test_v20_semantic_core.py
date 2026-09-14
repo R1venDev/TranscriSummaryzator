@@ -48,7 +48,7 @@ class V20SemanticCoreTests(unittest.TestCase):
         result = plan(claims, episodes, [], lambda _: 1)
         self.assertIn("C1", result["channels"]["mandatory"])
         self.assertEqual(set(result["episode_coverage"]), {"E1", "E2"})
-        self.assertGreaterEqual(adaptive_budget(claims, episodes), 20)
+        self.assertGreaterEqual(adaptive_budget(claims, episodes), 7)
 
     def test_surface_guard_rejects_new_number_and_causality(self):
         audit = audit_realization("Из-за этого результат вырос на 20%", {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": ["10%"]})

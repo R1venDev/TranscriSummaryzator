@@ -38,6 +38,50 @@ class ClaimKind(StrEnum):
     QUESTION = "question"
 
 
+class ContentKind(StrEnum):
+    OBSERVATION = "observation"
+    RULE = "rule"
+    METRIC = "metric"
+    EXPERIMENT = "experiment"
+    DESIGN = "design"
+    PROBLEM = "problem"
+    RESOURCE = "resource"
+    SCHEDULE = "schedule"
+    QUESTION_CONTENT = "question_content"
+    ACTION = "action"
+    STATE = "state"
+    OTHER = "other"
+
+
+class SpeechAct(StrEnum):
+    ASSERT = "assert"
+    ASK = "ask"
+    ANSWER = "answer"
+    PROPOSE = "propose"
+    ACCEPT = "accept"
+    REJECT = "reject"
+    COMMIT = "commit"
+    CORRECT = "correct"
+    DECIDE = "decide"
+    DEFER = "defer"
+
+
+class EpistemicModality(StrEnum):
+    CERTAIN = "certain"
+    PROBABLE = "probable"
+    POSSIBLE = "possible"
+    HYPOTHETICAL = "hypothetical"
+    UNKNOWN = "unknown"
+
+
+class SocialState(StrEnum):
+    CANDIDATE = "candidate"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    DEFERRED = "deferred"
+    SUPERSEDED = "superseded"
+
+
 class RelationKind(StrEnum):
     SUPPORTS = "supports"
     CONTRADICTS = "contradicts"
@@ -59,6 +103,16 @@ class RelationKind(StrEnum):
     CREATES = "creates"
     RESULT_OF = "result_of"
     TESTED_BY = "tested_by"
+    EXPLAINS = "explains"
+    CONDITION_FOR = "condition_for"
+    IMPLEMENTS = "implements"
+    TESTS = "tests"
+    BLOCKS = "blocks"
+    ASSIGNED_TO = "assigned_to"
+    RESOLVES = "resolves"
+    REOPENS = "reopens"
+    QUALIFIES = "qualifies"
+    CONFIRMS = "confirms"
 
 
 class ClaimLifecycle(StrEnum):
@@ -107,3 +161,7 @@ class DecisionStatus(StrEnum):
 
 CLAIM_KINDS = tuple(item.value for item in ClaimKind)
 RELATION_KINDS = tuple(item.value for item in RelationKind)
+CONTENT_KINDS = tuple(item.value for item in ContentKind)
+SPEECH_ACTS = tuple(item.value for item in SpeechAct)
+EPISTEMIC_MODALITIES = tuple(item.value for item in EpistemicModality)
+SOCIAL_STATES = tuple(item.value for item in SocialState)

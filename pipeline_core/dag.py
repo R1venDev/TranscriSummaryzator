@@ -12,6 +12,13 @@ class Stage:
     outputs: tuple[str, ...]
     dependencies: tuple[str, ...] = ()
     runner: Callable | None = None
+    input_schema: str = "Any/v1"
+    output_schema: str = "Any/v1"
+    model_digest: str | None = None
+    retry_policy: str = "bounded"
+    failure_policy: str = "fail_closed"
+    degradation_policy: str = "none"
+    metrics: tuple[str, ...] = ()
 
 
 class DAG:
@@ -39,15 +46,27 @@ class DAG:
         return result
 
 
+def _s(name, version, inputs, outputs, dependencies=(), ins="Any/v1", outs="Any/v1", failure="fail_closed", degradation="none", metrics=()):
+    return Stage(name, version, inputs, outputs, dependencies, input_schema=ins, output_schema=outs, failure_policy=failure, degradation_policy=degradation, metrics=metrics)
+
 MEETING_DAG = DAG([
-    Stage("audio", "v1", ("source",), ("canonical_audio",)),
-    Stage("diarization", "v2", ("canonical_audio",), ("speaker_segments",), ("audio",)),
-    Stage("asr", "v2", ("canonical_audio",), ("words", "asr_alternatives"), ("audio",)),
-    Stage("evidence", "v2", ("words", "speaker_segments"), ("evidence_ledger",), ("asr", "diarization")),
-    Stage("claims", "v1", ("evidence_ledger",), ("claims",), ("evidence",)),
-    Stage("episodes", "v1", ("claims",), ("episodes", "threads"), ("claims",)),
-    Stage("claim_graph", "v1", ("claims", "episodes"), ("relations", "meeting_state"), ("episodes",)),
-    Stage("project_state", "v1", ("meeting_state",), ("project_state", "delta"), ("claim_graph",)),
-    Stage("summary_plan", "v2", ("meeting_state",), ("summary_plan",), ("claim_graph",)),
-    Stage("rendering", "v2", ("summary_plan",), ("verified_views",), ("summary_plan",)),
+    _s("01_audio", "v2", ("source",), ("canonical_audio",), outs="Audio/v2"),
+    _s("02_diarization_primary", "v3", ("canonical_audio",), ("primary_segments",), ("01_audio",), "Audio/v2", "SpeakerSegments/v3", metrics=("DER",)),
+    _s("03_diarization_secondary", "v3", ("canonical_audio",), ("secondary_segments",), ("01_audio",), "Audio/v2", "SpeakerSegments/v3", metrics=("DER",)),
+    _s("04_speaker_consensus", "v3", ("primary_segments", "secondary_segments"), ("speaker_segments",), ("02_diarization_primary", "03_diarization_secondary"), outs="SpeakerConsensus/v3", metrics=("DER", "JER")),
+    _s("05_voice_identity", "v3", ("speaker_segments",), ("identified_segments",), ("04_speaker_consensus",), outs="SpeakerIdentity/v3", metrics=("ECE", "Brier")),
+    _s("06_asr", "v3", ("canonical_audio",), ("words", "asr_lattice"), ("01_audio",), outs="WordEvidence/v3", metrics=("critical_WER",)),
+    _s("07_evidence_build", "v3", ("words", "identified_segments"), ("evidence_spans",), ("05_voice_identity", "06_asr"), outs="EvidenceSpan/v3"),
+    _s("08_evidence_repair", "v3", ("evidence_spans",), ("repaired_evidence",), ("07_evidence_build",), outs="EvidenceSpan/v3", failure="risk_based", degradation="abstain"),
+    _s("09_proposition_extract", "v3", ("repaired_evidence",), ("propositions",), ("08_evidence_repair",), outs="PropositionSchema/v3"),
+    _s("10_dialogue_act", "v2", ("propositions",), ("dialogue_events",), ("09_proposition_extract",), outs="DialogueActSchema/v2"),
+    _s("11_relation_resolve", "v3", ("propositions", "dialogue_events"), ("relations",), ("10_dialogue_act",), outs="RelationSchema/v3", metrics=("relation_F1",)),
+    _s("12_state_reduce", "v3", ("propositions", "dialogue_events", "relations"), ("states",), ("11_relation_resolve",), outs="StateMachines/v3"),
+    _s("13_episode_segment", "v2", ("propositions", "dialogue_events"), ("episodes",), ("12_state_reduce",), outs="Episodes/v2", metrics=("boundary_F1",)),
+    _s("14_thread_resolve", "v2", ("episodes", "relations"), ("meeting_graph",), ("13_episode_segment",), outs="MeetingGraphSchema/v3", metrics=("thread_score",)),
+    _s("15_project_delta", "v2", ("meeting_graph",), ("project_graph", "delta"), ("14_thread_resolve",), outs="ProjectGraphSchema/v2"),
+    _s("16_view_plan", "v3", ("meeting_graph", "project_graph"), ("view_plans",), ("15_project_delta",), outs="SummaryPlanSchema/v3"),
+    _s("17_realize", "v3", ("view_plans",), ("generated_views",), ("16_view_plan",), outs="GeneratedViews/v3"),
+    _s("18_verify", "v3", ("generated_views", "meeting_graph"), ("verified_views",), ("17_realize",), outs="VerificationReport/v3", degradation="abstain", metrics=("public_precision", "condition_preservation")),
+    _s("19_publish", "v2", ("verified_views",), ("published_outputs",), ("18_verify",), outs="PublishedMeeting/v2"),
 ])

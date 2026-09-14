@@ -1,5 +1,19 @@
 # Архитектура транскрипции и саммари
 
+## v21: canonical MeetingGraph и declarative DAG
+
+Единственный источник семантической истины — `MeetingGraphSchema/v3`, который строится напрямую из проверенных `SemanticRecord` и immutable evidence. Старый `MeetingState` больше не участвует в вычислении: для прежних renderer/API он создаётся только как read-only compatibility projection. Полный путь публикации описан 19 стадиями в `pipeline_core/dag.py`, где у каждой стадии объявлены входы, выходы, версии схем, модельный digest, retry/failure/degradation policy и метрики.
+
+Модель смысла разделяет стабильную `Proposition` и ситуативный `DialogueEvent`. Content kind, speech act, epistemic modality, social state и lifecycle являются независимыми осями. Условия, количества и сущности структурированы; `EntityRegistry` объединяет алиасы. Решения, задачи и вопросы вычисляются отдельными state machines. Вопрос считается закрытым только после slot-level entailment, отдельно от широкого candidate retrieval. Relation resolver поддерживает явные ответы/принятия, короткие coreference-реплики, corrections, supersession, conditions, causal links и conflict sets.
+
+Hybrid segmentation объединяет паузы, лексику, сущности, dialogue acts, discourse markers и опциональный embedding signal. Episodes остаются локальными фрагментами разговора, threads связывают разнесённые обсуждения. Planner выбирает связные подграфы с mandatory-first selection, soft episode coverage и адаптивным semantic budget, затем строит отдельные executive, technical, decisions, tasks, questions и timeline plans. `SentencePlan` перечисляет допустимые claims, relations, числа, сущности, говорящих, исполнителей, modality/polarity/conditions и запрещённые выводы.
+
+Проверяется именно сгенерированный текст. Детерминированные invariants контролируют числа, отрицания, causal wording, modality, conditions и attribution; независимые alignment и QA channels проверяют entailment и слоты. Небезопасная фраза заменяется дословной атомарной формулировкой источника, а если и она не проходит контракт — публикация останавливается. Critical evidence использует expected-value scheduling, ASR lattice и независимую ASR family; speaker refinement планируется только для рискованных target-speaker окон, а вероятность говорящего калибруется отдельно от routing score.
+
+`ProjectGraphSchema/v2` — атомарно публикуемый и блокируемый межвстречный event store. Он хранит semantic lineage, состояния решений/задач/экспериментов/threads и вычисляет `NEW`, `CHANGED`, `CONFIRMS`; Markdown в память не попадает. Retrieval объединяет lexical, entity, dense hook, recency и state-aware scoring. Все Hugging Face модели закреплены commit revision, Ollama cache включает фактический digest модели, а stage cache — версии producer и зависимостей.
+
+Требования 1–40 покрыты следующими модулями: 1–10 — `semantics/meeting_graph.py`, `propositions.py`, `entities.py`, `reducers.py`, `questions.py`; 11–18 — `episodes.py`, `relation_resolver.py`; 19–25 — `summary/planner.py` и view renderers; 26–30 — `summary/verifier.py` и actual-output verification; 31–35 — `evidence/refinement.py`, model workers и `pipeline_core/models.py`; 36–38 — `project_memory/graph_store.py` и `retrieval.py`; 39 — `evaluation/semantic_metrics.py`; 40 — `pipeline_core/dag.py`.
+
 ## v20: formal meeting intelligence core
 
 Основной продукт теперь `Evidence-backed MeetingState + Claim Graph`, а не Markdown:

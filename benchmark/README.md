@@ -1,6 +1,8 @@
 # Эталонная проверка pipeline
 
-## Release gates v20
+## Release gates v21
+
+`evaluation.semantic_metrics.architecture_metrics()` является исполняемой спецификацией и отдельно считает atomic claim, canonical proposition, relation, decision, task commitment, question-slot, latest-state, correction, condition, quantity-binding, episode, thread, technical-rule и open-question precision/recall/F1. Дополнительно считаются importance-weighted recall, public factual precision, unsupported synthesis, cross-episode merge error, redundancy, compression, usefulness, DER/JER и critical ASR errors. `release_gate()` запрещает выпуск при decision false-positive, question false-resolution, падении factual precision или недопустимой регрессии importance-weighted recall.
 
 Gold scorecard включает atomic claim precision/recall, canonical type accuracy, relation precision, modality/latest-state/correction accuracy, task acceptance F1, question slot/direct-answer accuracy, mandatory recall, episode/topic coverage, cross-episode merge error, redundancy, speaker ECE/Brier и critical ASR number/negation errors.
 

@@ -8,5 +8,10 @@ SCHEMA_VERSIONS = {
     "RelationSchema": 1,
     "MeetingStateSchema": 2,
     "ProjectStateSchema": 1,
-    "SummaryPlanSchema": 2,
+    "SummaryPlanSchema": 3,
+    "PropositionSchema": 3,
+    "DialogueActSchema": 2,
+    "MeetingGraphSchema": 3,
+    "ProjectGraphSchema": 2,
+    "VerificationReportSchema": 3,
 }

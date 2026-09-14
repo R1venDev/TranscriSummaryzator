@@ -1,7 +1,7 @@
 """Strict, versioned contracts for evidence-backed meeting state."""
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 from semantics.ontology import ClaimKind, ClaimLifecycle, DecisionStatus, QuestionStatus, RelationKind, TaskStatus
 
@@ -140,7 +140,18 @@ class SentencePlan(StrictModel):
     relation_ids: list[str] = Field(default_factory=list)
     intent: str
     allowed_numbers: list[str] = Field(default_factory=list)
+    allowed_quantities: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_entities: list[str] = Field(default_factory=list)
     allowed_speakers: list[str] = Field(default_factory=list)
+    allowed_assignees: list[str] = Field(default_factory=list)
+    polarity: list[str] = Field(default_factory=list)
+    modality: list[str] = Field(default_factory=list)
+    conditions: list[dict[str, Any]] = Field(default_factory=list)
+    time_scope: list[Any] = Field(default_factory=list)
+    decision_state: list[str] = Field(default_factory=list)
+    task_state: list[str] = Field(default_factory=list)
+    question_slots: list[Any] = Field(default_factory=list)
+    forbidden_inferences: list[str] = Field(default_factory=list)
     max_sentences: int = Field(1, ge=1, le=3)
 
 

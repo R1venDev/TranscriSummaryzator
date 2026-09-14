@@ -15,6 +15,21 @@ def _similarity(a, b):
     return len(left & right) / max(1, len(left | right))
 
 
+def _entity_ids(claim):
+    return {x.get("entity_id") for x in claim.get("entities", []) if isinstance(x, dict) and x.get("entity_id")}
+
+
+def boundary_score(claim, prior, recent):
+    """Hybrid discourse boundary signal; embedding scores may be supplied upstream."""
+    gap = max(0.0, float(claim.get("start", 0)) - float(prior.get("end", prior.get("start", 0))))
+    lexical_shift = 1.0 - _similarity(claim.get("statement"), " ".join(x.get("statement", "") for x in recent))
+    entity_shift = 0.0 if _entity_ids(claim) & set().union(*(_entity_ids(x) for x in recent)) else .35
+    act_shift = .2 if claim.get("kind") == "question" else 0.0
+    explicit = .45 if TOPIC_SHIFT_RE.search(str(claim.get("statement") or "")) else 0.0
+    embedding_shift = float(claim.get("discourse_features", {}).get("embedding_shift", 0))
+    return min(1.0, gap / 300.0 + lexical_shift * .25 + entity_shift + act_shift + explicit + embedding_shift * .5)
+
+
 def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
     ordered = sorted(claims, key=lambda x: (float(x.get("start", 0)), x.get("claim_id", "")))
     groups = []
@@ -26,8 +41,8 @@ def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
         gap = float(claim.get("start", 0)) - float(prior.get("end", prior.get("start", 0)))
         topic = claim.get("topic") or claim.get("statement") or ""
         prior_topic = " ".join(str(x.get("topic") or x.get("statement") or "") for x in groups[-1][-3:])
-        explicit_shift = bool(TOPIC_SHIFT_RE.search(str(claim.get("statement") or "")))
-        if gap > max_gap or (explicit_shift and _similarity(topic, prior_topic) < topic_threshold):
+        score = boundary_score(claim, prior, groups[-1][-4:])
+        if gap > max_gap or score >= .72:
             groups.append([claim])
         else:
             groups[-1].append(claim)
@@ -55,13 +70,17 @@ def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
     return result
 
 
-def build_threads(episodes, claims):
+def build_threads(episodes, claims, relations=None):
     by_id = {x.get("claim_id"): x for x in claims}
     threads = []
     for episode in episodes:
         matched = None
         for thread in threads:
-            if _similarity(episode.get("topic"), thread.get("topic")) >= 0.18:
+            episode_claims = [by_id[x] for x in episode.get("claim_ids", []) if x in by_id]
+            thread_claims = [by_id[x] for x in thread.get("active_claim_ids", []) if x in by_id]
+            entity_overlap = set().union(*(_entity_ids(x) for x in episode_claims)) & set().union(*(_entity_ids(x) for x in thread_claims)) if thread_claims else set()
+            linked = any(r.get("source_claim_id") in episode.get("claim_ids", []) and r.get("target_claim_id") in thread.get("active_claim_ids", []) or r.get("target_claim_id") in episode.get("claim_ids", []) and r.get("source_claim_id") in thread.get("active_claim_ids", []) for r in relations or [])
+            if _similarity(episode.get("topic"), thread.get("topic")) >= 0.18 or entity_overlap or linked:
                 matched = thread
                 break
         if matched is None:
