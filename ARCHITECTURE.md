@@ -1,5 +1,13 @@
 # Архитектура транскрипции и саммари
 
+## v24: speech-act safety, complete publication routes и рабочие таймкоды
+
+Обязательство теперь является независимым речевым актом: commit создаёт каноническую задачу при любом совместимом content kind, включая resource/dataset. Финальные LLM-аудиты не вправе превращать обязательство в question только из-за overlap или неуверенного ASR — предлагаемая правка сохраняется отдельно как review patch. Evidence bundle задач и ответов включает локальный диалог, короткое подтверждение, основной таймкод и word-level provenance.
+
+Planner и PublicationAudit учитывают все публичные разделы и требуют явную disposition для каждого выбранного claim и каждого кандидата-обязательства. Technical vocabulary централизован; выбранный technical claim публикуется как rule, technical result или получает явную причину исключения. Аудит разделён на integrity, grounding, coverage и readability; пустой результат никогда не проходит coverage, а material accounting явно не называется полнотой саммари. Обзор строится как смесь состояния, препятствия, следующего шага и технического контекста; полезное краткое повторение задачи разрешено, а вредные дубли блокируются.
+
+Расписание извлекается без привязки к конкретному дню или времени, сохраняет альтернативы через «или» и закрывает exact-time slot только после подтверждения. Объём данных, origin year и относительный срок хранятся раздельно; scope revisions принимаются только из локально связанного уточнения, а `scope_relation_ids` всегда содержат relation IDs. Ссылки таймкодов ведут на `/result` к конкретной реплике. Диагностика имеет отдельные job/attempt/stage/model группировки, request-key accounting, first/last fatal и last warning, раздельные LLM/stage latency и отдельный trace. Неиспользуемый LLM enrichment задач удалён из production path.
+
 ## v23: canonical state, hard budgets и publication audit
 
 Единственный источник семантической истины — `MeetingGraphSchema/v5`, который строится напрямую из проверенных `SemanticRecord` и immutable evidence. Старый `MeetingState` больше не участвует в вычислении: для прежних renderer/API он создаётся только как read-only compatibility projection. Полный путь публикации описан declarative DAG в `pipeline_core/dag.py`, где у каждой стадии объявлены входы, выходы, версии схем, модельный digest, retry/failure/degradation policy и метрики.

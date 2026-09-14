@@ -55,6 +55,25 @@ class ClosingScheduleRecoveryTests(unittest.TestCase):
         self.assertEqual(records[0]["requested_slots"], ["day", "exact_time"])
         self.assertIn("W3", records[0]["source_word_ids"])
 
+    def test_schedule_is_not_hardcoded_and_preserves_or_alternatives(self):
+        utterances = [
+            {"id": "U1", "start": 1, "end": 2, "speaker": "@A", "text": "Созвон в среду?", "source_word_ids": ["W1"]},
+            {"id": "U2", "start": 3, "end": 4, "speaker": "@B", "text": "В 18 или 19", "source_word_ids": ["W2"]},
+        ]
+        record = ensure_closing_schedule_question([], utterances)[0]
+        self.assertIn("среду", record["statement"])
+        self.assertIn("18:00 или 19:00", record["statement"])
+        self.assertEqual(record["question_status"], "partially_answered")
+
+    def test_equivalent_time_spellings_do_not_create_an_alternative(self):
+        utterances = [
+            {"id": "U1", "start": 1, "end": 2, "speaker": "@A", "text": "Созвон во вторник в 19?", "source_word_ids": ["W1"]},
+            {"id": "U2", "start": 3, "end": 4, "speaker": "@B", "text": "Да, в 19:00", "source_word_ids": ["W2"]},
+        ]
+        record = ensure_closing_schedule_question([], utterances)[0]
+        self.assertEqual(record["question_status"], "answered")
+        self.assertNotIn("или", record["statement"])
+
 
 if __name__ == "__main__":
     unittest.main()

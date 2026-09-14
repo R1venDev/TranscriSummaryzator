@@ -2598,8 +2598,12 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 needs_review = turn_needs_speaker_review(item, labels)
                 speaker_class = "unknown" if speaker is None else "speaker-{}".format(sum(ord(character) for character in str(speaker)) % 6)
                 warning = '<span class="warning">Проверить</span>' if needs_review else ""
+                start_seconds = float(item.get("start", 0))
+                anchor = "t-{}".format(round(start_seconds * 1000))
                 rendered_turns.append(
-                    '<section class="turn{}"><time>{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
+                    '<section id="{}" data-start="{:.3f}" class="turn{}"><time>{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
+                        anchor,
+                        start_seconds,
                         " needs-review" if needs_review else "",
                         timecode,
                         speaker_class,

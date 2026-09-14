@@ -158,8 +158,10 @@ def normalize_semantic_record(raw, fact):
         if isinstance(item, dict) and item.get("id") in evidence_set
     }
     audited_owners = [value for value in fact.get("owner_refs", []) if value in speakers]
+    evidence_text_for_commitment = " ".join(str(item.get("text") or "") for item in fact.get("evidence", []))
+    commitment_like = bool(COMMITMENT_RE.search(evidence_text_for_commitment))
     owners = []
-    if fact.get("type") == "action":
+    if fact.get("type") == "action" or commitment_like:
         # The semantic model may see several speakers in the evidence.  Only the
         # owner already proven by the action-policy pass may become an assignee.
         owners = audited_owners
@@ -245,7 +247,7 @@ def normalize_semantic_record(raw, fact):
             question_status = "unclear"
     uncertainty = dict(fact.get("uncertainty", {}))
     assignment_status = "not_applicable"
-    if fact.get("type") == "action":
+    if fact.get("type") == "action" or commitment_like:
         if owners and confirmation_ids:
             assignment_status = "confirmed"
         elif owners:
@@ -261,13 +263,14 @@ def normalize_semantic_record(raw, fact):
     if raw_act in {"assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"}:
         detected_act = raw_act if detected_act == "assert" else detected_act
     legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
-    explicit_commitment = fact.get("type") == "action" and bool(COMMITMENT_RE.search(evidence_text)) and len(owners) == 1
+    explicit_commitment = bool(COMMITMENT_RE.search(evidence_text)) and len(owners) == 1
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
         "topic": fact.get("topic") or "Прочее",
         "statement": fact["statement"],
         "start": float(fact.get("start", 0)),
+        "primary_evidence_start": float(fact.get("primary_evidence_start", fact.get("start", 0))),
         "subject": str(raw.get("subject") or "").strip() or None,
         "predicate": str(raw.get("predicate") or "").strip() or None,
         "object": str(raw.get("object") or "").strip() or None,
@@ -303,6 +306,7 @@ def normalize_semantic_record(raw, fact):
         "requested_slots": list(dict.fromkeys(str(value) for value in raw.get("requested_slots", []) if str(value).strip())),
         "answered_slots": list(dict.fromkeys(str(value) for value in raw.get("answered_slots", []) if str(value).strip())),
         "evidence_ids": evidence_ids,
+        "dialogue_evidence": list(fact.get("dialogue_evidence", [])),
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),
         "risk_level": fact.get("risk_level", "LOW"),

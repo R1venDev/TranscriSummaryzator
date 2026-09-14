@@ -3,8 +3,9 @@ from __future__ import annotations
 import math, re
 from semantics.graph import cross_episode_allowed
 from summary.verifier import relation_markers
+from summary.policy import TECHNICAL_KINDS
 
-TECHNICAL = {"trading_rule", "system_rule", "definition", "experimental_result", "metric", "design_choice", "constraint", "dependency"}
+TECHNICAL = set(TECHNICAL_KINDS)
 VIEW_KINDS = {
     "executive": {"decision", "current_state", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
     "technical": TECHNICAL, "tasks": {"action", "follow_up"},
@@ -43,7 +44,7 @@ def _utility(claim, score_fn, view):
 
 
 def _select(claims, score_fn, view, budget):
-    eligible = [x for x in claims if x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view])]
+    eligible = [x for x in claims if x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view] or (view == "tasks" and x.get("canonical_task_state_id")))]
     if view == "tasks":
         eligible = [x for x in eligible if x.get("canonical_task_anchor", True)]
     if view == "questions":
@@ -89,8 +90,8 @@ def plan(claims, episodes, relations, score_fn, max_units=None):
         budget = max_units or adaptive_budget(claims, episodes, view=view)
         selected, overflow = _select(claims, score_fn, view, budget)
         view_units = _units(selected, claims, relations)
-        view_plans[view] = {"objective": view, "budget": budget, "selected_count": len(selected), "overflow_count": overflow, "exclusion_reason": "hard_budget_or_duplicate" if overflow else None, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)]}
-        if view in {"executive", "minutes"}: union.update({x["claim_id"]: x for x in selected})
+        view_plans[view] = {"objective": view, "budget": budget, "selected_count": len(selected), "overflow_count": overflow, "exclusion_reason": "hard_budget_or_duplicate" if overflow else None, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)], "dispositions": {x["claim_id"]: {"status": "selected", "section": view} for x in selected}}
+        union.update({x["claim_id"]: x for x in selected})
     ordered = sorted(union.values(), key=lambda x: float(x.get("start", 0)))
     units = _units(ordered, claims, relations)
     sentences = [_sentence(i, unit, by_id) for i, unit in enumerate(units, 1)]

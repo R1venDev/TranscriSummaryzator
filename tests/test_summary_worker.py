@@ -160,7 +160,7 @@ class SummaryWorkerTests(unittest.TestCase):
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
         }
         rendered = summary.render_markdown(document, [item], {"covered_seconds": 100, "total_seconds": 100})
-        self.assertIn("[00:00:10](#video-time=00:00:10)", rendered)
+        self.assertIn("[00:00:10](#transcript-time=10.125)", rendered)
         self.assertNotIn("F00001", rendered)
 
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
@@ -599,7 +599,8 @@ class SummaryWorkerTests(unittest.TestCase):
         item = fact(kind="schedule", statement="Созвон будет во вторник в 19:00", evidence=evidence)
         updated = summary.enforce_fact_policy(item)
         self.assertEqual(updated["type"], "question")
-        self.assertNotIn("19:00", updated["statement"])
+        self.assertIn("19:00 или 20:00", updated["statement"])
+        self.assertIn("не подтверждено", updated["statement"])
 
     def test_first_person_commitment_becomes_action(self):
         evidence = [utterance(1, 1, 3, speaker="@Yachoy", text="К следующему разу я подготовлю TradingView и скину файл")]
@@ -891,14 +892,22 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertEqual(merged[0]["evidence_ids"], ["U00001"])
 
-    def test_other_speakers_backchannel_does_not_confirm_assignment(self):
+    def test_owner_question_plus_local_yes_confirms_assignment(self):
         question = utterance(1, 1, 3, speaker="@Misha", text="Мне сделать тебе разметчик Order Block?")
         confirmation = utterance(2, 3.1, 4, speaker="@HoTTaBbicH", text="Да, дальше этап апробации")
         item = fact(kind="proposal", statement="Misha должен сделать разметчик Order Block", evidence=[question])
         updated = summary.resolve_dialogue_commitments([item], [question, confirmation])[0]
-        self.assertEqual(updated["type"], "proposal")
-        self.assertNotIn("confirmed_owner_question_promoted", updated.get("policy_note", ""))
-        self.assertEqual(updated["evidence_ids"], ["U00001"])
+        self.assertEqual(updated["type"], "action")
+        self.assertEqual(updated.get("policy_note"), "confirmed_owner_question_promoted")
+        self.assertEqual(updated["evidence_ids"], ["U00001", "U00002"])
+
+    def test_recognition_review_cannot_turn_commitment_into_question(self):
+        item = fact(kind="action", statement="Я передам выгрузку", evidence=[utterance(1, 1, 2, text="Я передам выгрузку")])
+        accepted, rejected = summary.apply_reviews([item], [{"fact_id": "F00001", "verdict": "corrected", "type": "question", "statement": "Нужно ли передать выгрузку?", "confidence": .7}], enforce_policy=False)
+        self.assertFalse(rejected)
+        self.assertEqual(accepted[0]["type"], "action")
+        self.assertEqual(accepted[0]["statement"], "Я передам выгрузку")
+        self.assertEqual(accepted[0]["review_patch"]["reason"], "speech_act_guard")
 
     def test_cache_is_invalidated_when_prompt_changes(self):
         class Client:

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _path = None
 _trace_path = None
 _component = os.environ.get("TRANSCRISUMMARY_COMPONENT", "unknown")
@@ -107,6 +107,7 @@ def event(name, *, category="observation", outcome=None, inputs=None, metrics=No
         "event_id": uuid.uuid4().hex,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "run_id": _run_id,
+        "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or _run_id,
         "job_id": _job_id,
         "component": component or _component,
         "category": category,
@@ -176,9 +177,10 @@ def stage(name, *, inputs=None, refs=None, component=None):
 def summarize(path):
     path = Path(path)
     counters = {name: Counter() for name in ("components", "categories", "severities", "outcomes")}
-    first = last = last_error = None
+    first = last = last_error = first_fatal = last_fatal = last_warning = None
     total = malformed = 0
-    durations, slow, tokens, calls, retries, cache_hits, cache_total = [], [], Counter(), 0, 0, 0, 0
+    durations, llm_durations, stage_durations, slow, tokens, calls, retries, cache_hits, cache_total = [], [], [], [], Counter(), 0, 0, 0, 0
+    groups, request_keys, repeated_without_progress = {}, Counter(), Counter()
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -194,9 +196,26 @@ def summarize(path):
                     counters[bucket][str(item[field])] += 1
             if item.get("severity") == "ERROR" or item.get("error"):
                 last_error = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
+                first_fatal = first_fatal or last_error
+                last_fatal = last_error
+            if item.get("severity") in {"WARN", "WARNING"}:
+                last_warning = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
             duration = item.get("duration_ms")
             if isinstance(duration, (int, float)):
                 durations.append(float(duration)); slow.append({"name": item.get("name"), "component": item.get("component"), "duration_ms": duration, "outcome": item.get("outcome")})
+                if item.get("name") == "llm_request": llm_durations.append(float(duration))
+                if item.get("category") == "stage": stage_durations.append(float(duration))
+            group_key = " / ".join(str(item.get(key) or "unknown") for key in ("job_id", "attempt_id", "component"))
+            model = str(item.get("refs", {}).get("model") or item.get("inputs", {}).get("model") or "none")
+            grouped = groups.setdefault(group_key, {"events": 0, "stages": Counter(), "models": Counter()})
+            grouped["events"] += 1
+            grouped["stages"][str(item.get("name") or "unknown")] += 1
+            grouped["models"][model] += 1
+            request_key = item.get("refs", {}).get("request_key") or item.get("metrics", {}).get("request_key")
+            if request_key:
+                request_keys[str(request_key)] += 1
+                if item.get("outcome") in {"retryable_output_limit", "failed", "partial", "cached_partial"}:
+                    repeated_without_progress[str(request_key)] += 1
             if item.get("name") == "llm_request":
                 calls += item.get("outcome") == "completed"
                 retries += item.get("outcome") in {"retryable_output_limit", "failed"}
@@ -205,19 +224,25 @@ def summarize(path):
                     if isinstance(value, (int, float)): tokens[key] += value
             if item.get("name") in {"llm_cache", "stage_cache.audio", "stage_cache.diarizen", "stage_cache.ultra", "stage_cache.consensus", "stage_cache.asr"}:
                 cache_total += 1; cache_hits += item.get("outcome") == "hit"
-    durations.sort()
-    def percentile(p):
-        return durations[min(len(durations)-1, int((len(durations)-1)*p))] if durations else None
+    durations.sort(); llm_durations.sort(); stage_durations.sort()
+    def latency(values):
+        def percentile(p):
+            return values[min(len(values)-1, int((len(values)-1)*p))] if values else None
+        return {"p50": percentile(.50), "p95": percentile(.95), "max": max(values) if values else None}
     return {
         "schema_version": SCHEMA_VERSION, "events": total, "malformed_lines": malformed,
         "first_timestamp": first, "last_timestamp": last,
         **{name: dict(value) for name, value in counters.items()},
         "last_error": last_error,
+        "first_fatal_error": first_fatal, "last_fatal_error": last_fatal, "last_warning": last_warning,
         "jsonl_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
         "jsonl_bytes": path.stat().st_size if path.is_file() else 0,
         "calls": calls, "tokens": dict(tokens), "retries": retries,
         "cache_hit_ratio": cache_hits / cache_total if cache_total else None,
-        "latency_ms": {"p50": percentile(.50), "p95": percentile(.95), "max": max(durations) if durations else None},
+        "latency_ms": latency(durations), "llm_latency_ms": latency(llm_durations), "stage_latency_ms": latency(stage_durations),
+        "groups": {key: {"events": value["events"], "stages": dict(value["stages"]), "models": dict(value["models"])} for key, value in groups.items()},
+        "request_keys": {"unique": len(request_keys), "repeated": {key: count for key, count in request_keys.items() if count > 1}, "repeated_without_progress": {key: count for key, count in repeated_without_progress.items() if count > 1}},
+        "cache_states": {"reused_successfully": counters["outcomes"].get("hit", 0), "cached_partial_seen_again": counters["outcomes"].get("cached_partial", 0)},
         "top_slow_requests": sorted(slow, key=lambda x: x["duration_ms"], reverse=True)[:10],
     }
 

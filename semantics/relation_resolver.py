@@ -9,6 +9,7 @@ REJECT_RE = re.compile(r"(?iu)^\s*(?:нет|не согласен|не дела�
 CAUSE_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|в результате|привел[оа]? к)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|при условии|после того как)\b")
 SCOPE_RE = re.compile(r"(?iu)\b(?:месяц|год|недел|день|час|минут|период|объём|объем)\b")
+SCOPE_REPLY_RE = re.compile(r"(?iu)\b(?:для\s+(?:начала|проверки|этого)|достаточно|возьм[её]м|объ[её]м|период|нужн\w+\s+(?:данн\w*|выборк\w*|объ[её]м\w*|период\w*))")
 
 
 def _tokens(value):
@@ -76,10 +77,12 @@ def resolve_relations(propositions, events, records):
             if similarity < .18 and not shared_entities:
                 # Scope clarifications often change content kind (action ->
                 # proposal/constraint) and use different surface words.
-                if not (target["content_kind"] in {"action", "follow_up"}
+                local_reply = event.get("timestamp", 0) - prior.get("timestamp", 0) <= 20 and bool(SCOPE_REPLY_RE.search(text))
+                if not (target["content_kind"] in {"action", "follow_up", "resource"}
                         and source["content_kind"] in {"proposal", "constraint", "correction", "decision"}
                         and SCOPE_RE.search(text)
-                        and event.get("timestamp", 0) - prior.get("timestamp", 0) <= 45):
+                        and event.get("timestamp", 0) - prior.get("timestamp", 0) <= 45
+                        and (shared_entities or local_reply)):
                     continue
                 add("revises_scope", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .86, "bounded_cross_kind_scope")
                 continue

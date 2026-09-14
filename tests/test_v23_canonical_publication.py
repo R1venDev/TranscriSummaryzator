@@ -21,6 +21,12 @@ def rec(number, kind, text, act="assert", speaker="@A", **extra):
 
 
 class CanonicalStateTests(unittest.TestCase):
+    def test_resource_commitment_is_still_a_task(self):
+        graph = build_meeting_graph([rec(1, "resource", "Я передам выгрузку Bitcoin", "commit", assignees=["@A"])])
+        self.assertEqual(len(graph["task_states"]), 1)
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        self.assertIn(graph["claims"][0]["claim_id"], planned["view_plans"]["tasks"]["selected_claim_ids"])
+
     def test_explicit_commitment_is_required(self):
         explicit = build_meeting_graph([rec(1, "action", "Я отправлю EXE-файл", "commit", assignees=["@A"])])
         proposed = build_meeting_graph([rec(1, "action", "Предлагалось отправить EXE-файл", "commit", assignees=["@A"])])
@@ -45,9 +51,32 @@ class CanonicalStateTests(unittest.TestCase):
             rec(3, "constraint", "Для симуляции месяца достаточно", speaker="@B"),
         ])
         task = graph["task_states"][0]
-        self.assertEqual(task["current_scope"], "один месяц из 2021 года")
-        self.assertIn("2021 год", task["superseded_scopes"])
+        self.assertEqual(task["current_scope"], "1 месяц")
+        self.assertEqual(task["data_origin"], "2021")
+        self.assertEqual(task["superseded_scopes"], [])
+        self.assertTrue(all(value.startswith("R") for value in task["scope_relation_ids"]))
         self.assertTrue(any(x["type"] == "revises_scope" for x in graph["relations"]))
+
+    def test_unrelated_month_does_not_revise_task_scope(self):
+        graph = build_meeting_graph([
+            rec(1, "resource", "Я передам выгрузку Bitcoin", "commit", assignees=["@A"]),
+            rec(2, "proposal", "Нужна подписка на два месяца", "propose", speaker="@B"),
+        ])
+        self.assertFalse(any(x["type"] == "revises_scope" for x in graph["relations"]))
+        self.assertIsNone(graph["task_states"][0]["current_scope"])
+
+    def test_every_selected_technical_claim_has_a_public_disposition(self):
+        graph = build_meeting_graph([
+            rec(1, "definition", "Order Block определяется по импульсу"),
+            rec(2, "dependency", "Фильтр зависит от таймфрейма"),
+            rec(3, "system_rule", "Нельзя входить без подтверждения"),
+        ])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        items = build_public_items(graph, planned)
+        published = {claim_id for item in items if item["section"] in {"technical", "rules"} for claim_id in item["claim_ids"]}
+        selected = set(planned["view_plans"]["technical"]["selected_claim_ids"])
+        self.assertEqual(selected, published)
+        self.assertTrue(all(planned["view_plans"]["technical"]["dispositions"][value]["status"] == "published" for value in selected))
 
     def test_similar_atomic_actions_have_one_canonical_task(self):
         graph = build_meeting_graph([

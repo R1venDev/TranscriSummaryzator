@@ -7,7 +7,9 @@ from .questions import verify_slot_entailment
 
 PROPOSAL_WORDING_RE = re.compile(r"(?iu)\b(?:предлагалось|предлагает|можно|стоит|нужно\s+бы|планируется|планирует)\b")
 FIRST_PERSON_COMMIT_RE = re.compile(r"(?iu)\b(?:я\s+(?:сделаю|отправлю|передам|дам|кину|буду|возьмусь)|i\s+will)\b")
-SCOPE_MONTH_RE = re.compile(r"(?iu)\b(?:од(?:ин|ного)?\s+)?месяц(?:а|ев|ем)?\b")
+COUNT_WORDS = {"один": 1, "одного": 1, "одну": 1, "два": 2, "две": 2, "трех": 3, "трёх": 3}
+SCOPE_VALUE_RE = re.compile(r"(?iu)\b(?P<count>\d+|один|одного|одну|два|две|тр[её]х)?\s*(?P<unit>месяц(?:а|ев|ем)?|недел(?:я|и|ь|ю)|д(?:ень|ня|ней)|год(?:а|ов)?)\b")
+YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 TOKEN_RE = re.compile(r"(?iu)[a-zа-яё0-9]+")
 TASK_STOP = {"говорящий", "предлагает", "планирует", "будут", "параллельно", "надо", "нужно", "чтобы", "участник"}
 
@@ -23,6 +25,19 @@ def _task_similarity(left, right):
 
 def _incoming(target, relations, kinds):
     return [x for x in relations if x.get("target_proposition_id") == target and x.get("type") in kinds]
+
+
+def _scope_value(text):
+    match = SCOPE_VALUE_RE.search(str(text or ""))
+    if not match:
+        return None
+    raw = (match.group("count") or "один").casefold()
+    count = int(raw) if raw.isdigit() else COUNT_WORDS.get(raw, 1)
+    unit = match.group("unit").casefold()
+    stem = "месяц" if unit.startswith("месяц") else "неделя" if unit.startswith("недел") else "день" if unit.startswith("д") else "год"
+    forms = {"месяц": ("месяц", "месяца", "месяцев"), "неделя": ("неделя", "недели", "недель"), "день": ("день", "дня", "дней"), "год": ("год", "года", "лет")}[stem]
+    form = forms[0] if count % 10 == 1 and count % 100 != 11 else forms[1] if count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14} else forms[2]
+    return f"{count} {form}"
 
 
 def reduce_decisions(propositions, events, relations):
@@ -59,11 +74,12 @@ def reduce_tasks(propositions, events, relations, records):
             continue
         processed.add(event["proposition_id"])
         prop = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
-        if prop["content_kind"] not in {"action", "follow_up"}:
-            continue
         prop_events = [x for x in events if x["proposition_id"] == prop["proposition_id"]]
         event = max(prop_events, key=lambda x: x.get("timestamp", 0))
         record = by_record.get(event.get("source_record_id"), {})
+        commitment_candidate = event["speech_act"] == "commit" or record.get("commitment_strength") in {"explicit", "implicit"} or prop["content_kind"] in {"action", "follow_up"}
+        if not commitment_candidate:
+            continue
         owners = list(record.get("assignees", []))
         confirmations = list(record.get("confirmation_evidence_ids", []))
         acceptance_relations = _incoming(prop["proposition_id"], relations, {"accepts", "confirms", "accepts_assignment"})
@@ -97,17 +113,21 @@ def reduce_tasks(propositions, events, relations, records):
             status = "superseded"
         explicit_automation = record.get("automation_eligible")
         automation = explicit_automation if isinstance(explicit_automation, bool) else (False if status in {"idea", "proposed", "assigned", "assigned_pending", "superseded"} else "unknown")
-        scope = record.get("scope") or record.get("time_scope") or record.get("time_expression")
+        scope = record.get("scope") or record.get("time_scope")
+        data_origin = record.get("data_origin") or next(iter(YEAR_RE.findall(statement)), None)
         scope_relations, scope_evidence, scope_words = [], [], []
-        for candidate in records:
-            delta = float(candidate.get("start", 0)) - float(record.get("start", 0))
-            if not 0 < delta <= 45 or candidate.get("kind") not in {"proposal", "constraint", "correction", "decision"}:
+        revisers = sorted(_incoming(prop["proposition_id"], relations, {"revises_scope"}), key=lambda x: x.get("confidence", 0))
+        for relation in revisers:
+            source_prop = next((x for x in propositions if x["proposition_id"] == relation.get("source_proposition_id")), None)
+            value = _scope_value(source_prop.get("statement") if source_prop else "")
+            if not value:
                 continue
-            if SCOPE_MONTH_RE.search(str(candidate.get("statement") or "")):
-                scope = "один месяц из 2021 года" if "2021" in statement else "один месяц"
-                scope_relations.append(candidate.get("record_id")); scope_evidence.extend(candidate.get("evidence_ids", [])); scope_words.extend(candidate.get("source_word_ids", []))
-                break
-        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": prop["statement"], "deliverable": prop["statement"], "owner": owners[0] if len(owners) == 1 else None, "assignee": owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": event.get("speaker"), "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "assignment_actor": event.get("speaker"), "assignment_target": owners[0] if len(owners) == 1 else None, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "superseded_scopes": (["2021 год"] if scope_relations and "2021" in statement else []), "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
+            scope = value
+            scope_relations.append(relation["relation_id"])
+            scope_evidence.extend(relation.get("evidence_ids", []))
+            source_records = source_prop.get("source_record_ids", []) if source_prop else []
+            scope_words.extend(w for rid in source_records for w in by_record.get(rid, {}).get("source_word_ids", []))
+        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": prop["statement"], "deliverable": prop["statement"], "owner": owners[0] if len(owners) == 1 else None, "assignee": owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": event.get("speaker"), "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "assignment_actor": event.get("speaker"), "assignment_target": owners[0] if len(owners) == 1 else None, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "data_origin": data_origin, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "superseded_scopes": [], "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
     # Canonical task envelopes: one state is consumed by every public/API view.
     groups = []
     for item in sorted(atomic, key=lambda x: x["start"]):
@@ -160,8 +180,8 @@ def reduce_questions(propositions, events, relations, records):
         elif _incoming(prop["proposition_id"], relations, {"tentatively_answers"}): status = "tentatively_answered"
         elif upstream in {"deferred", "requires_external_verification", "rhetorical", "superseded"}: status = upstream
         else: status = "unanswered"
-        display = {"additional_tools": "какие дополнительные инструменты нужны", "rhythmic_entry_implementation": "какой вариант ритмического входа работает", "high_tf_result": "какой результат получен на старших таймфреймах", "exact_time": "точное время"}
-        result.append({"question_id": "Q" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_record_id": event.get("source_record_id"), "intent": record.get("question_intent") or "unknown", "requested_slots": requested, "answered_slots": entailed, "missing_slots": missing, "missing_slot_labels": [display.get(x, str(x).replace("_", " ")) for x in missing], "candidate_answer_ids": answer_ids, "answer_record_ids": answer_ids, "answer_evidence_ids": answer_evidence, "answer_relation_ids": [x["relation_id"] for x in answer_relations], "status": status, "start": float(record.get("start", 0)), "closing_schedule_priority": prop["content_kind"] == "schedule"})
+        display = {"additional_tools": "какие дополнительные инструменты нужны", "rhythmic_entry_implementation": "какой вариант ритмического входа работает", "high_tf_result": "какой результат получен на старших таймфреймах", "exact_time": "точное время", "day": "день"}
+        result.append({"question_id": "Q" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_record_id": event.get("source_record_id"), "intent": record.get("question_intent") or "unknown", "requested_slots": requested, "answered_slots": entailed, "missing_slots": missing, "missing_slot_labels": [display.get(x) for x in missing if display.get(x)], "candidate_answer_ids": answer_ids, "answer_record_ids": answer_ids, "answer_evidence_ids": answer_evidence, "answer_relation_ids": [x["relation_id"] for x in answer_relations], "status": status, "start": float(record.get("start", 0)), "closing_schedule_priority": prop["content_kind"] == "schedule"})
     return result
 
 
