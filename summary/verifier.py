@@ -154,6 +154,10 @@ def build_public_items(meeting_graph, summary_plan):
         emitted_tasks.add(state["task_id"])
         status = state.get("status", "idea")
         description = str(state.get("deliverable") or state.get("description") or claim.get("statement") or "")
+        # A source can contain both proposal and agreement wording while the
+        # canonical task still awaits acceptance. Preserve the proposal only.
+        if status == "assigned_pending":
+            description = re.sub(r"(?iu)^предлагалось\s+участники\s+договорились\s+", "Предлагалось ", description)
         if re.search(r"(?iu)^\s*(?:вопрос|уточнение|метаописание)\b", description):
             continue
         if claim.get("content_kind") not in {"action", "follow_up", "resource"} and not re.search(r"(?iu)\b(?:сделать|подготовить|отправить|передать|предоставить|разметить|размечивать|проверить|продолжить|реализовать|встроить|экспериментировать)\b", description):
@@ -350,7 +354,12 @@ def verify_generated_items(items, sentence_plans, claims):
         merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(str(x.get("statement") or "") for x in cited)))
         merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
         source_has_negation = any(NEGATION_RE.search(str(x.get("statement") or "")) for x in cited)
-        if source_has_negation and "negative" not in merged["polarity"]:
+        if item.get("section") == "questions":
+            # A residual question is not an assertion of its cited answer or
+            # schedule state. Keep its source-backed wording and provenance
+            # checks, but do not copy predicate polarity from those claims.
+            merged["polarity"] = []
+        elif source_has_negation and "negative" not in merged["polarity"]:
             merged["polarity"].append("negative")
         realization = audit_realization(text, merged)
         if unknown_claim_ids:
@@ -415,10 +424,17 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     }
     def tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 3}
     duplicates = 0
+    cross_view_repetitions = 0
     for index, left in enumerate(items):
         for right in items[index + 1:]:
             a, b = tokens(left.get("text")), tokens(right.get("text"))
-            duplicates += bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= .8)
+            similar = bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= .8)
+            if left.get("section") == right.get("section"):
+                duplicates += similar
+            else:
+                # Overview, canonical task and chronology intentionally reuse
+                # one supported claim in different views; track, do not reject.
+                cross_view_repetitions += similar
     minute_starts = [float(x.get("start", 0)) for x in items if x.get("section") == "minutes"]
     task_ids = [x.get("task_state_id") for x in items if x.get("section") == "tasks"]
     internal = re.compile(r"(?iu)\b(?:self_committed|assigned_pending|additional_tools|rhythmic_entry_implementation|high_tf_result|stop_loss_options|should[_ ]\w+|[a-z]+_[a-z_]+)\b")
@@ -457,6 +473,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     readability_lint = sum(bool(dangling.search(str(x.get("text") or "").strip()) or double_modality.search(str(x.get("text") or "")) or mixed_token.search(str(x.get("text") or ""))) for x in items)
     counters.update({
         "duplicate_items": duplicates,
+        "cross_view_repetitions": cross_view_repetitions,
         "answered_questions_published_as_open": sum(x.get("section") == "questions" and x.get("question_state", {}).get("status") in {"answered", "rhetorical", "superseded"} for x in items),
         "unconfirmed_tasks_published_as_committed": sum(x.get("section") == "tasks" and x.get("social_state") == "self_committed" and x.get("task_state", {}).get("commitment_strength") != "explicit" for x in items),
         "duplicate_task_states": len([x for x in task_ids if x]) - len({x for x in task_ids if x}),
@@ -478,7 +495,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "title_missing": int(not title_line),
         "title_too_long": int(len(authored_title.strip()) > 110),
         "excessive_residual_questions": int(item_counts.get("questions", 0) > 5),
-        "excessive_technical_items": int(item_counts.get("technical", 0) > 6),
+        "excessive_technical_items": int(sum(x.get("section") == "technical" and not (x.get("content_kind") == "hypothesis" and x.get("social_state") == "constraint") for x in items) > 6),
         "definition_only_technical_items": sum(x.get("section") == "technical" and bool(re.search(r"(?iu)\b(?:называется|определяется|ширина\s*[—–-]\s*ширина)\b", str(x.get("text") or ""))) for x in items),
     })
     counters["section_counts"] = item_counts

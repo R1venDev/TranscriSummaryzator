@@ -72,6 +72,18 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(topic["title"], "Имбалансы")
         self.assertEqual(len(topic["items"]), 5)
 
+    def test_rejected_revision_is_terminal_despite_origin_rewrite(self):
+        denials = [
+            {"fact": {"fact_id": "F00181", "origin_id": "ORafter",
+                      "evidence_ids": ["U00302"]}, "reason": "Нет доказательств решения."},
+            {"fact": {"fact_id": "F00181", "origin_id": "ORother",
+                      "evidence_ids": ["U00327"]}, "reason": "Метафора, не факт."},
+        ]
+        reasons = summary.rejection_reason_by_revision(denials)
+        self.assertEqual(reasons[("F00181", ("U00302",))], "Нет доказательств решения.")
+        self.assertEqual(reasons[("F00181", ("U00327",))], "Метафора, не факт.")
+        self.assertNotIn(("F00180", ("U00302",)), reasons)
+
     def test_section_and_detailed_views_are_not_limited_to_executive_facts(self):
         core = fact(statement="Основной результат встречи")
         hypothesis = dict(

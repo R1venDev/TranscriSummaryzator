@@ -11,7 +11,7 @@ from pathlib import Path
 from pipeline import current_summary_output, find_existing_job, run_command, submission_fingerprint
 from scripts.summary_worker import build_public_document, render_public_document, time_link
 from summary.planner import plan
-from summary.verifier import build_public_items, verify_public_document
+from summary.verifier import build_public_items, publication_audit, verify_generated_items, verify_public_document
 
 
 class GenerationTests(unittest.TestCase):
@@ -44,6 +44,61 @@ class GenerationTests(unittest.TestCase):
         task_items = [item for item in build_public_items(graph, summary_plan) if item["section"] == "tasks"]
         self.assertEqual(len(task_items), 1)
         self.assertEqual(set(task_items[0]["claim_ids"]), {"C1", "C2"})
+
+    def test_residual_question_does_not_inherit_answer_or_schedule_negation(self):
+        plan = {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [],
+                "allowed_relation_markers": [], "allowed_speakers": ["@Riven"],
+                "allowed_assignees": [], "polarity": ["negative"],
+                "modality": ["possible"], "conditions": [], "time_scope": []}
+        claim = {"claim_id": "C1", "statement": "Точное время не подтверждено.",
+                 "speaker_refs": ["@Riven"], "lifecycle": "active"}
+        question = {"text": "@Riven спрашивает: подтвердить точное время",
+                    "claim_ids": ["C1"], "section": "questions",
+                    "question_state": {"status": "partially_answered",
+                                       "original_question": claim["statement"],
+                                       "remaining_question": "подтвердить точное время"}}
+        assertion = {"text": "Точное время подтверждено.",
+                     "claim_ids": ["C1"], "section": "minutes"}
+        self.assertTrue(verify_generated_items([question], [plan], [claim])["passed"])
+        self.assertFalse(verify_generated_items([assertion], [plan], [claim])["passed"])
+
+    def test_public_quality_distinguishes_cross_view_reuse_from_duplicates(self):
+        item = {"text": "Подготовить TradingView.", "claim_ids": ["C1"],
+                "evidence_ids": ["U1"], "source_word_ids": ["W1"]}
+        report = publication_audit({"audits": []}, "# Итоги\n", [
+            {**item, "section": "overview"}, {**item, "section": "minutes"}], {})
+        self.assertEqual(report["duplicate_items"], 0)
+        self.assertEqual(report["cross_view_repetitions"], 1)
+        repeated = publication_audit({"audits": []}, "# Итоги\n", [
+            {**item, "section": "minutes"}, {**item, "section": "minutes"}], {})
+        self.assertEqual(repeated["duplicate_items"], 1)
+
+    def test_pending_task_removes_conflicting_agreement_wording(self):
+        claim = {"claim_id": "C1", "content_kind": "action", "kind": "action",
+                 "statement": "Предлагалось участники договорились параллельно размечать имбалансы и Order Block.",
+                 "lifecycle": "active", "verification_status": "supported",
+                 "canonical_task_state_id": "TS1", "evidence_ids": ["U1"],
+                 "source_word_ids": ["W1"], "start": 10,
+                 "speaker_refs": ["@A"], "social_state": "candidate"}
+        state = {"task_id": "TS1", "status": "assigned_pending",
+                 "deliverable": claim["statement"], "assignee": "@A",
+                 "evidence_ids": ["U1"], "source_word_ids": ["W1"]}
+        items = build_public_items(
+            {"claims": [claim], "task_states": [state]},
+            {"view_plans": {"tasks": {"selected_claim_ids": ["C1"]}}},
+        )
+        task = next(item for item in items if item["section"] == "tasks")
+        self.assertIn("Предлагалось параллельно размечать", task["text"])
+        self.assertNotIn("участники договорились", task["text"])
+
+    def test_confirmed_hypothesis_constraint_does_not_use_technical_budget(self):
+        items = [{"section": "technical", "content_kind": "observation",
+                  "social_state": "observation", "text": f"Тезис {index}."}
+                 for index in range(6)]
+        items.append({"section": "technical", "content_kind": "hypothesis",
+                      "social_state": "constraint", "text": "Техническое ограничение."})
+        report = publication_audit({"audits": []}, "# Итоги\n", items, {})
+        self.assertEqual(report["excessive_technical_items"], 0)
 
     def test_watcher_does_not_reenqueue_web_upload_under_storage_name(self):
         db = sqlite3.connect(":memory:")

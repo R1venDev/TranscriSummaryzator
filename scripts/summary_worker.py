@@ -4105,6 +4105,25 @@ def build_run_manifest(settings, cfg, source_manifest):
     }
 
 
+def rejection_reason_by_revision(denials):
+    """Keep exact rejected fact revisions even when an origin ID was rewritten.
+
+    Early candidates are captured before validation. A downstream duplicate
+    repair can change the origin identifier, but the rejected source revision
+    still has a concrete terminal review decision.
+    """
+    reasons = {}
+    for denial in denials:
+        source = denial.get("fact", {}) if isinstance(denial, dict) else {}
+        fact_id = source.get("fact_id")
+        evidence_ids = tuple(sorted(set(source.get("evidence_ids") or [])))
+        if fact_id and evidence_ids:
+            # Fact sequence numbers may be reused after a rejected item is
+            # removed. The evidence identity disambiguates that revision.
+            reasons[(fact_id, evidence_ids)] = str(denial.get("reason") or denial.get("verdict") or "review_rejected")
+    return reasons
+
+
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
     def persist_publication_failure(code, audit):
@@ -4528,7 +4547,9 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_text(output_dir / "transcript.html", "\n".join(transcript_lines) + "\n</html>\n")
     disposition = []
     rejected_sources = {}
-    for denial in list(fact_rejected) + list(publication_rejected) + list(semantic_rejected) + list(surface_rejected):
+    all_denials = list(fact_rejected) + list(publication_rejected) + list(semantic_rejected) + list(surface_rejected)
+    rejected_revisions = rejection_reason_by_revision(all_denials)
+    for denial in all_denials:
         source = denial.get("fact", {}) if isinstance(denial, dict) else {}
         if source.get("fact_id") or source.get("origin_id"):
             for origin in source.get("origin_ids", [source.get("origin_id") or source.get("fact_id")]):
@@ -4556,6 +4577,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         elif origin in tasks_sources or evidence & task_evidence: status, reason = "published_task", "canonical_task_state"
         elif origin in cited_sources or evidence & cited_evidence: status, reason = "published_other", "canonical_public_item"
         elif origin in rejected_sources: status, reason = "rejected", rejected_sources[origin]
+        elif (fact_id, tuple(sorted(evidence))) in rejected_revisions:
+            status, reason = "rejected", rejected_revisions[(fact_id, tuple(sorted(evidence)))]
         elif origin in canonical_rejections: status, reason = "canonical_rejected", "state_transition_with_provenance"
         elif candidate.get("kind") == "resource": status, reason = "not_a_work_result", "contextual_resource_without_commitment"
         elif candidate.get("kind") == "proposal": status, reason = "proposal_unconfirmed", "no_acceptance_or_assignee"
