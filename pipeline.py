@@ -76,6 +76,7 @@ def diagnostic_environment(job_id, job_dir, component):
         "TRANSCRISUMMARY_COMPONENT": component,
         "TRANSCRISUMMARY_JOB_ID": str(job_id),
         "TRANSCRISUMMARY_RUN_ID": str(getattr(diagnostic_environment, "run_id", "")),
+        "TRANSCRISUMMARY_ATTEMPT_ID": str(getattr(diagnostic_environment, "run_id", "")),
     }
 
 
@@ -397,6 +398,10 @@ def run_command(command, log_path, env=None, progress_callback=None, deadline_se
             process.wait()
         finally:
             selector.close()
+            # Popen does not close a PIPE until the file object is released;
+            # long-running workers otherwise accumulate BufferedReaders.
+            if process.stdout is not None:
+                process.stdout.close()
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
@@ -437,7 +442,7 @@ def load_json(path):
 
 
 def current_summary_output(base):
-    """Only a complete, explicitly committed generation is public."""
+    """Return only a complete generation whose files match its signed manifest."""
     base = Path(base)
     try:
         pointer = load_json(base / "summary_current.json")
@@ -446,11 +451,20 @@ def current_summary_output(base):
             return None
         target = base / "summary_generations" / generation_id
         manifest = load_json(target / "generation_manifest.json")
-        if manifest.get("generation_id") != generation_id or not manifest.get("artifact_sha256"):
+        digests = manifest.get("artifact_sha256")
+        if manifest.get("generation_id") != generation_id or not isinstance(digests, dict) or not digests:
             return None
+        for name, expected in digests.items():
+            path = target / str(name)
+            if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(expected or "")):
+                return None
+            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                return None
         return target
     except (OSError, ValueError, json.JSONDecodeError):
-        return base if not (base / "summary_current.json").exists() and (base / "summary.md").is_file() else None
+        # Legacy loose files have no integrity/provenance envelope and must
+        # never be silently presented as a committed generation.
+        return None
 
 
 def profile_path(profile_id):
@@ -1976,6 +1990,30 @@ def process_summary(job_id, force=False):
 
     worker_failure_detail = None
 
+    def publish_attempt(status, failure=None):
+        package = current_summary_output(output_dir)
+        manifest = load_json(package / "generation_manifest.json") if package else {}
+        rejected = []
+        candidates = sorted((job_dir / "summary_cache").glob("*/post_render_verification.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            try:
+                audit = load_json(candidates[0])
+                for item in audit.get("abstentions", [])[:25]:
+                    rejected.append({key: item.get(key) for key in ("public_id", "section", "claim_ids", "evidence_ids", "errors")})
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        envelope = {
+            "schema_version": 1, "job_id": job_id, "attempt_id": summary_run_id,
+            "attempted_commit": os.environ.get("TRANSCRISUMMARY_GIT_COMMIT"),
+            "attempt_status": status, "failure_stage": "post_render_verification" if rejected else ("summary_worker" if failure else None),
+            "failure_code": failure, "failure_items": rejected,
+            "displayed_generation_id": manifest.get("generation_id"),
+            "displayed_generation_sha256": manifest.get("verified_artifact_sha256"),
+            "displayed_generation_created_at": manifest.get("created_at"),
+            "fallback_reason": "last_attempt_failed" if failure and package else None,
+        }
+        write_json(output_dir / "summary_attempt.json", envelope)
+
     def summary_progress(line):
         nonlocal worker_failure_detail
         prefix = "SUMMARY_PROGRESS "
@@ -1994,6 +2032,7 @@ def process_summary(job_id, force=False):
             summary_progress=float(payload.get("progress", 0)),
             summary_detail=payload.get("detail", "Создаю саммари"),
         )
+        publish_attempt("published")
 
     command = [
         sys.executable, str(ROOT / "scripts" / "summary_worker.py"),
@@ -2032,6 +2071,7 @@ def process_summary(job_id, force=False):
             summary_error=worker_failure_detail or str(exc),
             summary_finished_at=now(),
         )
+        publish_attempt("failed", worker_failure_detail or str(exc))
         publish_diagnostics(job_dir / "diagnostics.jsonl", output_dir)
         if log.is_file():
             shutil.copy2(log, output_dir / "summary-processing.log")
@@ -2609,13 +2649,13 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
         if parsed.path == "/download":
             job_id = parse_qs(parsed.query).get("id", [""])[0]
             name = parse_qs(parsed.query).get("file", [""])[0]
-            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics.trace.jsonl", "diagnostics_summary.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
+            allowed = {"transcript.md", "transcript.txt", "transcript.html", "summary.html", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics.trace.jsonl", "diagnostics_summary.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json", "summary_attempt.json", "last_summary_failure.json"}
             if os.environ.get("TRANSCRISUMMARY_TRACE_EXPORT") != "1":
                 allowed.discard("diagnostics.trace.jsonl")
             row = connect().execute("SELECT output_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
             base = Path(row["output_dir"]) if row and row["output_dir"] else None
             package = current_summary_output(base) if base else None
-            summary_files = {"summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
+            summary_files = {"summary.md", "summary.html", "transcript.html", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
             target = (package if name in summary_files else base) / name if name in allowed and (package if name in summary_files else base) else None
             if not target or not target.is_file():
                 self.send_bytes(b"Not found", "text/plain", 404)
@@ -2645,8 +2685,18 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             title = html.escape(row["original_name"])
             status = html.escape(row["summary_detail"] or "Саммари ещё не создано")
             error = html.escape(row["summary_error"] or "")
+            attempt = {}
+            attempt_path = Path(row["output_dir"], "summary_attempt.json") if row["output_dir"] else None
+            if attempt_path and attempt_path.is_file():
+                try: attempt = load_json(attempt_path)
+                except (OSError, ValueError, json.JSONDecodeError): pass
+            fallback = ""
+            if ready and row["summary_status"] == "failed":
+                fallback = '<p class="error"><strong>Последняя генерация не прошла проверку.</strong> Ниже показана предыдущая успешная версия: {}. Причина: {}.</p>'.format(
+                    html.escape(str(attempt.get("displayed_generation_id") or "неизвестно")), error or "не указана")
             download_specs = [
                 ("summary.md", "Markdown", True),
+                ("transcript.html", "HTML расшифровка для таймкодов", False),
                 ("summary.json", "JSON", False),
                 ("tasks.json", "Задачи", False),
                 ("semantic_records.json", "Тезисы", False),
@@ -2659,6 +2709,8 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 ("diagnostics.trace.jsonl", "Per-item trace", False),
                 ("diagnostics_summary.json", "Сводка диагностики", False),
                 ("run_manifest.json", "Manifest", False),
+                ("summary_attempt.json", "Статус попытки", False),
+                ("last_summary_failure.json", "Причины последнего отказа", False),
             ]
             downloads = ""
             if ready:
@@ -2667,13 +2719,14 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                         ' class="primary"' if primary else "", job_id, name, label
                     )
                     for name, label, primary in download_specs
-                    if (package / name if name in {"summary.md", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
+                    if (package / name if name in {"summary.md", "summary.html", "transcript.html", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
                 )
-            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div><article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';if(j.summary_status==='done'&&document.querySelector('#content').style.display==='none')location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
+            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';if(j.summary_status==='done'&&document.querySelector('#content').style.display==='none')location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
                 title=title, job_id=int(job_id), content=content,
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
                 state_display="none" if ready and row["summary_status"] == "done" else "block", content_display="block" if ready else "none",
                 downloads=downloads,
+                fallback=fallback,
             )
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
             return

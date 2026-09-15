@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -2486,7 +2487,11 @@ def _public_text(item):
 
 def _chapter_label(text, limit=78):
     value = re.split(r"[.!?;]", re.sub(r"[*`]", "", text), maxsplit=1)[0].strip(" —:,")
-    return shorten_text(value, limit).rstrip(".…") or "Фрагмент обсуждения"
+    if len(value) > limit:
+        clauses = [part.strip(" —:,") for part in re.split(r"(?iu),|\s+[—–]\s+|\s+(?:и|или|потому что|из-за|после)\s+", value) if part.strip()]
+        value = next((part for part in clauses if 18 <= len(part) <= limit), clauses[0] if clauses else value)
+    value = shorten_text(value, limit).rstrip(".…")
+    return value if value and not re.search(r"(?iu)\b(?:и|или|что|чтобы|из-за|после)$", value) else "Ключевой результат эпизода"
 
 
 def build_public_document(items, metadata=None):
@@ -2495,36 +2500,65 @@ def build_public_document(items, metadata=None):
     by_section = {}
     for item in items:
         by_section.setdefault(item["section"], []).append(item)
-    overview = by_section.get("overview", [])
-    task = next((item for item in by_section.get("tasks", []) if item.get("social_state") in {"accepted", "self_committed", "assigned", "completed"}), None)
-    title_sources = ([overview[0]] if overview else []) + ([task] if task and task not in overview else [])
+    def utility(item):
+        text = _public_text(item)
+        score = 2 * bool(re.search(r"(?iu)\b(?:не\s+работ|неуспеш|огранич|проблем|решил|соглас|провер|следующ|задерж|результат)\w*", text))
+        score += 2 * (item.get("section") in {"decisions", "tasks", "technical"})
+        score += bool(item.get("evidence_ids")) + bool(item.get("source_word_ids"))
+        score -= 3 * bool(re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|определяется|называется)\b", text))
+        score -= 3 * bool(item.get("verification_status") in {"verification_unavailable", "insufficient_evidence"})
+        return score
+    overview = sorted(by_section.get("overview", []), key=lambda item: (-utility(item), float(item.get("start", 0))))[:5]
+    title_sources = sorted(overview + by_section.get("technical", []) + by_section.get("tasks", []), key=lambda item: (-utility(item), float(item.get("start", 0))))[:3]
     if not title_sources:
         title_sources = list(items[:1])
-    title_parts = [_chapter_label(_public_text(item), 72) for item in title_sources]
-    title = "; следующие шаги: ".join(dict.fromkeys(title_parts)) or "Итоги встречи и следующие шаги"
+    entities = list(dict.fromkeys(entity for item in title_sources for entity in item.get("topic_entities", []) if entity))[:3]
+    title = ("Результаты и следующие проверки: " + ", ".join(entities)) if entities else _chapter_label(_public_text(title_sources[0]), 104)
+    title = shorten_text(title, 110).rstrip(".…")
     minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
-    chapter_count = min(9, max(1, math.ceil(len(minute_items) / 4))) if minute_items else 0
+    episode_groups = []
+    for item in minute_items:
+        episode = item.get("episode_id")
+        topics = set(item.get("topic_entities", []))
+        previous = episode_groups[-1] if episode_groups else None
+        same_topic = previous and topics and topics & previous["topics"]
+        near = previous and float(item.get("start", 0)) - float(previous["items"][-1].get("start", 0)) <= 240
+        if previous and ((episode and episode == previous["episode"]) or (not episode and same_topic and near)):
+            previous["items"].append(item); previous["topics"].update(topics)
+        else:
+            episode_groups.append({"episode": episode, "topics": topics, "items": [item]})
+    # Avoid dozens of micro-chapters while preserving the beginning and end.
+    while len(episode_groups) > 9:
+        smallest = min(range(len(episode_groups)), key=lambda i: len(episode_groups[i]["items"]))
+        target = smallest - 1 if smallest else 1
+        episode_groups[target]["items"] = sorted(episode_groups[target]["items"] + episode_groups[smallest]["items"], key=lambda x: float(x.get("start", 0)))
+        episode_groups[target]["topics"].update(episode_groups[smallest]["topics"])
+        episode_groups.pop(smallest)
     chapters = []
-    for index in range(chapter_count):
-        first = round(index * len(minute_items) / chapter_count)
-        last = round((index + 1) * len(minute_items) / chapter_count)
-        members = minute_items[first:last]
+    for index, group in enumerate(episode_groups):
+        members = group["items"]
         if not members:
             continue
+        label = ", ".join(list(group["topics"])[:3]) if group["topics"] else _chapter_label(_public_text(max(members, key=utility)))
         chapters.append({
-            "chapter_id": f"CH{index + 1:02d}", "label": _chapter_label(_public_text(members[0])),
+            "chapter_id": f"CH{index + 1:02d}", "label": _chapter_label(label),
             "start": float(members[0].get("start", 0)), "end": float(members[-1].get("start", 0)),
             "claim_ids": [claim for item in members for claim in item.get("claim_ids", [])],
             "evidence_ids": [evidence for item in members for evidence in item.get("evidence_ids", [])],
             "items": members,
         })
+    outcome_cards = [{"outcome_id": f"OC{i + 1:02d}", "topic": chapter["label"],
+                      "current_state": _public_text(max(chapter["items"], key=utility)),
+                      "status": "evidence_backed", "claim_ids": chapter["claim_ids"], "evidence_ids": chapter["evidence_ids"]}
+                     for i, chapter in enumerate(chapters)]
     return {
-        "schema": "PublicDocument", "schema_version": 2,
+        "schema": "PublicDocument", "schema_version": 3,
         "title": {"text": title, "claim_ids": [claim for item in title_sources for claim in item.get("claim_ids", [])], "evidence_ids": [evidence for item in title_sources for evidence in item.get("evidence_ids", [])]},
         "overview": [{"text": _public_text(item), "claim_ids": item.get("claim_ids", []), "evidence_ids": item.get("evidence_ids", [])} for item in overview],
         "sections": {key: value for key, value in by_section.items() if key not in {"overview", "minutes"}},
         "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "claim_ids", "evidence_ids")} for chapter in chapters],
         "chronology": chapters,
+        "outcome_cards": outcome_cards,
         "metadata": dict(metadata),
     }
 
@@ -2549,7 +2583,7 @@ def render_public_document(document):
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
             lines.append(f"- {start}–{end} — {chapter['label']}")
-    headings = {"decisions": "Принятые решения", "rules": "Упомянутые действующие правила", "tasks": "Договорённости и следующие шаги", "questions": "Что осталось уточнить", "technical": "Технические выводы и ограничения", "experiments": "Идеи и эксперименты", "requires_verification": "Требует проверки источника"}
+    headings = {"decisions": "Принятые решения", "rules": "Упомянутые действующие правила", "tasks": "Действия и планы на подтверждение", "questions": "Что осталось уточнить", "technical": "Технические выводы и ограничения", "experiments": "Идеи и эксперименты, ещё не проверенные", "requires_verification": "Требует проверки источника"}
     prefixes = {"decisions": "D", "rules": "R", "tasks": "T", "questions": "Q", "experiments": "H", "technical": "X", "requires_verification": "V"}
     for section in ("decisions", "rules", "tasks", "questions", "technical", "experiments", "requires_verification"):
         section_items = document.get("sections", {}).get(section, [])
@@ -4030,13 +4064,16 @@ def build_run_manifest(settings, cfg, source_manifest):
     roles = ("extractor", "arbitrator", "high_risk_verifier", "critical_secondary_verifier", "writer", "auditor", "public_auditor")
     inventory = settings.get("model_inventory", {})
     return {
-        "schema_version": 2,
+        "schema_version": 3,
+        "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
+        "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or os.environ.get("TRANSCRISUMMARY_RUN_ID"),
         "pipeline_version": PIPELINE_VERSION,
         "schemas": {**SCHEMA_VERSIONS, "semantic": 5, "summary_view": 2},
         "git_commit": release_commit(),
         "declared_release_marker": declared_release_marker(),
         "worker_sha256": settings.get("worker_hash"),
         "config_sha256": stable_hash(cfg),
+        "resolved_config_redacted": {key: ("[REDACTED]" if any(mark in key.casefold() for mark in ("token", "secret", "password", "api_key")) else value) for key, value in cfg.items()},
         "prompt_versions": {
             "extraction": PIPELINE_VERSION + ":extract-v1",
             "semantic_records": PIPELINE_VERSION + ":semantic-v1",
@@ -4061,12 +4098,26 @@ def build_run_manifest(settings, cfg, source_manifest):
         },
         "vocabulary_sha256": hashlib.sha256(vocabulary.read_bytes()).hexdigest() if vocabulary.is_file() else None,
         "input_audio_sha256": source_manifest.get("audio_sha256"),
-        "transcript_sha256": settings.get("transcript"),
+        "transcript_sha256": settings.get("transcript_artifact_sha256"),
+        "utterance_content_sha256": settings.get("utterance_content_sha256"),
+        "presentation_title_sha256": settings.get("presentation_title_sha256"),
+        "release_tree_sha256": settings.get("worker_hash"),
     }
 
 
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
+    def persist_publication_failure(code, audit):
+        rejected = audit.get("abstentions") or [{"errors": audit.get("errors", [])}]
+        safe = [{key: item.get(key) for key in ("public_id", "section", "claim_ids", "evidence_ids", "errors", "source_word_ids")}
+                for item in rejected[:25]]
+        atomic_json(output_dir / "last_summary_failure.json", {
+            "schema_version": 1, "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
+            "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or os.environ.get("TRANSCRISUMMARY_RUN_ID"),
+            "attempted_commit": release_commit(), "failure_stage": code,
+            "failure_code": code, "failure_count": len(rejected), "failure_items": safe,
+            "retained_local_audit": str(run_dir / ("post_render_verification.json" if "post_render" in code else "public_document_verification.json")),
+        })
     # Capture candidates before any editorial/model pass can remove them.
     prevalidation_registry = load_json(run_dir / "early_candidates.json") if (run_dir / "early_candidates.json").is_file() else {"candidates": []}
     early_candidates = list(prevalidation_registry.get("candidates", []))
@@ -4078,6 +4129,21 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
                         for fact in final_facts if fact.get("type") in {"action", "follow_up", "resource", "decision"}]
     known_origins = {item["origin_id"] for item in early_candidates}
     early_candidates.extend(item for item in later_candidates if item["origin_id"] not in known_origins)
+    utterance_word_ids = {str(turn.get("id")): list(turn.get("source_word_ids") or [word.get("word_id") for word in turn.get("words", []) if word.get("word_id")])
+                          for turn in transcript_document.get("utterances", [])}
+    seen_origins = {}
+    for index, candidate in enumerate(early_candidates):
+        candidate["proposition_index"] = int(candidate.get("proposition_index", index))
+        evidence_key = "|".join(map(str, candidate.get("evidence_ids", [])))
+        normalized = normalize_space(candidate.get("statement", "")).casefold()
+        origin = candidate.get("origin_id")
+        if not origin or (origin in seen_origins and seen_origins[origin] != normalized):
+            origin = "OR" + hashlib.sha256(f"{settings.get('utterance_content_sha256')}|{evidence_key}|{candidate['proposition_index']}|{normalized}".encode()).hexdigest()[:20]
+            candidate["origin_id"] = origin
+        seen_origins[origin] = normalized
+        if not candidate.get("source_word_ids"):
+            candidate["source_word_ids"] = list(dict.fromkeys(word for evidence in candidate.get("evidence_ids", []) for word in utterance_word_ids.get(str(evidence), [])))
+        candidate["provenance_granularity"] = "word" if candidate.get("source_word_ids") else "utterance"
     atomic_json(run_dir / "early_candidates.json", {"schema_version": 1, "candidates": early_candidates})
     source_turns = transcript_utterances(transcript_document)
     total_seconds = float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0)
@@ -4270,6 +4336,14 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     })
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     public_items = build_public_items(state_v2, summary_plan)
+    question_states = state_v2.get("question_states", [])
+    semantic_counts.update({
+        "retrieved_question_count": len(question_states),
+        "resolved_question_count": sum(q.get("status") in {"answered", "rhetorical", "superseded"} for q in question_states),
+        "selected_residual_question_count": sum(item.get("section") == "questions" for item in public_items),
+        "false_open_question_count": sum(item.get("section") == "questions" and item.get("question_state", {}).get("status") in {"answered", "rhetorical", "superseded"} for item in public_items),
+        "question_metric_stage": "canonical_state_to_public_selection",
+    })
     anchor_by_id = {turn["id"]: float(turn.get("start", 0)) for turn in source_turns}
     anchor_starts = set(anchor_by_id.values())
     for item in public_items:
@@ -4285,6 +4359,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
     if not post_render_audit["passed"]:
         atomic_json(run_dir / "post_render_verification.json", post_render_audit)
+        persist_publication_failure("post_render_verification", post_render_audit)
         raise RuntimeError("Post-render PublicItem verification rejected publication")
     final_document = build_public_document(public_items, metadata={
         "source": transcript_document.get("source"),
@@ -4299,6 +4374,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     document_verification = verify_public_document(final_document, markdown, public_items)
     if not document_verification["passed"]:
         atomic_json(run_dir / "public_document_verification.json", document_verification)
+        persist_publication_failure("public_document_verification", document_verification)
         raise RuntimeError("Final PublicDocument verification rejected publication")
     verified_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
     quality_gates = runtime_quality_gates(post_render_audit, markdown, verified_hash, public_items, summary_plan)
@@ -4313,6 +4389,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(run_dir / "runtime_quality_gates.json", quality_gates)
     atomic_json(run_dir / "publication_audit.json", quality_gates)
     if not quality_gates["passed"]:
+        persist_publication_failure("runtime_quality_gates", quality_gates)
         raise RuntimeError("Runtime public quality gates rejected publication")
     atomic_json(run_dir / "summary.final.json", final_document)
     atomic_json(run_dir / "audit.json", {
@@ -4332,7 +4409,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "provenance": provenance,
     })
 
-    if stable_hash(load_json(output_dir / "transcript.json")) != settings["transcript"]:
+    if stable_hash(load_json(output_dir / "transcript.json").get("utterances", [])) != settings["transcript"]:
         raise RuntimeError("Стенограмма изменилась во время генерации; публикация устаревшего саммари остановлена")
     claim_by_id = {item["claim_id"]: item for item in state_v2["claims"]}
     plan_audits = []
@@ -4348,6 +4425,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         raise RuntimeError("Plan-before-write verification rejected a public sentence")
     base_output = output_dir
     generation_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(6).hex()
+    run_manifest["generation_id"] = generation_id
+    run_manifest["generation_created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     generations = base_output / "summary_generations"
     generations.mkdir(parents=True, exist_ok=True)
     output_dir = generations / (generation_id + ".pending")
@@ -4406,6 +4485,8 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             "meeting_graph.json": output_dir / "semantics" / "meeting_state.v2.json",
         }.items()
     }
+    run_manifest["publication_outcome"] = "published"
+    run_manifest["performance_metric_scope"] = "published_generation"
     atomic_json(output_dir / "run_manifest.json", run_manifest)
     # Project memory is an optional side effect, never a publication gate.
     projections = project_views(state_v2, summary_plan)
@@ -4481,8 +4562,19 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         elif candidate.get("kind") == "follow_up" and re.search(r"(?iu)\b(?:вопрос|уточнение|спрашива)", candidate.get("statement", "")):
             status, reason = "not_a_work_result", "interrogative_routed_out_of_commitments"
         else: status, reason = "unresolved", "candidate_lost_after_review_or_planning"
-        disposition.append({"origin_id": candidate["origin_id"], "fact_id": fact_id, "status": status, "reason": reason})
-    atomic_json(output_dir / "candidate_disposition.json", {"schema_version": 1, "candidates": early_candidates, "dispositions": disposition})
+        matching_items = [item for item in public_items if evidence & set(item.get("evidence_ids", []))]
+        disposition.append({"origin_id": candidate["origin_id"], "revision_id": fact_id, "fact_id": fact_id,
+                            "status": status, "reason": reason,
+                            "published_public_ids": sorted({item.get("public_id") for item in matching_items if item.get("public_id")}),
+                            "claim_ids": sorted({claim for item in matching_items for claim in item.get("claim_ids", [])}),
+                            "task_state_ids": sorted({item.get("task_state_id") for item in matching_items if item.get("task_state_id")})})
+    origin_ids = [item.get("origin_id") for item in early_candidates]
+    if len(origin_ids) != len(set(origin_ids)) or {item.get("origin_id") for item in disposition} != set(origin_ids):
+        raise RuntimeError("Candidate lineage invariant failed")
+    atomic_json(output_dir / "candidate_disposition.json", {"schema_version": 2, "candidates": early_candidates, "dispositions": disposition,
+                "integrity": {"passed": True, "unique_origin_count": len(set(origin_ids)),
+                              "word_granularity_count": sum(x.get("provenance_granularity") == "word" for x in early_candidates),
+                              "utterance_granularity_count": sum(x.get("provenance_granularity") == "utterance" for x in early_candidates)}})
     unresolved = [item["fact_id"] for item in disposition if item["status"] == "unresolved"]
     if unresolved:
         atomic_json(run_dir / "candidate_disposition_failed.json", {"unresolved": unresolved, "dispositions": disposition})
@@ -4493,13 +4585,19 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     integrity = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in required}
     if integrity["summary.md"] != verified_hash:
         raise RuntimeError("Generation content differs from verified Markdown")
-    atomic_json(output_dir / "generation_manifest.json", {"schema_version": 1, "generation_id": generation_id,
-                "transcript_hash": settings["transcript"], "artifact_sha256": integrity, "verified_artifact_sha256": verified_hash})
-    if stable_hash(load_json(base_output / "transcript.json")) != settings["transcript"]:
+    atomic_json(output_dir / "generation_manifest.json", {"schema_version": 2, "generation_id": generation_id,
+                "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
+                "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or os.environ.get("TRANSCRISUMMARY_RUN_ID"),
+                "git_commit": release_commit(), "created_at": run_manifest.get("generation_created_at"),
+                "transcript_hash": settings["transcript"], "utterance_content_sha256": settings.get("utterance_content_sha256"),
+                "artifact_sha256": integrity, "verified_artifact_sha256": verified_hash})
+    if stable_hash(load_json(base_output / "transcript.json").get("utterances", [])) != settings["transcript"]:
         raise RuntimeError("Стенограмма изменилась во время публикации поколения")
     final_generation = generations / generation_id
     os.replace(output_dir, final_generation)
-    atomic_json(base_output / "summary_current.json", {"schema_version": 1, "generation_id": generation_id,
+    atomic_json(base_output / "summary_current.json", {"schema_version": 2, "generation_id": generation_id,
+                "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
+                "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or os.environ.get("TRANSCRISUMMARY_RUN_ID"),
                 "transcript_hash": settings["transcript"], "verified_artifact_sha256": verified_hash})
     if cfg.get("summary_project_memory_enabled", False):
         try:
@@ -4531,32 +4629,17 @@ def main():
     settings = {
         "version": PIPELINE_VERSION,
         "config": {k: v for k, v in cfg.items() if k.startswith("summary_")},
+        # Hash every executable dependency in the release tree.  A manually
+        # curated list silently missed semantic modules in previous builds.
         "worker_hash": stable_hash({
             str(path.relative_to(APPLICATION_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in (
-                Path(__file__), Path(__file__).with_name("quality_schema.py"),
-                Path(__file__).with_name("evidence_ledger.py"), Path(__file__).with_name("evidence_repair.py"),
-                Path(__file__).with_name("semantic_contracts.py"), Path(__file__).with_name("speech_acts.py"),
-                Path(__file__).with_name("meeting_intelligence.py"),
-                Path(__file__).with_name("diagnostics.py"),
-                Path(__file__).with_name("config_schema.py"),
-                APPLICATION_ROOT / "contracts" / "__init__.py",
-                APPLICATION_ROOT / "contracts" / "meeting.py",
-                APPLICATION_ROOT / "semantics" / "meeting_graph.py",
-                APPLICATION_ROOT / "semantics" / "ontology.py",
-                APPLICATION_ROOT / "semantics" / "propositions.py",
-                APPLICATION_ROOT / "semantics" / "reducers.py",
-                APPLICATION_ROOT / "semantics" / "relation_resolver.py",
-                APPLICATION_ROOT / "semantics" / "episodes.py",
-                APPLICATION_ROOT / "summary" / "planner.py",
-                APPLICATION_ROOT / "summary" / "verifier.py",
-                APPLICATION_ROOT / "summary" / "views.py",
-                APPLICATION_ROOT / "pipeline_core" / "dag.py",
-                APPLICATION_ROOT / "pipeline_core" / "models.py",
-                APPLICATION_ROOT / "project_memory" / "graph_store.py",
-            )
+            for root in ("scripts", "contracts", "semantics", "summary", "pipeline_core", "project_memory")
+            for path in sorted((APPLICATION_ROOT / root).rglob("*.py"))
         }),
-        "transcript": stable_hash(transcript),
+        "transcript": stable_hash(transcript.get("utterances", [])),
+        "transcript_artifact_sha256": stable_hash(transcript),
+        "utterance_content_sha256": stable_hash(transcript.get("utterances", [])),
+        "presentation_title_sha256": stable_hash(transcript.get("title") or transcript.get("source") or ""),
         "extractor": cfg.get("summary_extractor_model", "qwen3.5:9b-q4_K_M"),
         "arbitrator": cfg["summary_arbitrator_model"],
         "high_risk_verifier": cfg.get("summary_high_risk_verifier_model", cfg["summary_arbitrator_model"]),

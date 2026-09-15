@@ -172,7 +172,7 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
         ]
         rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
-        self.assertIn("Обсудили фильтрацию сигналов", rendered.splitlines()[0])
+        self.assertIn("Результаты и следующие проверки: Order Block, Bitcoin", rendered.splitlines()[0])
         self.assertNotIn("торговой системы", rendered.splitlines()[0])
         overview = rendered.split("## Главное", 1)[1].split("## Таймкоды", 1)[0]
         self.assertNotIn("\n- ", overview)

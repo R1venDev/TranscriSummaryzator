@@ -32,6 +32,7 @@ _job_id = os.environ.get("TRANSCRISUMMARY_JOB_ID")
 _lock = threading.Lock()
 _SENSITIVE = ("password", "passwd", "secret", "token", "authorization", "cookie", "api_key",
               "statement", "utterance", "prompt", "transcript", "raw_text", "source_text", "dialogue_evidence")
+_SAFE_TELEMETRY_KEYS = {"utterances", "utterance_count", "transcript_sha256", "audio_sha256", "worker_sha256", "config_sha256"}
 
 
 def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path=None):
@@ -61,7 +62,7 @@ def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path
 def _safe(value, key="", depth=0):
     lowered = key.casefold()
     telemetry_token_key = lowered in {"prompt_tokens", "output_tokens", "prompt_eval_count", "eval_count", "tokens"}
-    if not telemetry_token_key and any(marker in lowered for marker in _SENSITIVE):
+    if lowered not in _SAFE_TELEMETRY_KEYS and not telemetry_token_key and any(marker in lowered for marker in _SENSITIVE):
         return "[REDACTED]"
     if depth > 8:
         return "[MAX_DEPTH]"
@@ -183,6 +184,7 @@ def summarize(path):
     durations, llm_durations, stage_durations, slow, tokens, calls, retries, cache_hits, cache_total = [], [], [], [], Counter(), 0, 0, 0, 0
     groups, request_keys, repeated_without_progress = {}, Counter(), Counter()
     request_attempts, failed_attempts, completed_attempts, stage_models = {}, set(), set(), {}
+    fatal_events, successful_lifecycles = [], set()
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -202,6 +204,9 @@ def summarize(path):
                 if item.get("outcome") in {"failed_terminal", "timeout", "rejected_publication", "fatal"}:
                     first_fatal = first_fatal or last_error
                     last_fatal = last_error
+                    fatal_events.append((str(item.get("attempt_id") or "unknown"), last_error))
+            if item.get("name") in {"summary_job", "pipeline_job"} and item.get("outcome") == "completed":
+                successful_lifecycles.add(str(item.get("attempt_id") or "unknown"))
             if item.get("severity") in {"WARN", "WARNING"}:
                 last_warning = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
             duration = item.get("duration_ms")
@@ -241,6 +246,9 @@ def summarize(path):
         def percentile(p):
             return values[min(len(values)-1, int((len(values)-1)*p))] if values else None
         return {"p50": percentile(.50), "p95": percentile(.95), "max": max(values) if values else None}
+    unrecovered_fatals = [value for attempt, value in fatal_events if attempt not in successful_lifecycles]
+    first_fatal = unrecovered_fatals[0] if unrecovered_fatals else None
+    last_fatal = unrecovered_fatals[-1] if unrecovered_fatals else None
     return {
         "schema_version": SCHEMA_VERSION, "events": total, "malformed_lines": malformed,
         "first_timestamp": first, "last_timestamp": last,

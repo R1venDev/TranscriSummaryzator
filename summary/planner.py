@@ -32,7 +32,7 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes")
     minutes = max([float(x.get("end", x.get("start", 0))) for x in active] or [0]) / 60
     threads = len({x.get("thread_id") for x in active if x.get("thread_id")}) or len(episodes)
     base = math.ceil(math.sqrt(max(1, minutes)) + 1.5 * threads + sum(_mandatory(x) for x in active) + len({_kind(x) for x in active}))
-    configured = {"executive": (5, 7), "technical": (6, 16), "tasks": (3, 120), "experiments": (3, 12), "questions": (3, 10), "minutes": (16, 32)}
+    configured = {"executive": (4, 5), "technical": (4, 6), "tasks": (3, 120), "experiments": (2, 5), "questions": (3, 5), "minutes": (16, 32)}
     low, high = configured.get(view, (minimum, maximum))
     return max(low, min(high, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 2.0}.get(view, 1))))
 
@@ -40,11 +40,19 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes")
 def _utility(claim, score_fn, view):
     risk = max([float(v or 0) for v in claim.get("risk", {}).values() if isinstance(v, (int, float))] or [0])
     closing_schedule = 8 if view == "questions" and _kind(claim) == "schedule" else 0
-    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + 2 * (1-risk) + 2 * _mandatory(claim) + closing_schedule
+    text = str(claim.get("statement") or "")
+    definition_only = bool(re.search(r"(?iu)\b(?:называется|определяется|это\s+когда|ширина\s*[—–-]\s*ширина)\b", text))
+    non_work = bool(re.search(r"(?iu)\b(?:шутк|ха-ха|смешно|камышов|табзон)\w*", text))
+    no_deliverable = _kind(claim) in {"action", "follow_up"} and not re.search(r"(?iu)\b(?:показ|переда|отправ|сдела|размет|провер|исправ|встро|подготов)\w*", text)
+    raw_slot = bool(re.search(r"(?u)\b[a-z]+_[a-z_]+\b", text))
+    penalty = 4 * definition_only + 8 * non_work + 4 * no_deliverable + 8 * raw_slot + 4 * (claim.get("verification_status") == "verification_unavailable")
+    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + 2 * (1-risk) + 2 * _mandatory(claim) + closing_schedule - penalty
 
 
 def _select(claims, score_fn, view, budget):
     eligible = [x for x in claims if x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view] or (view == "tasks" and x.get("canonical_task_state_id")))]
+    if view == "technical":
+        eligible = [x for x in eligible if not re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|называется|определяется)\b", str(x.get("statement") or ""))]
     if view == "tasks":
         eligible = [x for x in eligible if x.get("canonical_task_anchor", True)]
     if view == "questions":

@@ -1,4 +1,5 @@
 """Release checks for public generations, links and stuck stage processes."""
+import hashlib
 import json
 import sqlite3
 import sys
@@ -68,8 +69,9 @@ class GenerationTests(unittest.TestCase):
             self.assertIsNone(current_summary_output(base))
             final = pending.with_name(generation)
             pending.rename(final)
+            digest = hashlib.sha256((final / "summary.md").read_bytes()).hexdigest()
             (final / "generation_manifest.json").write_text(json.dumps({
-                "generation_id": generation, "artifact_sha256": {"summary.md": "hash"}}), encoding="utf-8")
+                "generation_id": generation, "artifact_sha256": {"summary.md": digest}}), encoding="utf-8")
             (base / "summary_current.json").write_text(json.dumps({"generation_id": generation}), encoding="utf-8")
             self.assertEqual(current_summary_output(base), final)
             (base / "summary_current.json").write_text(json.dumps({"generation_id": "../unsafe"}), encoding="utf-8")

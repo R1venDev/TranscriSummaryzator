@@ -139,6 +139,36 @@ class DecisionState(StrictModel):
     status: DecisionStatus = DecisionStatus.CANDIDATE
 
 
+class ActionFrame(StrictModel):
+    """Actor-safe representation built before a task is projected publicly."""
+    speaker: Optional[str] = None
+    grammatical_actor: Optional[str] = None
+    mentioned_people: list[str] = Field(default_factory=list)
+    beneficiary: Optional[str] = None
+    proposed_by: Optional[str] = None
+    proposed_for: Optional[str] = None
+    assignment_target: Optional[str] = None
+    explicit_acceptance_actor: Optional[str] = None
+    utterance_ids: list[str] = Field(min_length=1)
+    alias_resolution: dict[str, str] = Field(default_factory=dict)
+    confidence: float = Field(0, ge=0, le=1)
+    state: Literal["reported_plan", "proposal", "assigned_pending", "self_intention", "commitment", "accepted", "rejected"]
+
+
+class OutcomeCard(StrictModel):
+    outcome_id: str
+    topic: str
+    user_need: Optional[str] = None
+    current_state: str
+    issue_or_risk: Optional[str] = None
+    work_result: Optional[str] = None
+    next_action: Optional[str] = None
+    open_decision: Optional[str] = None
+    status: str
+    claim_ids: list[str] = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+
+
 class PublicItemContract(StrictModel):
     public_id: str
     section: Literal["overview", "decisions", "rules", "tasks", "questions", "technical", "experiments", "minutes", "contributions", "requires_verification"]
@@ -157,6 +187,8 @@ class PublicItemContract(StrictModel):
     topic_entities: list[str] = Field(default_factory=list)
     context_ids: list[str] = Field(default_factory=list)
     verification_status: Literal["supported", "contradicted", "insufficient_evidence", "verification_unavailable"] = "supported"
+    navigation_basis: Optional[Literal["supporting_utterance", "nearest_utterance_fallback"]] = None
+    aspect_id: Optional[str] = None
 
 
 class SentencePlan(StrictModel):

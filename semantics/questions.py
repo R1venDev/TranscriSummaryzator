@@ -3,6 +3,23 @@ from __future__ import annotations
 import re
 
 
+SLOT_ALIASES = {
+    "closing": "yes_no", "decision": "yes_no", "possibility": "yes_no",
+    "диапазон времени": "time_range", "exact_time": "time_range",
+    "should_misha_make_orderblock_labeler": "actor_commitment",
+    "rhythmic entry success": "implementation_status",
+    "rhythmic_entry_implementation": "implementation_status",
+    "high_tf_result": "implementation_status", "result on higher timeframes": "implementation_status",
+    "definition small imbalance": "threshold_value",
+    "reversal zone bos condition": "reason_hypothesis",
+}
+
+
+def normalize_slot(slot):
+    value = re.sub(r"[_\s]+", " ", str(slot or "").strip().casefold())
+    return SLOT_ALIASES.get(value, SLOT_ALIASES.get(str(slot or "").strip().casefold(), value.replace(" ", "_")))
+
+
 def _tokens(value):
     return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 2}
 
@@ -32,16 +49,24 @@ def verify_slot_entailment(requested_slots, answer, question=None):
     relevant = not topics or bool(topics & _tokens(text)) or bool(structured)
     numbers = re.findall(r"(?<!\w)\d+(?:[.,]\d+)?", text)
     entailed = {}
-    for slot in requested_slots:
-        if slot in structured and structured[slot] not in (None, "", []):
-            entailed[slot] = structured[slot]
-        elif slot in {"number", "quantity", "number_of_trades"} and len(numbers) == 1 and relevant and (
-                slot != "number_of_trades" or re.search(r"(?iu)\b(?:сделк\w*|вход\w*|позици\w*)\b", text)):
-            entailed[slot] = numbers[0]
-        elif (slot in {"closing", "yes_no", "decision", "possibility"} and
+    for original_slot in requested_slots:
+        slot = normalize_slot(original_slot)
+        structured_value = structured.get(original_slot, structured.get(slot))
+        if structured_value not in (None, "", []):
+            entailed[original_slot] = structured_value
+        elif slot in {"number", "quantity", "number_of_trades", "threshold_value"} and len(numbers) == 1 and relevant and (
+                slot not in {"number_of_trades", "threshold_value"} or re.search(r"(?iu)\b(?:сделк\w*|вход\w*|позици\w*|порог\w*|размер\w*|ширин\w*)\b", text)):
+            entailed[original_slot] = numbers[0]
+        elif slot == "time_range" and (relevant or answer.get("speech_act") == "answer") and re.search(r"(?iu)\b\d{1,2}(?::\d{2})?\s*(?:[-–—]|или|до)\s*\d{1,2}(?::\d{2})?\b", text):
+            entailed[original_slot] = text
+        elif (slot in {"yes_no", "actor_commitment"} and
               re.fullmatch(r"(?iu)\s*(?:нет|неа|да|ага)(?:[.!])?\s*", text) and
               answer.get("speech_act") in {"answer", "accept", "reject"}):
-            entailed[slot] = "нет" if re.search(r"(?iu)\b(?:нет|неа)\b", text) else "да"
-        elif slot == "closing" and relevant and re.search(r"(?iu)\b(?:закрыва\w*|закро\w*)\b", text):
-            entailed[slot] = text
+            entailed[original_slot] = "нет" if re.search(r"(?iu)\b(?:нет|неа)\b", text) else "да"
+        elif slot == "implementation_status" and relevant and re.search(r"(?iu)\b(?:работа\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*)\b", text):
+            entailed[original_slot] = text
+        elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
+            entailed[original_slot] = text
+        elif original_slot == "closing" and relevant and re.search(r"(?iu)\b(?:закрыва\w*|закро\w*)\b", text):
+            entailed[original_slot] = text
     return {"entailed_slots": entailed, "missing_slots": [x for x in requested_slots if x not in entailed], "passed": bool(requested_slots) and len(entailed) == len(requested_slots)}
