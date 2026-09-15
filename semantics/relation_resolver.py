@@ -56,6 +56,9 @@ def resolve_relations(propositions, events, records):
         for target_id in record.get("supersedes_record_ids", []) + record.get("revises_record_ids", []):
             target = prop_by_record.get(target_id)
             if target: add("supersedes", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "explicit_revision")
+        for target_id in record.get("accepts_record_ids", []):
+            target = prop_by_record.get(target_id)
+            if target: add("accepts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "source_grounded_short_reply")
     for index, event in enumerate(ordered):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]

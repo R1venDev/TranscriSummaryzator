@@ -151,7 +151,12 @@ def reduce_tasks(propositions, events, relations, records):
             accepted = bool(_incoming(source_prop["proposition_id"], relations, {"accepts", "confirms"})) if source_prop else False
             source_events = [x for x in events if x["proposition_id"] == source_prop["proposition_id"]] if source_prop else []
             asserted = any(x["speech_act"] in {"assert", "answer", "decide"} for x in source_events)
-            selected_scope = accepted or asserted or not scope
+            # A later technical constraint (for example, a four-hour
+            # simulation window) is not automatically a revision of an
+            # already established delivery scope (for example, one month of
+            # source data). It may fill an empty scope, but replacing a scope
+            # requires an acceptance or a non-constraint assertion.
+            selected_scope = accepted or (asserted and source_prop.get("content_kind") != "constraint") or not scope
             if selected_scope:
                 if scope and scope != value:
                     scope_history.append({"value": scope, "status": "superseded", "relation_id": relation["relation_id"]})

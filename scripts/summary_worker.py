@@ -194,13 +194,15 @@ def ensure_closing_schedule_question(records, utterances):
         else f"Следующий созвон предложен на {day}; варианты времени: {' или '.join(times)}. Точное время не подтверждено."
     )
     evidence_ids = [x["id"] for x in candidates]
+    question_asker = next((x.get("speaker") for x in reversed(candidates)
+                           if x.get("speaker") and ("?" in x.get("text", "") or re.search(r"(?iu)\b(?:когда|сможешь|удобно|созвон)\b", x.get("text", "")))), None)
     records = [r for r in records if r not in existing_schedule or r.get("question_status") in {"answered", "resolved"}]
     records.append({
         "record_id": "F-CLOSING-SCHEDULE", "kind": "schedule", "content_kind": "schedule",
         "topic": "время следующего созвона", "statement": statement,
         "start": min(x["start"] for x in candidates), "end": max(x["end"] for x in candidates),
         "speech_act": "assert" if answered else "ask", "modality": "certain" if answered else "tentative", "polarity": "positive" if answered else "negative",
-        "attributed_speakers": sorted({x.get("speaker") for x in candidates if x.get("speaker")}),
+        "attributed_speakers": [question_asker] if question_asker else sorted({x.get("speaker") for x in candidates if x.get("speaker")}),
         "requested_slots": ["day", "exact_time"], "answered_slots": ["day", "exact_time"] if answered else ["day"],
         "question_status": "answered" if answered else "partially_answered", "question_intent": "next_meeting_schedule",
         "answer_evidence_ids": evidence_ids, "answer_record_ids": [], "evidence_ids": evidence_ids,
@@ -211,6 +213,33 @@ def ensure_closing_schedule_question(records, utterances):
         "risk_level": "HIGH", "semantic_risks": ["quantity", "time_scope"],
     })
     return records
+
+
+def restore_short_acknowledgements(records, utterances):
+    """Keep source-grounded short acceptances even when fact extraction drops them."""
+    used = {e for record in records for e in record.get("evidence_ids", [])}
+    accept_re = re.compile(r"(?iu)(?:^|[.!?]\s*)(?:ну\s+)?ладно\W*$|^\s*(?:да(?:\s*,\s*)?|ага|угу|ну\s+)?(?:договорились|соглас(?:ен|на|ны)|ок(?:ей)?|хорошо)\W*$|^\s*(?:да|ага|угу)\W*$")
+    restored = list(records)
+    for turn in utterances:
+        if turn.get("id") in used or not accept_re.search(str(turn.get("text") or "")):
+            continue
+        prior = [record for record in records if record.get("speech_act") in {"propose", "commit", "ask"}
+                 and 0 <= float(turn.get("start", 0)) - float(record.get("start", 0)) <= 30]
+        if not prior:
+            continue
+        target = max(prior, key=lambda record: float(record.get("start", 0)))
+        restored.append({
+            "record_id": "DIALOGUE-" + str(turn["id"]), "kind": "observation", "content_kind": "state",
+            "topic": "подтверждение предыдущей реплики", "statement": str(turn.get("text") or "").strip(),
+            "subject": None, "predicate": "подтверждает", "object": None, "polarity": "positive",
+            "start": float(turn.get("start", 0)), "end": float(turn.get("end", turn.get("start", 0))),
+            "primary_evidence_start": float(turn.get("start", 0)), "speech_act": "accept", "modality": "asserted",
+            "attributed_speakers": [turn["speaker"]] if turn.get("speaker") else [],
+            "evidence_ids": [turn["id"]], "source_word_ids": list(turn.get("source_word_ids", [])),
+            "conditions": [], "quantities": [], "commitment_strength": "none",
+            "accepts_record_ids": [target.get("record_id")],
+        })
+    return restored
 
 
 def make_chunks(utterances, seconds=300.0, overlap=35.0, min_seconds=120.0, max_seconds=480.0):
@@ -4077,6 +4106,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         counterexample_model=settings["public_auditor"],
         utterances=source_turns,
     )
+    resolved_records = restore_short_acknowledgements(resolved_records, source_turns)
     resolved_records = ensure_closing_schedule_question(resolved_records, source_turns)
     semantic_registry["records"] = resolved_records
     semantic_registry["tasks"] = task_records(resolved_records)
@@ -4431,15 +4461,25 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     cited_sources = referenced_origins()
     tasks_sources = referenced_origins("tasks")
     quarantine_sources = referenced_origins("requires_verification")
+    cited_evidence = {evidence for item in public_items for evidence in item.get("evidence_ids", [])}
+    task_evidence = {evidence for item in public_items if item.get("section") == "tasks"
+                     for evidence in item.get("evidence_ids", [])}
+    quarantine_evidence = {evidence for item in public_items if item.get("section") == "requires_verification"
+                           for evidence in item.get("evidence_ids", [])}
     canonical_rejections = {origin for claim in state_v2.get("claims", []) if claim.get("lifecycle") in {"rejected", "superseded"}
                             for origin in source_origins.get(claim.get("source_record_id"), [])}
     for candidate in early_candidates:
         fact_id, origin = candidate["fact_id"], candidate["origin_id"]
-        if origin in quarantine_sources: status, reason = "requires_verification", "auditor_unavailable"
-        elif origin in tasks_sources: status, reason = "published_task", "canonical_task_state"
-        elif origin in cited_sources: status, reason = "published_other", "canonical_public_item"
+        evidence = set(candidate.get("evidence_ids", []))
+        if origin in quarantine_sources or evidence & quarantine_evidence: status, reason = "requires_verification", "auditor_unavailable"
+        elif origin in tasks_sources or evidence & task_evidence: status, reason = "published_task", "canonical_task_state"
+        elif origin in cited_sources or evidence & cited_evidence: status, reason = "published_other", "canonical_public_item"
         elif origin in rejected_sources: status, reason = "rejected", rejected_sources[origin]
         elif origin in canonical_rejections: status, reason = "canonical_rejected", "state_transition_with_provenance"
+        elif candidate.get("kind") == "resource": status, reason = "not_a_work_result", "contextual_resource_without_commitment"
+        elif candidate.get("kind") == "proposal": status, reason = "proposal_unconfirmed", "no_acceptance_or_assignee"
+        elif candidate.get("kind") == "follow_up" and re.search(r"(?iu)\b(?:вопрос|уточнение|спрашива)", candidate.get("statement", "")):
+            status, reason = "not_a_work_result", "interrogative_routed_out_of_commitments"
         else: status, reason = "unresolved", "candidate_lost_after_review_or_planning"
         disposition.append({"origin_id": candidate["origin_id"], "fact_id": fact_id, "status": status, "reason": reason})
     atomic_json(output_dir / "candidate_disposition.json", {"schema_version": 1, "candidates": early_candidates, "dispositions": disposition})

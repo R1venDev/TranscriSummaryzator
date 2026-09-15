@@ -223,6 +223,9 @@ def source_aware_plan(plan, claims):
     result["allowed_speakers"] = sorted(
         set(plan.get("allowed_speakers", [])) | set(re.findall(r"@[\w.-]+", source_text))
     )
+    source_polarity = {"negative" if NEGATION_RE.search(str(claim.get("statement") or "")) else "positive"
+                       for claim in claims}
+    result["polarity"] = sorted(source_polarity)
     return result
 
 
@@ -250,7 +253,7 @@ def audit_realization(text, plan):
     if found_relations and not plan.get("relation_ids") and not found_relations.issubset(allowed_relations):
         errors.append("unsupported_relation_language")
     polarities = set(plan.get("polarity", []))
-    semantic_text = re.sub(r"(?iu)\b(?:не\s+уточнено|не\s+подтвержден[оаы]?|ожидает\s+подтверждения)\b", "", text or "")
+    semantic_text = re.sub(r"(?iu)\b(?:не\s+уточнено|не\s+подтвержд[её]н[оаы]?|ожидает\s+подтверждения)\b", "", text or "")
     if "negative" in polarities and not NEGATION_RE.search(text or ""):
         errors.append("negation_not_preserved")
     if polarities == {"positive"} and NEGATION_RE.search(semantic_text):
@@ -262,8 +265,10 @@ def audit_realization(text, plan):
         errors.append("completion_status_upgraded")
     if plan.get("conditions") and not CONDITION_RE.search(text or ""):
         errors.append("condition_not_preserved")
-    allowed_scopes = [x.casefold() for x in plan.get("time_scope", []) if isinstance(x, str) and x.strip()]
-    if allowed_scopes and not any(scope in (text or "").casefold() for scope in allowed_scopes):
+    number_words = {"один": "1", "одного": "1", "одну": "1", "два": "2", "две": "2", "три": "3", "четыре": "4"}
+    normalize_scope = lambda value: re.sub(r"(?iu)\b(?:один|одного|одну|два|две|три|четыре)\b", lambda m: number_words[m.group(0).casefold()], str(value).casefold()).replace("ё", "е")
+    allowed_scopes = [normalize_scope(x) for x in plan.get("time_scope", []) if isinstance(x, str) and x.strip()]
+    if allowed_scopes and not any(scope in normalize_scope(text or "") for scope in allowed_scopes):
         errors.append("time_scope_not_preserved")
     allowed_values = list(plan.get("allowed_speakers", [])) + list(plan.get("allowed_assignees", []))
     allowed_speakers = set(allowed_values) | set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))
