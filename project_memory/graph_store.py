@@ -14,20 +14,29 @@ def empty(project):
 
 def apply_meeting(project_graph, meeting_graph):
     graph = json.loads(json.dumps(project_graph)); meeting_id = meeting_graph["meeting_id"]
-    if meeting_id in {x["meeting_id"] for x in graph["meeting_events"]}: return graph, {"schema_version": 2, "meeting_id": meeting_id, "changes": []}
+    replacing = meeting_id in {x["meeting_id"] for x in graph["meeting_events"]}
+    if replacing:
+        for bucket in ("propositions", "decisions", "tasks", "experiments", "threads"):
+            graph[bucket] = {key: value for key, value in graph[bucket].items() if value.get("meeting_id") != meeting_id}
+        graph["meeting_events"] = [x for x in graph["meeting_events"] if x["meeting_id"] != meeting_id]
+        graph["lineage"] = {family: [key for key in keys if key in graph["propositions"]]
+                            for family, keys in graph["lineage"].items()}
     changes = []
     for claim in meeting_graph.get("claims", []):
         family = _family(claim); prior_ids = graph["lineage"].get(family, []); prior = graph["propositions"].get(prior_ids[-1]) if prior_ids else None
         status = "NEW" if not prior else "CHANGED" if prior.get("polarity") != claim.get("polarity") or prior.get("quantities") != claim.get("quantities") else "CONFIRMS"
         entry = {**claim, "meeting_id": meeting_id, "lineage_id": family, "project_revision": graph["revision"] + 1, "recorded_at": time.time()}
-        graph["propositions"][claim["proposition_id"]] = entry; graph["lineage"].setdefault(family, []).append(claim["proposition_id"])
-        changes.append({"status": status, "lineage_id": family, "proposition_id": claim["proposition_id"], "previous_proposition_id": prior_ids[-1] if prior_ids else None})
+        project_key = meeting_id + ":" + claim["proposition_id"]
+        graph["propositions"][project_key] = entry; graph["lineage"].setdefault(family, []).append(project_key)
+        changes.append({"status": status, "lineage_id": family, "proposition_id": claim["proposition_id"], "project_key": project_key, "previous_proposition_id": prior_ids[-1] if prior_ids else None})
         for entity in claim.get("entities", []): graph["entities"][entity["entity_id"]] = entity
     for source, target, key in (("decision_states", "decisions", "decision_id"), ("task_states", "tasks", "task_id"), ("experiment_states", "experiments", "experiment_id"), ("threads", "threads", "thread_id")):
-        for item in meeting_graph.get(source, []): graph[target][item[key]] = {**item, "meeting_id": meeting_id}
-    graph["meeting_events"].append({"meeting_id": meeting_id, "delta": changes, "provenance": meeting_graph.get("provenance", {})}); graph["revision"] += 1
-    graph["history"].append({"revision": graph["revision"], "meeting_id": meeting_id}); graph["project_graph_id"] = "PG" + hashlib.sha256(json.dumps(graph["history"], sort_keys=True).encode()).hexdigest()[:16]
-    return graph, {"schema_version": 2, "meeting_id": meeting_id, "changes": changes}
+        for item in meeting_graph.get(source, []): graph[target][meeting_id + ":" + item[key]] = {**item, "meeting_id": meeting_id}
+    graph["meeting_events"].append({"meeting_id": meeting_id, "generation_id": meeting_graph.get("generation_id"), "delta": changes, "provenance": meeting_graph.get("provenance", {})}); graph["revision"] += 1
+    graph["history"].append({"revision": graph["revision"], "meeting_id": meeting_id,
+                             "generation_id": meeting_graph.get("generation_id"), "transition": "regenerated" if replacing else "new_meeting"})
+    graph["project_graph_id"] = "PG" + hashlib.sha256(json.dumps(graph["history"], sort_keys=True).encode()).hexdigest()[:16]
+    return graph, {"schema_version": 2, "meeting_id": meeting_id, "transition": "regenerated" if replacing else "new_meeting", "changes": changes}
 
 class ProjectGraphStore:
     def __init__(self, root, project):

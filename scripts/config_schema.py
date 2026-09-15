@@ -16,6 +16,10 @@ class PipelineConfig(BaseModel):
 
     audio_track: int = Field(0, ge=0)
     poll_seconds: float = Field(10, gt=0)
+    max_upload_bytes: int = Field(200 * 1024**3, gt=0)
+    max_profile_upload_bytes: int = Field(4 * 1024**3, gt=0)
+    subprocess_deadline_seconds: float = Field(21600, gt=0)
+    subprocess_idle_seconds: float = Field(1800, gt=0)
     stable_seconds: float = Field(30, ge=0)
     asr_device: str = "auto"
     diarization_device: str = "auto"
@@ -138,6 +142,10 @@ class PipelineConfig(BaseModel):
     summary_public_budget_min: int = Field(20, ge=8, le=120)
     summary_public_budget_max: int = Field(120, ge=20, le=240)
     summary_navigation_max_chapters: int = Field(12, ge=4, le=16)
+    summary_closing_pass_seconds: float = Field(600, ge=0)
+    summary_public_base_url: Optional[str] = None
+    summary_project_memory_enabled: bool = False
+    summary_force_cache_policy: Literal["rebuild", "fresh_models"] = "fresh_models"
     domain_vocabulary: dict[str, str] = Field(default_factory=dict)
 
     def model_post_init(self, __context) -> None:

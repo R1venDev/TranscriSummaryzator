@@ -78,13 +78,12 @@ class CanonicalStateTests(unittest.TestCase):
         self.assertEqual(selected, published)
         self.assertTrue(all(planned["view_plans"]["technical"]["dispositions"][value]["status"] == "published" for value in selected))
 
-    def test_similar_atomic_actions_have_one_canonical_task(self):
+    def test_distinct_annotation_and_integration_deliverables_do_not_merge(self):
         graph = build_meeting_graph([
             rec(1, "action", "Я буду размечать и встраивать Order Block", "commit", assignees=["@A"]),
             rec(2, "action", "Я буду параллельно размечать Order Block", "commit", assignees=["@A"]),
         ])
-        self.assertEqual(len(graph["task_states"]), 1)
-        self.assertEqual(len(graph["task_states"][0]["source_proposition_ids"]), 2)
+        self.assertEqual(len(graph["task_states"]), 2)
 
     def test_upstream_answer_without_answered_slots_is_preserved(self):
         graph = build_meeting_graph([

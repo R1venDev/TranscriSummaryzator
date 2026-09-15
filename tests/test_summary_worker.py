@@ -160,7 +160,7 @@ class SummaryWorkerTests(unittest.TestCase):
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
         }
         rendered = summary.render_markdown(document, [item], {"covered_seconds": 100, "total_seconds": 100})
-        self.assertIn("[00:00:10](#transcript-time=10.125)", rendered)
+        self.assertIn("[00:00:10](transcript.html#t-10125)", rendered)
         self.assertNotIn("F00001", rendered)
 
     def test_public_renderer_has_prose_overview_timecode_index_and_detailed_chronology(self):
@@ -172,13 +172,14 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
         ]
         rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
-        self.assertIn("Итоги встречи по развитию торговой системы: Order Block, Bitcoin", rendered)
-        overview = rendered.split("## Краткое описание", 1)[1].split("## Таймкоды", 1)[0]
+        self.assertIn("Обсудили фильтрацию сигналов", rendered.splitlines()[0])
+        self.assertNotIn("торговой системы", rendered.splitlines()[0])
+        overview = rendered.split("## Главное", 1)[1].split("## Таймкоды", 1)[0]
         self.assertNotIn("\n- ", overview)
         self.assertNotIn("/result?", overview)
         self.assertIn("## Таймкоды", rendered)
         self.assertIn("## Подробная хронология встречи", rendered)
-        self.assertIn("/result?id=8#t-10000", rendered)
+        self.assertIn("transcript.html#t-10000", rendered)
 
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
         item = fact()
@@ -736,6 +737,13 @@ class SummaryWorkerTests(unittest.TestCase):
         updated = summary.enforce_fact_policy(item)
         self.assertEqual(updated["type"], "action")
 
+    def test_promise_does_not_promote_neighboring_predicate(self):
+        evidence = [utterance(1, 1, 4, speaker="@A", text="Я передам отчёт. Проверка сервера пока не завершена.")]
+        proposal = fact(kind="proposal", statement="Проверить сервер", evidence=evidence)
+        self.assertEqual(summary.enforce_fact_policy(proposal)["type"], "proposal")
+        commitment = fact(kind="proposal", statement="Передать отчёт", evidence=evidence)
+        self.assertEqual(summary.enforce_fact_policy(commitment)["type"], "action")
+
     def test_promoted_action_survives_second_policy_pass(self):
         evidence = [utterance(1, 1, 3, speaker="@HoTTaBbicH", text="Order Block я буду параллельно размечивать")]
         item = fact(kind="proposal", statement="Параллельно размечать Order Block", evidence=evidence)
@@ -1199,8 +1207,10 @@ class SummaryWorkerTests(unittest.TestCase):
                 raise RuntimeError("ответ оборван или достигнут лимит вывода")
 
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(RuntimeError, "лимит вывода"):
-                summary.prepare_publishable_facts(Client(), "model", [fact()], Path(directory))
+            kept, rejected = summary.prepare_publishable_facts(Client(), "model", [fact()], Path(directory))
+            self.assertFalse(rejected)
+            self.assertEqual(kept[0]["verification_status"], "verification_unavailable")
+            self.assertEqual(kept[0]["verification_failure_stage"], "editorial_review")
 
     def test_final_audit_splits_when_model_omits_reviews(self):
         facts = [
@@ -1260,8 +1270,9 @@ class SummaryWorkerTests(unittest.TestCase):
             kept, rejected, details = summary.audit_public_surface_facts(
                 Client(), "large-model", [item], Path(directory), 60
             )
-            self.assertEqual(kept, [])
-            self.assertEqual(rejected[0]["reason"], "public_auditor_unavailable")
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0]["verification_status"], "verification_unavailable")
+            self.assertEqual(rejected, [])
         self.assertEqual(len(details["degraded_batches"]), 1)
 
     def test_overview_uses_real_chapter_evidence(self):
@@ -1432,8 +1443,9 @@ class SummaryWorkerTests(unittest.TestCase):
         accepted, rejected = summary.critical_verifier_consensus(
             [original], [primary], [], "ministral", "gemma"
         )
-        self.assertEqual(accepted, [])
-        self.assertEqual(rejected[0]["reason"], "critical_verifier_disagreement")
+        self.assertFalse(rejected)
+        self.assertEqual(accepted[0]["verification_status"], "verification_unavailable")
+        self.assertEqual(accepted[0]["critical_consensus"]["reason"], "critical_verifier_disagreement")
 
     def test_critical_consensus_requires_identical_corrections(self):
         original = dict(fact(kind="decision"), confidence=.8)
@@ -1442,8 +1454,9 @@ class SummaryWorkerTests(unittest.TestCase):
         accepted, rejected = summary.critical_verifier_consensus(
             [original], [primary], [secondary], "ministral", "gemma"
         )
-        self.assertEqual(accepted, [])
-        self.assertEqual(rejected[0]["reason"], "critical_correction_mismatch")
+        self.assertFalse(rejected)
+        self.assertEqual(accepted[0]["verification_status"], "verification_unavailable")
+        self.assertEqual(accepted[0]["critical_consensus"]["reason"], "critical_correction_mismatch")
 
 
 if __name__ == "__main__":

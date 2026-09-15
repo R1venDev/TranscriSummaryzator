@@ -158,8 +158,8 @@ def normalize_semantic_record(raw, fact):
         if isinstance(item, dict) and item.get("id") in evidence_set
     }
     audited_owners = [value for value in fact.get("owner_refs", []) if value in speakers]
-    evidence_text_for_commitment = " ".join(str(item.get("text") or "") for item in fact.get("evidence", []))
-    commitment_like = bool(COMMITMENT_RE.search(evidence_text_for_commitment))
+    action_text = str(fact.get("statement") or "")
+    commitment_like = bool(COMMITMENT_RE.search(action_text))
     owners = []
     if fact.get("type") == "action" or commitment_like:
         # The semantic model may see several speakers in the evidence.  Only the
@@ -193,8 +193,10 @@ def normalize_semantic_record(raw, fact):
         amount = str(normalized.get("value") if normalized.get("value") is not None else value.get("value") or "").strip()
         digits = re.findall(r"\d+(?:[.,]\d+)?", amount)
         cited_text = " ".join(str(evidence_by_id[item].get("text") or "") for item in ids if item in evidence_by_id).casefold()
+        cited_numbers = [float(token.replace(",", ".")) for token in re.findall(r"(?<!\d)\d+(?:[.,]\d+)?(?!\d)", cited_text)]
         supported = any(
-            digit in cited_text or any(word in cited_text.split() for word in NUMBER_WORDS.get(digit, set()))
+            any(abs(float(digit.replace(",", ".")) - cited) < 1e-9 for cited in cited_numbers)
+            or any(word in cited_text.split() for word in NUMBER_WORDS.get(str(float(digit.replace(",", "."))).rstrip("0").rstrip("."), set()))
             for digit in digits
         )
         if amount and ids and digits and supported:
@@ -258,12 +260,12 @@ def normalize_semantic_record(raw, fact):
             uncertainty = dict(uncertainty, needs_review=True)
             uncertainty["reasons"] = sorted(set(uncertainty.get("reasons", [])) | {"assignee_not_confirmed"})
     evidence_text = " ".join(str(item.get("text") or "") for item in fact.get("evidence", []))
-    detected_act = primary_speech_act(evidence_text or fact.get("statement"), fact.get("type"))
+    detected_act = primary_speech_act(action_text, fact.get("type"))
     raw_act = raw.get("speech_act")
     if raw_act in {"assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"}:
         detected_act = raw_act if detected_act == "assert" else detected_act
     legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
-    explicit_commitment = bool(COMMITMENT_RE.search(evidence_text)) and len(owners) == 1
+    explicit_commitment = bool(COMMITMENT_RE.search(action_text)) and len(owners) == 1
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
@@ -310,6 +312,7 @@ def normalize_semantic_record(raw, fact):
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),
         "risk_level": fact.get("risk_level", "LOW"),
+        "verification_status": fact.get("verification_status", "supported"),
         "source_word_ids": list(dict.fromkeys(
             word_id for item in fact.get("evidence", []) for word_id in item.get("source_word_ids", [])
         )),

@@ -30,7 +30,8 @@ _component = os.environ.get("TRANSCRISUMMARY_COMPONENT", "unknown")
 _run_id = os.environ.get("TRANSCRISUMMARY_RUN_ID")
 _job_id = os.environ.get("TRANSCRISUMMARY_JOB_ID")
 _lock = threading.Lock()
-_SENSITIVE = ("password", "passwd", "secret", "token", "authorization", "cookie", "api_key")
+_SENSITIVE = ("password", "passwd", "secret", "token", "authorization", "cookie", "api_key",
+              "statement", "utterance", "prompt", "transcript", "raw_text", "source_text", "dialogue_evidence")
 
 
 def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path=None):
@@ -177,10 +178,11 @@ def stage(name, *, inputs=None, refs=None, component=None):
 def summarize(path):
     path = Path(path)
     counters = {name: Counter() for name in ("components", "categories", "severities", "outcomes")}
-    first = last = last_error = first_fatal = last_fatal = last_warning = None
+    first = last = last_error = first_failure = first_fatal = last_fatal = last_warning = None
     total = malformed = 0
     durations, llm_durations, stage_durations, slow, tokens, calls, retries, cache_hits, cache_total = [], [], [], [], Counter(), 0, 0, 0, 0
     groups, request_keys, repeated_without_progress = {}, Counter(), Counter()
+    request_attempts, failed_attempts, completed_attempts, stage_models = {}, set(), set(), {}
     if path.is_file():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
@@ -194,10 +196,12 @@ def summarize(path):
             for field, bucket in (("component", "components"), ("category", "categories"), ("severity", "severities"), ("outcome", "outcomes")):
                 if item.get(field) is not None:
                     counters[bucket][str(item[field])] += 1
-            if item.get("severity") == "ERROR" or item.get("error"):
+            if item.get("severity") == "ERROR":
                 last_error = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
-                first_fatal = first_fatal or last_error
-                last_fatal = last_error
+                first_failure = first_failure or last_error
+                if item.get("outcome") in {"failed_terminal", "timeout", "rejected_publication", "fatal"}:
+                    first_fatal = first_fatal or last_error
+                    last_fatal = last_error
             if item.get("severity") in {"WARN", "WARNING"}:
                 last_warning = {key: item.get(key) for key in ("timestamp", "component", "name", "outcome", "error", "refs")}
             duration = item.get("duration_ms")
@@ -212,10 +216,18 @@ def summarize(path):
             grouped["stages"][str(item.get("name") or "unknown")] += 1
             grouped["models"][model] += 1
             request_key = item.get("refs", {}).get("request_key") or item.get("metrics", {}).get("request_key")
-            if request_key:
-                request_keys[str(request_key)] += 1
+            if request_key and item.get("name") == "llm_request":
+                attempt_ref = str(item.get("refs", {}).get("request_attempt_id") or
+                                  (item.get("attempt_id"), item.get("inputs", {}).get("attempt"), item.get("timestamp")))
+                request_attempts.setdefault(str(request_key), set()).add(attempt_ref)
                 if item.get("outcome") in {"retryable_output_limit", "failed", "partial", "cached_partial"}:
-                    repeated_without_progress[str(request_key)] += 1
+                    failed_attempts.add((str(request_key), attempt_ref))
+                if item.get("outcome") == "completed":
+                    completed_attempts.add((str(request_key), attempt_ref))
+            if item.get("category") in {"stage", "llm"}:
+                dimension = (str(item.get("job_id") or "unknown"), str(item.get("attempt_id") or "unknown"),
+                             str(item.get("name") or "unknown"), model)
+                stage_models.setdefault(dimension, Counter())[str(item.get("outcome") or "unknown")] += 1
             if item.get("name") == "llm_request":
                 calls += item.get("outcome") == "completed"
                 retries += item.get("outcome") in {"retryable_output_limit", "failed"}
@@ -233,7 +245,7 @@ def summarize(path):
         "schema_version": SCHEMA_VERSION, "events": total, "malformed_lines": malformed,
         "first_timestamp": first, "last_timestamp": last,
         **{name: dict(value) for name, value in counters.items()},
-        "last_error": last_error,
+        "last_error": last_error, "first_failure": first_failure,
         "first_fatal_error": first_fatal, "last_fatal_error": last_fatal, "last_warning": last_warning,
         "jsonl_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
         "jsonl_bytes": path.stat().st_size if path.is_file() else 0,
@@ -241,7 +253,8 @@ def summarize(path):
         "cache_hit_ratio": cache_hits / cache_total if cache_total else None,
         "latency_ms": latency(durations), "llm_latency_ms": latency(llm_durations), "stage_latency_ms": latency(stage_durations),
         "groups": {key: {"events": value["events"], "stages": dict(value["stages"]), "models": dict(value["models"])} for key, value in groups.items()},
-        "request_keys": {"unique": len(request_keys), "repeated": {key: count for key, count in request_keys.items() if count > 1}, "repeated_without_progress": {key: count for key, count in repeated_without_progress.items() if count > 1}},
+        "stage_model_outcomes": [{"job_id": j, "attempt_id": a, "stage": s, "model": m, "outcomes": dict(counts)} for (j, a, s, m), counts in sorted(stage_models.items())],
+        "request_keys": {"unique": len(request_attempts), "repeated": {key: len(value) for key, value in request_attempts.items() if len(value) > 1}, "repeated_without_progress": {key: sum((key, attempt) in failed_attempts and (key, attempt) not in completed_attempts for attempt in values) for key, values in request_attempts.items() if sum((key, attempt) in failed_attempts and (key, attempt) not in completed_attempts for attempt in values) > 1}},
         "cache_states": {"reused_successfully": counters["outcomes"].get("hit", 0), "cached_partial_seen_again": counters["outcomes"].get("cached_partial", 0)},
         "top_slow_requests": sorted(slow, key=lambda x: x["duration_ms"], reverse=True)[:10],
     }
@@ -259,7 +272,7 @@ def publish(source, output_dir):
     temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, output_dir / "diagnostics_summary.json")
     trace = source.with_name("diagnostics.trace.jsonl")
-    if trace.is_file():
+    if trace.is_file() and os.environ.get("TRANSCRISUMMARY_TRACE_EXPORT") == "1":
         shutil.copy2(trace, output_dir / "diagnostics.trace.jsonl")
         summary["trace_sha256"] = hashlib.sha256(trace.read_bytes()).hexdigest()
         summary["trace_bytes"] = trace.stat().st_size

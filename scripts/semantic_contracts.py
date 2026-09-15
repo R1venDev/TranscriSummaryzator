@@ -39,7 +39,7 @@ class SemanticRecordResponse(StrictModel):
     object: Optional[str] = None
     polarity: Literal["positive", "negative"] = "positive"
     modality: Literal["asserted", "tentative", "proposed", "committed", "question"] = "asserted"
-    content_kind: Optional[Literal["state", "metric", "experimental_result", "definition", "rule", "trading_rule", "system_rule", "task", "goal", "schedule", "question", "constraint", "assumption", "resource", "design_choice", "alternative", "risk", "dependency", "blocker", "correction", "rejected_option"]] = None
+    content_kind: Optional[ClaimKind] = None
     speech_act: Optional[Literal["assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"]] = None
     conditions: list[Condition] = Field(default_factory=list)
     quantities: list[Quantity] = Field(default_factory=list)

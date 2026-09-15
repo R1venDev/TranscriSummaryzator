@@ -62,13 +62,15 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
         prop_events = sorted(events_by_prop.get(prop["proposition_id"], []), key=lambda x: (x.get("timestamp", 0), x.get("event_id", "")))
         event = prop_events[-1] if prop_events else {}
         social = decision_by_prop.get(prop["proposition_id"], {}).get("status", "candidate")
-        lifecycle = "superseded" if social == "superseded" or prop["proposition_id"] in superseded_props else "rejected" if social == "rejected" or prop["proposition_id"] in rejected_props else "active"
+        task_status = task_by_prop.get(prop["proposition_id"], {}).get("status")
+        lifecycle = "superseded" if social == "superseded" or prop["proposition_id"] in superseded_props else "rejected" if social == "rejected" or prop["proposition_id"] in rejected_props or task_status == "cancelled" else "active"
         confidences = [x.get("confidence", {}) for x in prop_events]
         def risk(name, default=0.0):
             values = [x.get(name) for x in confidences if isinstance(x.get(name), (int, float))]
             return 1.0 - max(values) if values else default
         claim = {"claim_id": "C" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "event_ids": [x["event_id"] for x in prop_events], "kind": prop["claim_kind"], "content_kind": prop["content_kind"], "speech_act": event.get("speech_act", "assert"), "statement": prop["statement"], "semantic_signature": prop["semantic_signature"], "entities": prop["entities"], "quantities": prop["quantities"], "conditions": prop["conditions"], "polarity": prop["polarity"], "modality": event.get("epistemic_modality", "unknown"), "epistemic_modality": event.get("epistemic_modality", "unknown"), "social_state": social, "lifecycle": lifecycle, "evidence_ids": prop["evidence_ids"], "source_word_ids": list(dict.fromkeys(w for x in prop_events for w in x.get("source_word_ids", []))), "speaker_refs": sorted({s for x in prop_events for s in x.get("speaker_candidates", [])}), "source_record_id": prop["source_record_ids"][0], "source_record_ids": prop["source_record_ids"], "start": min([x.get("timestamp", 0) for x in prop_events] or [0]), "end": max([x.get("end", x.get("timestamp", 0)) for x in prop_events] or [0]), "risk": {"recognition": risk("recognition", .5), "speaker": risk("speaker", .5), "number": risk("number", .5 if prop["quantities"] else 0), "modality": risk("semantic", .3)}}
         claim["primary_evidence_start"] = min([x.get("primary_evidence_start", x.get("timestamp", 0)) for x in prop_events] or [0])
+        claim["verification_status"] = next((record.get("verification_status") for record in records if record.get("record_id") == claim["source_record_id"]), "supported")
         claim["dialogue_evidence"] = [item for x in prop_events for item in x.get("dialogue_evidence", [])]
         if prop["proposition_id"] in decision_by_prop:
             decision = decision_by_prop[prop["proposition_id"]]
@@ -83,8 +85,12 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
     claim_relations = [{**x, "source_claim_id": "C" + x["source_proposition_id"][1:], "target_claim_id": "C" + x["target_proposition_id"][1:]} for x in relations]
     episodes = build_episodes(claims)
     threads = build_threads(episodes, claims, claim_relations)
-    identity = meeting_id or "MG" + hashlib.sha256(json.dumps([[x["proposition_id"], x["evidence_ids"]] for x in propositions], sort_keys=True).encode()).hexdigest()[:16]
-    graph = {"schema": "MeetingGraphSchema", "schema_version": 5, "meeting_id": identity, "authoritative": True, "provenance": provenance or {}, "propositions": propositions, "dialogue_events": events, "events_by_proposition": events_by_prop, "relations": claim_relations, "decision_states": decisions, "task_states": tasks, "question_states": questions, "rule_states": rules, "experiment_states": experiments, "conflict_sets": conflict_sets(propositions, relations), "episodes": episodes, "threads": threads, "claims": claims, "tasks": tasks, "questions": questions, "decisions": decisions, "active_rules": rules, "experimental_results": experiments, "open_threads": [x for x in threads if x["state"] == "open"], "uncertainty": {"abstentions": [], "conflicts": sum(x["resolution"] == "unresolved" for x in conflict_sets(propositions, relations))}}
+    stable_recording = (provenance or {}).get("recording_id") or (provenance or {}).get("audio_sha256")
+    identity_payload = stable_recording or json.dumps([[x["proposition_id"], x["evidence_ids"]] for x in propositions], sort_keys=True)
+    identity = meeting_id or "MG" + hashlib.sha256(str(identity_payload).encode()).hexdigest()[:16]
+    generation_payload = json.dumps([[x["proposition_id"], x["source_record_ids"]] for x in propositions], sort_keys=True)
+    generation_id = (provenance or {}).get("generation_id") or "GEN" + hashlib.sha256((identity + generation_payload).encode()).hexdigest()[:16]
+    graph = {"schema": "MeetingGraphSchema", "schema_version": 6, "meeting_id": identity, "recording_id": stable_recording, "generation_id": generation_id, "authoritative": True, "provenance": provenance or {}, "propositions": propositions, "dialogue_events": events, "events_by_proposition": events_by_prop, "relations": claim_relations, "decision_states": decisions, "task_states": tasks, "question_states": questions, "rule_states": rules, "experiment_states": experiments, "conflict_sets": conflict_sets(propositions, relations), "episodes": episodes, "threads": threads, "claims": claims, "tasks": tasks, "questions": questions, "decisions": decisions, "active_rules": rules, "experimental_results": experiments, "open_threads": [x for x in threads if x["state"] == "open"], "uncertainty": {"abstentions": [], "conflicts": sum(x["resolution"] == "unresolved" for x in conflict_sets(propositions, relations))}}
     graph["entity_registry"] = registry.snapshot()
     return graph
 

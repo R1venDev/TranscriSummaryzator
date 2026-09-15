@@ -20,7 +20,11 @@ def project_views(state, selected_ids):
     return {
         "executive": selected("executive")[:10],
         "technical": kinds("technical", "trading_rule", "system_rule", "definition", "metric", "experimental_result", "design_choice", "constraint", "dependency"),
-        "tasks": kinds("tasks", "action", "follow_up"),
+        "tasks": [
+            {**task, "statement": task.get("deliverable") or task.get("description")}
+            for task in state.get("task_states", state.get("tasks", []))
+            if set(task.get("source_proposition_ids", [task.get("proposition_id")])) & {x.get("proposition_id") for x in selected("tasks")}
+        ],
         "decisions": decisions,
         "mentioned_rules": [x for x in kinds("technical", "trading_rule", "system_rule") if x.get("decision_status") != "accepted"],
         "experiments": kinds("experiments", "experimental_result", "hypothesis", "metric"),

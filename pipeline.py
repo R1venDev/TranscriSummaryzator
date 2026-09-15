@@ -11,6 +11,9 @@ import json
 import mimetypes
 import os
 import re
+import selectors
+import codecs
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -82,6 +85,7 @@ STAGE_DEPENDENCIES = {
     "ultra": ["pipeline.py", "scripts/ultra_worker.py", "scripts/diagnostics.py"],
     "consensus": ["pipeline.py", "scripts/consensus.py", "scripts/diagnostics.py"],
     "asr": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py", "scripts/diagnostics.py"],
+    "gigaam": ["pipeline.py", "scripts/asr_worker.py", "scripts/model_common.py", "scripts/diagnostics.py"],
     "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py", "scripts/diagnostics.py"],
 }
 
@@ -98,8 +102,11 @@ def stage_cache_key(stage, inputs):
 def stage_cache_valid(job_dir, stage, key, artifacts):
     path = Path(job_dir) / "stage_cache.json"
     metadata = load_json(path) if path.is_file() else {}
-    if metadata.get(stage, {}).get("key") == key and all(Path(job_dir, name).is_file() for name in artifacts):
-        return True
+    local = metadata.get(stage, {})
+    if local.get("key") == key and all(Path(job_dir, name).is_file() for name in artifacts):
+        hashes = local.get("artifact_hashes", {})
+        if hashes and all(hashlib.sha256(Path(job_dir, name).read_bytes()).hexdigest() == hashes.get(name) for name in artifacts):
+            return True
     shared = GLOBAL_STAGE_CACHE / key[:2] / key
     manifest_path = shared / "manifest.json"
     if not manifest_path.is_file():
@@ -116,12 +123,9 @@ def stage_cache_valid(job_dir, stage, key, artifacts):
         target = Path(job_dir, name)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(target.suffix + ".cache-tmp")
-        try:
-            os.link(shared / name, temporary)
-        except OSError:
-            shutil.copy2(shared / name, temporary)
+        shutil.copy2(shared / name, temporary)
         os.replace(temporary, target)
-    metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now(), "source": "global_content_addressed"}
+    metadata[stage] = {"key": key, "artifacts": list(artifacts), "artifact_hashes": manifest["artifacts"], "completed_at": now(), "source": "global_content_addressed"}
     write_json(path, metadata)
     return True
 
@@ -129,7 +133,8 @@ def stage_cache_valid(job_dir, stage, key, artifacts):
 def mark_stage_cached(job_dir, stage, key, artifacts):
     path = Path(job_dir) / "stage_cache.json"
     metadata = load_json(path) if path.is_file() else {}
-    metadata[stage] = {"key": key, "artifacts": list(artifacts), "completed_at": now()}
+    artifact_hashes = {name: hashlib.sha256(Path(job_dir, name).read_bytes()).hexdigest() for name in artifacts}
+    metadata[stage] = {"key": key, "artifacts": list(artifacts), "artifact_hashes": artifact_hashes, "completed_at": now()}
     write_json(path, metadata)
     shared = GLOBAL_STAGE_CACHE / key[:2] / key
     shared.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +142,20 @@ def mark_stage_cached(job_dir, stage, key, artifacts):
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         manifest_path = shared / "manifest.json"
-        if not manifest_path.is_file():
+        valid_existing = False
+        if manifest_path.is_file():
+            try:
+                manifest = load_json(manifest_path)
+                valid_existing = manifest.get("key") == key and all(
+                    (shared / name).is_file() and hashlib.sha256((shared / name).read_bytes()).hexdigest() == digest
+                    for name, digest in manifest.get("artifacts", {}).items()
+                )
+            except Exception:
+                valid_existing = False
+        if not valid_existing:
+            if shared.exists():
+                quarantine = shared.with_name(shared.name + ".corrupt-" + uuid.uuid4().hex[:8])
+                os.replace(shared, quarantine)
             temporary = shared.parent / (key + ".tmp-" + uuid.uuid4().hex)
             temporary.mkdir(parents=True)
             hashes = {}
@@ -316,21 +334,58 @@ def write_status_snapshot(db):
     write_json(STATE / "progress.json", payload)
 
 
-def run_command(command, log_path, env=None, progress_callback=None):
+def run_command(command, log_path, env=None, progress_callback=None, deadline_seconds=21600, idle_seconds=1800):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     diagnostic_event("subprocess", category="stage", outcome="started", inputs={"command": list(map(str, command))}, refs={"log": str(log_path)})
     with log_path.open("a", encoding="utf-8") as log:
         log.write("\n[{}] {}\n".format(now(), " ".join(map(str, command))))
         log.flush()
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, bufsize=1)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         assert process.stdout is not None
-        for line in process.stdout:
-            log.write(line)
-            log.flush()
-            if progress_callback:
-                progress_callback(line.strip())
-        process.wait()
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        pending = ""
+        last_output = time.monotonic()
+        try:
+            while selector.get_map():
+                elapsed, silent = time.monotonic() - started, time.monotonic() - last_output
+                if elapsed > deadline_seconds or silent > idle_seconds:
+                    diagnostic_event("subprocess", category="stage", outcome="timeout", severity="ERROR",
+                                     refs={"log": str(log_path)},
+                                     metrics={"elapsed_seconds": round(elapsed), "silent_seconds": round(silent)})
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=10)
+                    raise TimeoutError("Subprocess exceeded {} deadline".format("total" if elapsed > deadline_seconds else "progress"))
+                for key, _ in selector.select(timeout=1):
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        pending += decoder.decode(b"", final=True)
+                        break
+                    last_output = time.monotonic()
+                    pending += decoder.decode(chunk)
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        log.write(line + "\n")
+                        if progress_callback:
+                            progress_callback(line.strip())
+                    log.flush()
+            if pending:
+                log.write(pending + "\n")
+                if progress_callback:
+                    progress_callback(pending.strip())
+            process.wait()
+        finally:
+            selector.close()
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
     diagnostic_event(
         "subprocess", category="stage", outcome="completed" if process.returncode == 0 else "failed",
         metrics={"return_code": process.returncode}, refs={"log": str(log_path)},
@@ -365,6 +420,23 @@ def extract_audio(source, destination, track, log):
 
 def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def current_summary_output(base):
+    """Only a complete, explicitly committed generation is public."""
+    base = Path(base)
+    try:
+        pointer = load_json(base / "summary_current.json")
+        generation_id = str(pointer.get("generation_id") or "")
+        if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{12}", generation_id):
+            return None
+        target = base / "summary_generations" / generation_id
+        manifest = load_json(target / "generation_manifest.json")
+        if manifest.get("generation_id") != generation_id or not manifest.get("artifact_sha256"):
+            return None
+        return target
+    except (OSError, ValueError, json.JSONDecodeError):
+        return base if not (base / "summary_current.json").exists() and (base / "summary.md").is_file() else None
 
 
 def profile_path(profile_id):
@@ -1656,7 +1728,7 @@ def process_job(job_id):
     diar_key = stage_cache_key("diarizen-v2", {"audio": audio_key, "model": cfg["diarization_model"], "revision": cfg["diarization_model_revision"], "embedding_model": cfg["diarization_embedding_model"], "embedding_revision": cfg["diarization_embedding_revision"], "batch": cfg["diarization_batch_size"], "min": cfg["diarization_min_speakers"], "max": cfg["diarization_max_speakers"], "exact": job["speaker_count"]})
     ultra_key = stage_cache_key("ultra-v1", {"audio": audio_key, "model": cfg.get("ultra_model"), "revision": cfg["ultra_model_revision"], "streaming": [340, 40, 40, 300]})
     consensus_key = stage_cache_key("consensus-v2", {"diarizen": diar_key, "ultra": ultra_key, "boundary_ms": cfg.get("boundary_tolerance_ms", 300)})
-    asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru")})
+    asr_key = stage_cache_key("gigaam-v1", {"audio": audio_key, "model": cfg["gigaam_model"], "language": cfg.get("language", "ru"), "vad": {"threshold": cfg["vad_threshold"], "min_speech_ms": cfg["vad_min_speech_ms"], "min_silence_ms": cfg["vad_min_silence_ms"], "speech_pad_ms": cfg["vad_speech_pad_ms"]}, "chunk_seconds": cfg["asr_chunk_seconds"], "overlap_seconds": cfg["asr_overlap_seconds"]})
     diagnostic_event(
         "job", category="stage", outcome="started",
         inputs={"original_name": job["original_name"], "content_sha256": content_sha256, "speaker_count": job["speaker_count"]},
@@ -1923,6 +1995,8 @@ def process_summary(job_id, force=False):
             command, log,
             env=dict(os.environ, **diagnostic_environment(job_id, job_dir, "summary"), PYTHONUNBUFFERED="1", PYTHONPATH=str(ROOT / "scripts")),
             progress_callback=summary_progress,
+            deadline_seconds=float(cfg.get("subprocess_deadline_seconds", 21600)),
+            idle_seconds=float(cfg.get("subprocess_idle_seconds", 1800)),
         )
         update_job(
             db, job_id,
@@ -1934,7 +2008,7 @@ def process_summary(job_id, force=False):
         shutil.copy2(log, output_dir / "summary-processing.log")
         return True
     except Exception as exc:
-        diagnostic_event("summary_job", category="stage", outcome="failed", severity="ERROR", error=exc, refs={"summary_log": str(log)})
+        diagnostic_event("summary_job", category="stage", outcome="failed_terminal", severity="ERROR", error=exc, refs={"summary_log": str(log)})
         with log.open("a", encoding="utf-8") as stream:
             traceback.print_exc(file=stream)
         update_job(
@@ -2377,22 +2451,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         INBOX.mkdir(parents=True, exist_ok=True)
-        destination = INBOX / name
-        if destination.exists():
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            destination = INBOX / ("{}-{}{}".format(destination.stem, stamp, destination.suffix))
-            counter = 2
-            while destination.exists():
-                destination = INBOX / ("{}-{}-{}{}".format(Path(name).stem, stamp, counter, Path(name).suffix))
-                counter += 1
-
         token = uuid.uuid4().hex
+        destination = INBOX / ("{}-{}{}".format(safe_name(Path(name).stem), token[:12], Path(name).suffix))
         partial = INBOX / (".web-upload-{}.partial".format(token))
         metadata_path = INBOX / (".web-upload-{}.upload.json".format(token))
         write_json(
             metadata_path,
             {
-                "name": destination.name,
+                "name": name,
+                "storage_key": destination.name,
                 "partial_name": partial.name,
                 "size": length,
                 "started_at": now(),
@@ -2437,7 +2504,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            os.replace(partial, destination)
+            # Publish without clobbering a concurrent upload that selected the
+            # same human filename. Hard-link creation is atomic on this volume.
+            while True:
+                try:
+                    os.link(partial, destination)
+                    partial.unlink()
+                    break
+                except FileExistsError:
+                    destination = destination.with_name("{}-{}{}".format(destination.stem, uuid.uuid4().hex[:8], destination.suffix))
             job_id = enqueue(destination, known_fingerprint=fp, speaker_count=speaker_count, original_name=name)
             metadata_path.unlink(missing_ok=True)
             self.send_json(
@@ -2520,9 +2595,14 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
         if parsed.path == "/download":
             job_id = parse_qs(parsed.query).get("id", [""])[0]
             name = parse_qs(parsed.query).get("file", [""])[0]
-            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics.trace.jsonl", "diagnostics_summary.json", "public_items.json", "publication_audit.json", "summary_plan.json"}
+            allowed = {"transcript.md", "transcript.txt", "subtitles.srt", "transcript.json", "diarization.rttm", "result.json", "result.rttm", "debug.json", "review.csv", "speakers.json", "processing.log", "summary-processing.log", "summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "diagnostics.jsonl", "diagnostics.trace.jsonl", "diagnostics_summary.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
+            if os.environ.get("TRANSCRISUMMARY_TRACE_EXPORT") != "1":
+                allowed.discard("diagnostics.trace.jsonl")
             row = connect().execute("SELECT output_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            target = Path(row["output_dir"]) / name if row and row["output_dir"] and name in allowed else None
+            base = Path(row["output_dir"]) if row and row["output_dir"] else None
+            package = current_summary_output(base) if base else None
+            summary_files = {"summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
+            target = (package if name in summary_files else base) / name if name in allowed and (package if name in summary_files else base) else None
             if not target or not target.is_file():
                 self.send_bytes(b"Not found", "text/plain", 404)
                 return
@@ -2543,9 +2623,11 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             if not row:
                 self.send_bytes(b"Not found", "text/plain", 404)
                 return
-            body_path = Path(row["output_dir"]) / "summary.html" if row["output_dir"] else None
-            ready = row["summary_status"] == "done" and body_path and body_path.is_file()
-            content = body_path.read_text(encoding="utf-8") if ready else ""
+            package = current_summary_output(Path(row["output_dir"])) if row["output_dir"] else None
+            body_path = package / "summary.html" if package else None
+            ready = bool(body_path and body_path.is_file())
+            content = body_path.read_text(encoding="utf-8").replace('href="transcript.html#',
+                'href="/result?id={}#'.format(job_id)) if ready else ""
             title = html.escape(row["original_name"])
             status = html.escape(row["summary_detail"] or "Саммари ещё не создано")
             error = html.escape(row["summary_error"] or "")
@@ -2557,6 +2639,8 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 ("summary_audit.json", "Аудит", False),
                 ("publication_audit.json", "Аудит публикации", False),
                 ("public_items.json", "Public items", False),
+                ("candidate_disposition.json", "Реестр полноты", False),
+                ("evidence_versions.json", "Проверка ASR", False),
                 ("diagnostics.jsonl", "Подробная диагностика", False),
                 ("diagnostics.trace.jsonl", "Per-item trace", False),
                 ("diagnostics_summary.json", "Сводка диагностики", False),
@@ -2569,12 +2653,12 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                         ' class="primary"' if primary else "", job_id, name, label
                     )
                     for name, label, primary in download_specs
-                    if Path(row["output_dir"], name).is_file()
+                    if (package / name if name in {"summary.md", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
                 )
             page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div><article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';if(j.summary_status==='done'&&document.querySelector('#content').style.display==='none')location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
                 title=title, job_id=int(job_id), content=content,
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
-                state_display="none" if ready else "block", content_display="block" if ready else "none",
+                state_display="none" if ready and row["summary_status"] == "done" else "block", content_display="block" if ready else "none",
                 downloads=downloads,
             )
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")

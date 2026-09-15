@@ -52,9 +52,7 @@ class V21ArchitectureTests(unittest.TestCase):
 
     def test_task_state_does_not_invent_owner(self):
         graph = build_meeting_graph([record("F1", "action", "Наверное, посмотрим другой подход", "propose", modality="tentative")])
-        self.assertEqual(graph["task_states"][0]["status"], "proposed")
-        self.assertIsNone(graph["task_states"][0]["owner"])
-        self.assertFalse(graph["task_states"][0]["automation_eligible"])
+        self.assertEqual(graph["task_states"], [])  # vague intention has no deliverable
 
     def test_planner_builds_view_specific_subgraphs_and_contracts(self):
         graph = build_meeting_graph([record("F1", "problem", "BOS даёт ложные входы"), record("F2", "trading_rule", "Если M15 подтверждён, искать M1", "propose", conditions=["если M15 подтверждён"], quantities=[{"value": 15, "unit": "minute", "entity": "timeframe"}])])
@@ -67,13 +65,13 @@ class V21ArchitectureTests(unittest.TestCase):
         plan_contract = {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [], "allowed_relation_markers": [], "polarity": ["negative"], "modality": ["possible"], "conditions": ["если рынок открыт"], "allowed_speakers": [], "allowed_assignees": []}
         bad = audit_realization("Решено использовать вход.", plan_contract)
         self.assertIn("negation_not_preserved", bad["errors"]); self.assertIn("modality_upgraded", bad["errors"]); self.assertIn("condition_not_preserved", bad["errors"])
-        claim = {"claim_id": "C1"}
+        claim = {"claim_id": "C1", "statement": "Если рынок открыт, нельзя входить."}
         verified = verify_generated_items([{"text": "Если рынок открыт, нельзя входить.", "fact_ids": ["F1"], "claim_ids": ["C1"]}], [plan_contract], [claim])
         self.assertTrue(verified["passed"])
 
     def test_navigation_and_composite_people_are_verified_by_role(self):
         contract = {"claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [], "allowed_relation_markers": [], "polarity": ["positive"], "modality": ["certain"], "conditions": [], "allowed_speakers": ["@Yachoy / @HoTTaBbicH"], "allowed_assignees": []}
-        claim = {"claim_id": "C1"}
+        claim = {"claim_id": "C1", "statement": "Обсуждение торгового подхода. @Yachoy / @HoTTaBbicH должен проверить подход."}
         navigation = verify_generated_items([{"text": "Обсуждение торгового подхода", "claim_ids": ["C1"], "_semantic_role": "overview"}], [contract], [claim])
         self.assertTrue(navigation["passed"]); self.assertEqual(navigation["audits"][0]["status"], "SUPPORTED")
         statement = verify_generated_items([{"text": "@Yachoy / @HoTTaBbicH должен проверить подход.", "claim_ids": ["C1"]}], [contract], [claim])

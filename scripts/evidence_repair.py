@@ -37,7 +37,7 @@ def repair_mismatch_reasons(before, after):
         ("modality", MODAL), ("direction", DIRECTION),
     ):
         expected, actual = semantic_signature(pattern, before), semantic_signature(pattern, after)
-        if not expected.issubset(actual):
+        if expected != actual:
             reasons.append(name)
     if bool(NEGATION.search(before)) != bool(NEGATION.search(after)):
         reasons.append("negation")

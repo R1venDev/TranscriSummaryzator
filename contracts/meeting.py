@@ -141,7 +141,7 @@ class DecisionState(StrictModel):
 
 class PublicItemContract(StrictModel):
     public_id: str
-    section: Literal["overview", "decisions", "rules", "tasks", "questions", "technical", "experiments", "minutes", "contributions"]
+    section: Literal["overview", "decisions", "rules", "tasks", "questions", "technical", "experiments", "minutes", "contributions", "requires_verification"]
     text: str = Field(min_length=1)
     claim_ids: list[str] = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
@@ -150,6 +150,13 @@ class PublicItemContract(StrictModel):
     social_state: str
     lifecycle: ClaimLifecycle = ClaimLifecycle.ACTIVE
     relation_ids: list[str] = Field(default_factory=list)
+    start: float = Field(0, ge=0)
+    task_state_id: Optional[str] = None
+    task_state: dict[str, Any] = Field(default_factory=dict)
+    question_state: dict[str, Any] = Field(default_factory=dict)
+    topic_entities: list[str] = Field(default_factory=list)
+    context_ids: list[str] = Field(default_factory=list)
+    verification_status: Literal["supported", "contradicted", "insufficient_evidence", "verification_unavailable"] = "supported"
 
 
 class SentencePlan(StrictModel):

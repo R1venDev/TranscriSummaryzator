@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -25,11 +26,12 @@ if str(APPLICATION_ROOT) not in sys.path:
 from quality_schema import adaptive_compute_plan, evidence_uncertainty, normalize_semantic_record, task_records
 from semantic_contracts import json_schema as contract_schema, validate_response
 from evidence_ledger import risk_level, semantic_risks
-from evidence_repair import reconcile_repairs, repair_requests
+from evidence_repair import reconcile_repairs, repair_requests, repair_mismatch_reasons
 from config_schema import load_config
 from speech_acts import COMMITMENT_RE, CORRECTION_CUE_RE, DECISION_RE, SCHEDULE_RE
 from diagnostics import decision as diagnostic_decision, event as diagnostic_event
 from diagnostics import system_snapshot
+from semantics.reducers import WORK_PREDICATE_RE
 from meeting_intelligence import (
     QUESTION_STATES, apply_question_resolutions, build_summary_plan,
     consolidate_tasks, is_noise, question_candidate_bundles, salience_score,
@@ -39,7 +41,7 @@ from semantics.ontology import CLAIM_KINDS
 from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_views
-from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, verify_generated_items, verify_sentence_plan
+from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
@@ -143,8 +145,7 @@ def transcript_utterances(document):
 
 def ensure_closing_schedule_question(records, utterances):
     """Recover an unresolved end-of-meeting scheduling slot deterministically."""
-    if any((r.get("kind") == "schedule" or "созвон" in str(r.get("statement") or "").casefold()) and r.get("question_status") not in {"answered", "resolved"} for r in records):
-        return records
+    existing_schedule = [r for r in records if r.get("kind") == "schedule" or "созвон" in str(r.get("statement") or "").casefold()]
     end = max((float(x.get("end", x.get("start", 0))) for x in utterances), default=0)
     window = [x for x in utterances if float(x.get("start", 0)) >= max(0, end - 180)]
     schedule_re = re.compile(r"(?iu)\b(?:созвон\w*|встреч\w*|звон\w*)\b")
@@ -154,7 +155,12 @@ def ensure_closing_schedule_question(records, utterances):
     def extract_times(text):
         matches = list(time_re.findall(text or "")) + list(clock_re.findall(text or ""))
         return list(dict.fromkeys(f"{int(hour):02d}:{int(minute or 0):02d}" for hour, minute in matches))
-    candidates = [x for x in window if schedule_re.search(x.get("text", "")) or weekday_re.search(x.get("text", "")) or extract_times(x.get("text", ""))]
+    anchors = [index for index, x in enumerate(window) if schedule_re.search(x.get("text", "")) or weekday_re.search(x.get("text", ""))]
+    if not anchors:
+        return records
+    begin = max(0, min(anchors) - 1)
+    finish = min(len(window), max(anchors) + 4)
+    candidates = [x for x in window[begin:finish] if not re.search(r"(?iu)\b(?:закрыти[ея]|при[её]м\s+документ|дедлайн)\b", x.get("text", ""))]
     if not candidates or not any(schedule_re.search(x.get("text", "")) for x in candidates):
         return records
     combined = " ".join(x.get("text", "") for x in candidates)
@@ -169,6 +175,7 @@ def ensure_closing_schedule_question(records, utterances):
     if not day or not times:
         return records
     accept_re = re.compile(r"(?iu)^\s*(?:да|ага|договорились|подходит|ок(?:ей)?|хорошо)\b")
+    decline_re = re.compile(r"(?iu)\b(?:не\s+смогу|не\s+подходит|не\s+получится|отказ|нет)\b")
     explicit_selection = None
     accepted = False
     for index, utterance in enumerate(candidates):
@@ -176,10 +183,10 @@ def ensure_closing_schedule_question(records, utterances):
         if len(mentioned) == 1 and len(times) > 1:
             explicit_selection = mentioned[0]
             accepted = any(
-                next_item.get("speaker") != utterance.get("speaker") and accept_re.search(next_item.get("text", ""))
+                next_item.get("speaker") != utterance.get("speaker") and accept_re.search(next_item.get("text", "")) and not decline_re.search(next_item.get("text", ""))
                 for next_item in candidates[index + 1:index + 3]
             )
-    single_accepted = len(times) == 1 and any(accept_re.search(x.get("text", "")) for x in candidates[1:])
+    single_accepted = len(times) == 1 and any(accept_re.search(x.get("text", "")) and not decline_re.search(x.get("text", "")) for x in candidates[1:])
     answered = single_accepted or bool(explicit_selection and accepted)
     chosen = explicit_selection if explicit_selection and accepted else (times[0] if single_accepted else None)
     statement = (
@@ -187,7 +194,7 @@ def ensure_closing_schedule_question(records, utterances):
         else f"Следующий созвон предложен на {day}; варианты времени: {' или '.join(times)}. Точное время не подтверждено."
     )
     evidence_ids = [x["id"] for x in candidates]
-    records = list(records)
+    records = [r for r in records if r not in existing_schedule or r.get("question_status") in {"answered", "resolved"}]
     records.append({
         "record_id": "F-CLOSING-SCHEDULE", "kind": "schedule", "content_kind": "schedule",
         "topic": "время следующего созвона", "statement": statement,
@@ -589,16 +596,20 @@ def apply_resolution_response(response, focused, targets, facts, rejected_dir):
     return deduplicate(facts + accepted), resolved_by_fact, reviewed_non_facts
 
 
+LLM_CACHE_ROOT = None
+FRESH_MODEL_CALLS = False
+
+
 def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3, progress=None, num_predict=5000, num_ctx=16384, contract=None):
     schema = contract_schema(contract) if contract else None
     digest = client.model_digest(model) if hasattr(client, "model_digest") else "nonproduction-client:" + client.__class__.__name__
     request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "model_digest": digest, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx, "schema": schema})
-    run_root = next((parent for parent in cache_path.parents if parent.name.startswith("summary-state-")), None)
-    global_cache = (run_root.parent / "_global_llm_cache" / request_key[:2] / f"{request_key}.json") if run_root else None
-    for candidate, reason in ((cache_path, "run_cache"), (global_cache, "global_content_addressed")):
+    global_cache = (LLM_CACHE_ROOT / "_global_llm_cache" / request_key[:2] / f"{request_key}.json") if LLM_CACHE_ROOT else None
+    candidates = () if FRESH_MODEL_CALLS else ((cache_path, "run_cache"), (global_cache, "global_content_addressed"))
+    for candidate, reason in candidates:
         if candidate and candidate.is_file():
             cached = load_json(candidate)
-            if cached.get("request_key") == request_key:
+            if cached.get("request_key") == request_key and isinstance(cached.get("response"), dict):
                 if candidate != cache_path:
                     atomic_json(cache_path, cached)
                 diagnostic_decision("llm_cache", "hit", metrics={"request_key": request_key}, refs={"cache": str(candidate)}, reasons=[reason])
@@ -607,10 +618,11 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     errors = []
     for attempt in range(1, attempts + 1):
         started = time.monotonic()
+        request_attempt_id = uuid.uuid4().hex
         diagnostic_event(
             "llm_request", category="stage", outcome="started",
             inputs={"model": model, "attempt": attempt, "contract": contract, "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(), "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "system_chars": len(system), "prompt_chars": len(prompt)},
-            thresholds={"num_predict": num_predict, "num_ctx": num_ctx, "temperature": 0.0}, refs={"cache": str(cache_path)},
+            thresholds={"num_predict": num_predict, "num_ctx": num_ctx, "temperature": 0.0}, refs={"cache": str(cache_path), "request_key": request_key, "request_attempt_id": request_attempt_id},
         )
         try:
             suffix = "" if attempt == 1 else f"\n\nПовтор {attempt}: предыдущий ответ был пустым или невалидным. Обязательно верни полный JSON."
@@ -623,7 +635,7 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
                 atomic_json(global_cache, load_json(cache_path))
             diagnostic_event(
                 "llm_request", category="llm", outcome="completed", inputs={"model": model, "attempt": attempt, "contract": contract},
-                metrics=metrics, refs={"cache": str(cache_path), "request_key": request_key},
+                metrics=metrics, refs={"cache": str(cache_path), "request_key": request_key, "request_attempt_id": request_attempt_id},
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
             )
             return load_json(cache_path)
@@ -632,7 +644,7 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
             limited = output_limit_error(exc)
             diagnostic_event(
                 "llm_request", category="llm", outcome="retryable_output_limit" if limited else "failed", inputs={"model": model, "attempt": attempt, "contract": contract},
-                refs={"cache": str(cache_path), "request_key": request_key}, severity="WARN" if limited else "ERROR", error=exc,
+                refs={"cache": str(cache_path), "request_key": request_key, "request_attempt_id": request_attempt_id}, severity="WARN" if limited else "ERROR", error=exc,
                 duration_ms=round((time.monotonic() - started) * 1000, 3),
             )
             # Repeating an identical payload cannot repair an exhausted output
@@ -811,6 +823,23 @@ def cautious_statement(statement, prefix):
     return prefix + statement[:1].lower() + statement[1:]
 
 
+def action_predicate_supported(statement, evidence):
+    """A promise in a nearby clause cannot promote a different predicate."""
+    def groups(text):
+        values = {match.group(0).casefold()[:5] for match in WORK_PREDICATE_RE.finditer(text)}
+        if values & {"перед", "отпра", "предо", "выгру", "скину", "скин", "дам", "даю", "кину", "отдам"}:
+            values.add("deliver")
+        return values
+    wanted = groups(str(statement or ""))
+    if not wanted:
+        return False
+    for item in evidence:
+        for clause in re.split(r"[.!?;]|,\s*(?:но|а|затем|потом)\b", str(item.get("text") or ""), flags=re.I):
+            if (COMMITMENT_RE.search(clause) or re.search(r"(?iu)\bмне\s+(?:нужно|надо)\b", clause)) and wanted & groups(clause):
+                return True
+    return False
+
+
 def enforce_fact_policy(fact):
     """Conservatively downgrade types that models tend to overstate."""
     updated = dict(fact)
@@ -827,7 +856,9 @@ def enforce_fact_policy(fact):
         evidence_text,
     )
 
-    if updated["type"] == "proposal" and (any(marker in evidence_text for marker in commitment_markers) or first_person_intent):
+    work_predicate = bool(WORK_PREDICATE_RE.search(updated.get("statement", "")))
+    matched_commitment = action_predicate_supported(updated.get("statement"), updated.get("evidence", []))
+    if updated["type"] == "proposal" and matched_commitment and (any(marker in evidence_text for marker in commitment_markers) or first_person_intent):
         updated["type"] = "action"
         updated["certainty"] = "tentative" if any(marker in evidence_text for marker in tentative_markers) else "explicit"
         updated["policy_note"] = "explicit_commitment_promoted"
@@ -839,11 +870,10 @@ def enforce_fact_policy(fact):
         updated["certainty"] = "tentative"
         updated["statement"] = cautious_statement(updated["statement"], "Предлагалось ")
         updated["policy_note"] = "decision_downgraded"
-    elif updated["type"] == "action" and not (
-        any(marker in evidence_text for marker in action_markers)
-        or first_person_intent
+    elif updated["type"] == "action" and not (work_predicate and (
+        matched_commitment
         or updated.get("policy_note") in {"explicit_commitment_promoted", "confirmed_owner_question_promoted"}
-    ):
+    )):
         updated["type"] = "proposal"
         updated["certainty"] = "tentative"
         updated["statement"] = cautious_statement(updated["statement"], "Обсуждалась необходимость ")
@@ -936,7 +966,7 @@ def resolve_dialogue_commitments(facts, utterances):
     result = []
     for original in facts:
         fact = enforce_fact_policy(original)
-        evidence_text = " ".join(item["text"] for item in fact.get("evidence", [])).casefold()
+        evidence_text = str((fact.get("evidence") or [{}])[0].get("text") or "").casefold()
         if fact["type"] in {"proposal", "question"} and re.search(
             r"\bмне\s+(?:\w+\s+){0,4}(?:сделать|подготовить|разметить|проверить|отправить)\b",
             evidence_text,
@@ -970,7 +1000,8 @@ def resolve_dialogue_commitments(facts, utterances):
         if evidence_positions:
             first, last = min(evidence_positions), max(evidence_positions)
             fact = dict(fact)
-            fact["primary_evidence_start"] = min(float(item.get("start", 0)) for item in fact.get("evidence", []))
+            fact["primary_evidence_start"] = min(float(item.get("start", 0)) for item in fact.get("evidence", []) if item.get("id") in fact.get("evidence_ids", []))
+            fact["context_ids"] = [item["id"] for item in utterances[max(0, first - 2):min(len(utterances), last + 3)] if item["id"] not in fact.get("evidence_ids", [])]
             fact["dialogue_evidence"] = [
                 {key: item.get(key) for key in ("id", "start", "end", "speaker", "text", "source_word_ids", "uncertainty")}
                 for item in utterances[max(0, first - 2):min(len(utterances), last + 3)]
@@ -991,12 +1022,20 @@ def fact_similarity(left, right):
 def deduplicate(facts):
     kept = []
     for fact in sorted(facts, key=lambda item: (item["start"], item["fact_id"])):
+        fact.setdefault("origin_id", "OR" + stable_hash({"evidence_ids": fact.get("evidence_ids", []),
+            "start": round(float(fact.get("start", 0)), 2), "kind": fact.get("type"),
+            "speaker_refs": fact.get("speaker_refs", [])})[:16])
+        fact.setdefault("origin_ids", [fact["origin_id"]])
         normalized_statement = normalize_space(fact.get("statement", "")).casefold().rstrip(". ")
         duplicate = next((
             item for item in kept
             if fact_similarity(item, fact) == 1.0
         ), None)
         if duplicate:
+            duplicate["origin_ids"] = list(dict.fromkeys(
+                list(duplicate.get("origin_ids", [duplicate.get("origin_id")]))
+                + list(fact.get("origin_ids", [fact.get("origin_id")]))
+            ))
             duplicate["source_chunks"] = sorted(set(duplicate["source_chunks"] + fact["source_chunks"]))
             duplicate["evidence_ids"] = list(dict.fromkeys(duplicate["evidence_ids"] + fact["evidence_ids"]))
             known_evidence = {item["id"] for item in duplicate["evidence"]}
@@ -1008,7 +1047,13 @@ def deduplicate(facts):
             continue
         kept.append(fact)
     for index, fact in enumerate(kept, 1):
+        fact.setdefault("origin_id", "OR" + stable_hash({
+            "evidence_ids": fact.get("evidence_ids", []), "start": round(float(fact.get("start", 0)), 2),
+            "kind": fact.get("type"), "speaker_refs": fact.get("speaker_refs", []),
+        })[:16])
+        fact.setdefault("origin_ids", [fact["origin_id"]])
         fact["fact_id"] = f"F{index:05d}"
+        fact["revision_id"] = "RV" + stable_hash({"origin_id": fact["origin_id"], "statement": fact.get("statement"), "type": fact.get("type")})[:16]
     return kept
 
 
@@ -1018,21 +1063,23 @@ VALIDATE_SYSTEM = """Ты проверяешь атомарные факты п�
 def compact_fact(fact, include_evidence=True):
     result = {key: fact[key] for key in ("fact_id", "type", "topic", "statement", "certainty", "evidence_ids")}
     result["speaker_refs"] = list(fact.get("speaker_refs", []))
-    result["uncertainty"] = dict(fact.get("uncertainty", {}))
+    uncertainty = fact.get("uncertainty", {})
+    result["risk"] = {"level": fact.get("risk_level"), "reasons": uncertainty.get("reasons", [])}
     result["claim_id"] = fact.get("claim_id")
     result["allowed_relations"] = list(fact.get("allowed_relations", []))
     if include_evidence:
-        result["evidence"] = fact["evidence"]
-        result["dialogue_evidence"] = list(fact.get("dialogue_evidence", []))
-        result["audio_repairs"] = list(fact.get("audio_repairs", []))
+        result["evidence"] = [{key: item.get(key) for key in ("id", "speaker", "text", "start")} for item in fact.get("evidence", [])]
+        result["context_ids"] = list(fact.get("context_ids", []))
     return result
 
 
 def fact_has_commitment(fact):
     """Commitment is a speech act and must survive content-kind review."""
+    if not WORK_PREDICATE_RE.search(str(fact.get("statement") or "")):
+        return False
     if str(fact.get("speech_act") or "").casefold() in {"commit", "commitment"}:
         return True
-    return any(ACTION_OWNER_RE.search(str(item.get("text") or "")) for item in fact.get("evidence", []))
+    return action_predicate_supported(fact.get("statement"), fact.get("evidence", []))
 
 
 def evidence_is_question(fact):
@@ -1060,15 +1107,16 @@ def apply_reviews(facts, reviews, strict=False, enforce_policy=True):
             verdict = "reject"
         if verdict not in {"supported", "corrected"}:
             rejection_reason = normalize_space(review.get("reason")) or "отклонено моделью"
-            recognition_reason = bool(re.search(r"(?iu)overlap|audio|recognition|распозна|аудио|неувер", rejection_reason))
-            if fact_has_commitment(fact) and recognition_reason:
+            if fact_has_commitment(fact):
                 updated = repair_fact_attribution(dict(
                     fact, confidence=0.35, validation="recognition_uncertain",
+                    verification_status="verification_unavailable",
+                    verification_failure_stage="model_rejected_source_commitment",
                     recognition_review_required=True,
-                    review_patch={"applied": False, "reason": "commitment_preserved_for_audio_review", "model_reason": rejection_reason},
+                    review_patch={"applied": False, "reason": "commitment_preserved_for_source_review", "model_reason": rejection_reason},
                 ))
                 accepted.append(updated)
-                diagnostic_decision("fact_review", "preserved_for_audio_review", reasons=[rejection_reason], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
+                diagnostic_decision("fact_review", "quarantined_for_source_review", reasons=[rejection_reason], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
                 continue
             rejected.append({"fact": fact, "reason": rejection_reason})
             diagnostic_decision("fact_review", "rejected", metrics={"model_verdict": verdict, "model_confidence": review.get("confidence"), "kind": fact.get("type"), "risk_level": fact.get("risk_level")}, reasons=[rejection_reason], refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])})
@@ -1253,12 +1301,12 @@ def critical_verifier_consensus(
         ):
             reason = "critical_correction_mismatch"
         if reason:
-            rejected.append({
-                "fact": original,
-                "reason": reason,
-                "verifiers": [primary_model, secondary_model],
-            })
-            diagnostic_decision("critical_verifier_consensus", "rejected", metrics={"primary_validation": left.get("validation") if left else None, "secondary_validation": right.get("validation") if right else None, "primary_type": left.get("type") if left else None, "secondary_type": right.get("type") if right else None}, reasons=[reason], refs={"fact_id": fact_id, "models": [primary_model, secondary_model]})
+            quarantined = dict(original, verification_status="verification_unavailable",
+                               verification_failure_stage="critical_consensus", confidence=0.2,
+                               critical_consensus={"verdict": "quarantined", "reason": reason,
+                                                   "models": [primary_model, secondary_model]})
+            accepted.append(quarantined)
+            diagnostic_decision("critical_verifier_consensus", "quarantined", metrics={"primary_validation": left.get("validation") if left else None, "secondary_validation": right.get("validation") if right else None, "primary_type": left.get("type") if left else None, "secondary_type": right.get("type") if right else None}, reasons=[reason], refs={"fact_id": fact_id, "models": [primary_model, secondary_model]})
             continue
         result = dict(left if left.get("validation") == "corrected" else original)
         result["confidence"] = min(float(left.get("confidence", 0)), float(right.get("confidence", 0)))
@@ -1556,11 +1604,12 @@ def display_time(seconds, total_seconds=0):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def time_link(seconds, total_seconds=0, job_id=None):
+def time_link(seconds, total_seconds=0, job_id=None, base_url=None):
     value = display_time(seconds, total_seconds)
     if job_id is not None and str(job_id).isdigit():
-        return f"[{value}](/result?id={job_id}#t-{round(float(seconds) * 1000)})"
-    return f"[{value}](#transcript-time={float(seconds):.3f})"
+        if base_url:
+            return f"[{value}]({str(base_url).rstrip('/')}/result?id={job_id}#t-{round(float(seconds) * 1000)})"
+    return f"[{value}](transcript.html#t-{round(float(seconds) * 1000)})"
 
 
 def meeting_date(source):
@@ -1642,9 +1691,10 @@ def semantic_metrics(registry, facts=None):
     return {
         "records": len(records),
         "tasks": len(tasks),
-        "confirmed_tasks": sum(item.get("assignment_status") == "confirmed" for item in tasks),
-        "unconfirmed_tasks": sum(item.get("assignment_status") != "confirmed" for item in tasks),
-        "automation_eligible_tasks": sum(bool(item.get("automation_eligible")) for item in tasks),
+        "confirmed_tasks": sum(item.get("status") in {"self_committed", "accepted", "assigned", "completed"} or item.get("assignment_status") == "confirmed" for item in tasks),
+        "unconfirmed_tasks": sum(item.get("status") not in {"self_committed", "accepted", "assigned", "completed"} and item.get("assignment_status") != "confirmed" for item in tasks),
+        "automation_eligible_tasks": sum(item.get("automation_eligible") is True for item in tasks),
+        "automation_unknown_tasks": sum(item.get("automation_eligible") == "unknown" for item in tasks),
         "questions_resolved": sum(item.get("question_status") in {"answered", "resolved"} for item in questions),
         "questions_partially_answered": sum(item.get("question_status") == "partially_answered" for item in questions),
         "questions_tentatively_answered": sum(item.get("question_status") == "tentatively_answered" for item in questions),
@@ -2331,7 +2381,7 @@ def select_items_evenly(items, fact_map, limit=8):
     return [ordered[index] for index in dict.fromkeys(indexes)]
 
 
-def render_public_items(items, metadata=None):
+def render_public_items_legacy(items, metadata=None):
     """Pure formatter: no selection, inference, cleanup or state promotion."""
     metadata = metadata or {}
     total_seconds = float(metadata.get("duration_seconds") or 0)
@@ -2397,6 +2447,100 @@ def render_public_items(items, metadata=None):
                 prefix = prefixes[section]
                 lines.append(f"- **{prefix}-{index:02d}.** {text} {stamp}")
     return "\n".join(lines).strip() + "\n"
+
+
+def _public_text(item):
+    text = canonicalize_people(item.get("text") or "")
+    text = re.sub(r"(?iu)^\s*говорящий\s+(@[\w.-]+)\s+", r"\1 ", text)
+    return re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text).strip()
+
+
+def _chapter_label(text, limit=78):
+    value = re.split(r"[.!?;]", re.sub(r"[*`]", "", text), maxsplit=1)[0].strip(" —:,")
+    return shorten_text(value, limit).rstrip(".…") or "Фрагмент обсуждения"
+
+
+def build_public_document(items, metadata=None):
+    """Materialize every authored node before rendering it."""
+    metadata = metadata or {}
+    by_section = {}
+    for item in items:
+        by_section.setdefault(item["section"], []).append(item)
+    overview = by_section.get("overview", [])
+    task = next((item for item in by_section.get("tasks", []) if item.get("social_state") in {"accepted", "self_committed", "assigned", "completed"}), None)
+    title_sources = ([overview[0]] if overview else []) + ([task] if task and task not in overview else [])
+    if not title_sources:
+        title_sources = list(items[:1])
+    title_parts = [_chapter_label(_public_text(item), 72) for item in title_sources]
+    title = "; следующие шаги: ".join(dict.fromkeys(title_parts)) or "Итоги встречи и следующие шаги"
+    minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
+    chapter_count = min(9, max(1, math.ceil(len(minute_items) / 4))) if minute_items else 0
+    chapters = []
+    for index in range(chapter_count):
+        first = round(index * len(minute_items) / chapter_count)
+        last = round((index + 1) * len(minute_items) / chapter_count)
+        members = minute_items[first:last]
+        if not members:
+            continue
+        chapters.append({
+            "chapter_id": f"CH{index + 1:02d}", "label": _chapter_label(_public_text(members[0])),
+            "start": float(members[0].get("start", 0)), "end": float(members[-1].get("start", 0)),
+            "claim_ids": [claim for item in members for claim in item.get("claim_ids", [])],
+            "evidence_ids": [evidence for item in members for evidence in item.get("evidence_ids", [])],
+            "items": members,
+        })
+    return {
+        "schema": "PublicDocument", "schema_version": 2,
+        "title": {"text": title, "claim_ids": [claim for item in title_sources for claim in item.get("claim_ids", [])], "evidence_ids": [evidence for item in title_sources for evidence in item.get("evidence_ids", [])]},
+        "overview": [{"text": _public_text(item), "claim_ids": item.get("claim_ids", []), "evidence_ids": item.get("evidence_ids", [])} for item in overview],
+        "sections": {key: value for key, value in by_section.items() if key not in {"overview", "minutes"}},
+        "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "claim_ids", "evidence_ids")} for chapter in chapters],
+        "chronology": chapters,
+        "metadata": dict(metadata),
+    }
+
+
+def render_public_document(document):
+    """Format a verified PublicDocument without inventing content."""
+    metadata = document.get("metadata", {})
+    total_seconds = float(metadata.get("duration_seconds") or 0)
+    job_id, base_url = metadata.get("job_id"), metadata.get("public_base_url")
+    project = normalize_space(metadata.get("project")) or "Project"
+    lines = [f"# {meeting_date(metadata.get('source'))} | {project} — {document['title']['text']}"]
+    if document.get("overview"):
+        lines.extend(["", "## Главное", ""])
+        texts = [terminate_sentence(item["text"]) for item in document["overview"]]
+        split = min(2, len(texts))
+        lines.append(" ".join(texts[:split]))
+        if texts[split:]:
+            lines.extend(["", " ".join(texts[split:])])
+    if document.get("navigation"):
+        lines.extend(["", "## Таймкоды", ""])
+        for chapter in document["navigation"]:
+            start = time_link(chapter["start"], total_seconds, job_id, base_url)
+            end = display_time(chapter["end"], total_seconds)
+            lines.append(f"- {start}–{end} — {chapter['label']}")
+    headings = {"decisions": "Принятые решения", "rules": "Упомянутые действующие правила", "tasks": "Договорённости и следующие шаги", "questions": "Что осталось уточнить", "technical": "Технические выводы и ограничения", "experiments": "Идеи и эксперименты", "requires_verification": "Требует проверки источника"}
+    prefixes = {"decisions": "D", "rules": "R", "tasks": "T", "questions": "Q", "experiments": "H", "technical": "X", "requires_verification": "V"}
+    for section in ("decisions", "rules", "tasks", "questions", "technical", "experiments", "requires_verification"):
+        section_items = document.get("sections", {}).get(section, [])
+        if not section_items: continue
+        lines.extend(["", f"## {headings[section]}", ""])
+        for index, item in enumerate(section_items, 1):
+            stamp = time_link(float(item.get("start", 0)), total_seconds, job_id, base_url)
+            qualifier = " (проверка недоступна; не подтверждено как договорённость)" if section == "requires_verification" else ""
+            lines.append(f"- **{prefixes[section]}-{index:02d}.** {_public_text(item)}{qualifier} {stamp}")
+    if document.get("chronology"):
+        lines.extend(["", "## Подробная хронология встречи", ""])
+        for chapter in document["chronology"]:
+            start = time_link(chapter["start"], total_seconds, job_id, base_url)
+            end = display_time(chapter["end"], total_seconds)
+            lines.extend([f"### {start}–{end} — {chapter['label']}", "", " ".join(terminate_sentence(_public_text(item)) for item in chapter["items"]), ""])
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_public_items(items, metadata=None):
+    return render_public_document(build_public_document(items, metadata))
 
 
 def render_markdown(document, facts, coverage, metadata=None, semantic_registry=None,
@@ -2933,7 +3077,7 @@ def render_html(markdown):
     def inline(value):
         escaped = html.escape(value)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-        escaped = re.sub(r"\[([^]]+)\]\(((?:#transcript-time=|/result\?id=)[^)]+)\)", r'<a href="\2">\1</a>', escaped)
+        escaped = re.sub(r"\[([^]]+)\]\(((?:transcript\.html#t-|https?://[^ )]+/result\?id=|/result\?id=)[^)]+)\)", r'<a href="\2">\1</a>', escaped)
         return escaped
     for raw in lines:
         line = raw.strip()
@@ -3229,11 +3373,19 @@ def prepare_publishable_facts(client, model, facts, run_dir):
                 r"ответ оборван|лимит(?:а|у|ом)? вывода|truncat|max(?:imum)? (?:output )?tokens?",
                 str(exc), re.IGNORECASE,
             )
-            if len(batch) <= 1 or not output_limited:
-                raise
-            middle = len(batch) // 2
-            review_batch(batch[:middle], offset)
-            review_batch(batch[middle:], offset + middle)
+            if output_limited and len(batch) > 1:
+                middle = len(batch) // 2
+                review_batch(batch[:middle], offset)
+                review_batch(batch[middle:], offset + middle)
+                return
+            for original in batch:
+                retained = dict(original)
+                retained["verification_status"] = "verification_unavailable"
+                retained["verification_failure_stage"] = "editorial_review"
+                accepted.append(retained)
+            processed += len(batch)
+            diagnostic_event("editorial_review", category="decision", outcome="quarantined", severity="WARN",
+                             refs={"fact_ids": [value.get("fact_id") for value in batch]}, error=exc)
             return
 
         reviews = result.get("response", {}).get("reviews", [])
@@ -3241,9 +3393,10 @@ def prepare_publishable_facts(client, model, facts, run_dir):
         missing_ids = {item["fact_id"] for item in batch} - reviewed_ids
         if missing_ids:
             if len(batch) <= 1:
-                raise RuntimeError(
-                    "Редакционная модель не вернула проверку факта: " + next(iter(missing_ids))
-                )
+                retained = dict(batch[0]); retained["verification_status"] = "verification_unavailable"
+                retained["verification_failure_stage"] = "editorial_review_incomplete"
+                accepted.append(retained); processed += 1
+                return
             middle = len(batch) // 2
             review_batch(batch[:middle], offset)
             review_batch(batch[middle:], offset + middle)
@@ -3276,19 +3429,33 @@ def audit_final_facts(client, model, facts, run_dir):
         prompt = "Проверь все утверждения по приведённым репликам. Особенно проверь отрицания, условия, альтернативы (или/и), исполнителей, числовые единицы, местоимения и автора каждого смыслового фрагмента. Не считай автора вопроса автором ответа и не считай автора реплики исполнителем. Не добавляй внешнюю терминологическую оценку, которой нет в репликах. Если тезис звучит как общее утверждение о внешнем мире, но подтверждён только словами участника, явно сохрани атрибуцию «по словам @...», а не выдавай его за независимо проверенный факт. Вопрос не является установленным положением. Если имя «Макс» или «Максим» не позволяет различить двух участников, не выбирай одного из них. Неясное оставляй неясным.\n"
         prompt += json.dumps([compact_fact(f) for f in batch], ensure_ascii=False)
         prompt += '\nФормат: {"reviews":[{"fact_id":"F00001","verdict":"supported|corrected|reject","statement":"...","type":"observation","confidence":0.8,"reason":"..."}]}'
-        response = call_json_with_retries(
-            client, model, FINAL_AUDIT_SYSTEM, prompt,
-            run_dir / "final-semantic-audit" / f"facts-{offset + 1:05d}-{offset + len(batch):05d}.json",
-            num_predict=3500,
-        )
+        try:
+            response = call_json_with_retries(
+                client, model, FINAL_AUDIT_SYSTEM, prompt,
+                run_dir / "final-semantic-audit" / f"facts-{offset + 1:05d}-{offset + len(batch):05d}.json",
+                num_predict=3500,
+            )
+        except RuntimeError as exc:
+            if len(batch) > 1:
+                middle = len(batch) // 2
+                audit_batch(batch[:middle], offset)
+                audit_batch(batch[middle:], offset + middle)
+                return
+            retained = dict(batch[0]); retained["verification_status"] = "verification_unavailable"
+            retained["verification_failure_stage"] = "semantic_review"
+            accepted.append(retained); processed += 1
+            diagnostic_event("semantic_review", category="decision", outcome="quarantined", severity="WARN",
+                             refs={"fact_id": retained.get("fact_id")}, error=exc)
+            return
         reviews = response.get("response", {}).get("reviews", [])
         reviewed_ids = {item.get("fact_id") for item in reviews if isinstance(item, dict)}
         missing_ids = {item["fact_id"] for item in batch} - reviewed_ids
         if missing_ids:
             if len(batch) <= 1:
-                raise RuntimeError(
-                    "Финальная модель не вернула проверку факта: " + next(iter(missing_ids))
-                )
+                retained = dict(batch[0]); retained["verification_status"] = "verification_unavailable"
+                retained["verification_failure_stage"] = "semantic_review_incomplete"
+                accepted.append(retained); processed += 1
+                return
             middle = len(batch) // 2
             audit_batch(batch[:middle], offset)
             audit_batch(batch[middle:], offset + middle)
@@ -3378,13 +3545,13 @@ def audit_public_surface_facts(client, model, facts, run_dir, total_seconds, fai
             accepted_by_id.update({item["fact_id"]: item for item in kept})
             rejected.extend(denied)
         except RuntimeError as exc:
-            failures.append({"first": first, "last": last, "error": str(exc)})
-            unsafe = [item for item in batch if item.get("risk_level") in {"HIGH", "CRITICAL"} or item.get("type") in CRITICAL_TYPES]
-            if failure_policy == "fail_closed" and batch:
-                unsafe = list(batch)
-            unsafe_ids = {item["fact_id"] for item in unsafe}
-            rejected.extend({"fact": item, "reason": "public_auditor_unavailable"} for item in unsafe)
-            accepted_by_id.update({item["fact_id"]: item for item in batch if item["fact_id"] not in unsafe_ids})
+            failures.append({"first": first, "last": last, "fact_ids": [item["fact_id"] for item in batch], "error": str(exc)})
+            for item in batch:
+                retained = dict(item)
+                retained["verification_status"] = "verification_unavailable"
+                retained["uncertainty"] = dict(retained.get("uncertainty", {}), needs_review=True)
+                retained["uncertainty"]["reasons"] = sorted(set(retained["uncertainty"].get("reasons", [])) | {"public_auditor_unavailable"})
+                accepted_by_id[item["fact_id"]] = retained
         emit(
             73 + 2 * min(1.0, last / max(1, len(targets))),
             "summary_public_audit",
@@ -3398,6 +3565,7 @@ def audit_public_surface_facts(client, model, facts, run_dir, total_seconds, fai
         result.append(accepted_by_id.get(item["fact_id"], item))
     return result, rejected, {
         "model": model, "targeted": len(targets), "rejected": len(rejected),
+        "verification_unavailable": sum(len(item.get("fact_ids", [])) for item in failures),
         "degraded_batches": failures,
     }
 
@@ -3852,6 +4020,16 @@ def build_run_manifest(settings, cfg, source_manifest):
             role: {"name": settings.get(role), **inventory.get(settings.get(role), {})}
             for role in roles if settings.get(role)
         },
+        "stage_model_contracts": {
+            "summary_extract": {"model": settings.get("extractor"), "contract": "extraction"},
+            "summary_validate": {"model": settings.get("extractor"), "contract": "editorial_reviews"},
+            "summary_arbitrate": {"model": settings.get("high_risk_verifier"), "contract": "risk_arbitration"},
+            "summary_critical_check": {"model": settings.get("critical_secondary_verifier"), "contract": "independent_critical_review"},
+            "summary_audit": {"model": settings.get("auditor"), "contract": "semantic_reviews"},
+            "summary_public_audit": {"model": settings.get("high_risk_verifier"), "contract": "public_surface_reviews"},
+            "summary_dialogue_counterexample": {"model": settings.get("public_auditor"), "contract": "dialogue_counterexample"},
+            "public_document": {"model": None, "contract": "deterministic_public_items", "legacy_writer": "disabled"},
+        },
         "vocabulary_sha256": hashlib.sha256(vocabulary.read_bytes()).hexdigest() if vocabulary.is_file() else None,
         "input_audio_sha256": source_manifest.get("audio_sha256"),
         "transcript_sha256": settings.get("transcript"),
@@ -3860,6 +4038,18 @@ def build_run_manifest(settings, cfg, source_manifest):
 
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
+    # Capture candidates before any editorial/model pass can remove them.
+    prevalidation_registry = load_json(run_dir / "early_candidates.json") if (run_dir / "early_candidates.json").is_file() else {"candidates": []}
+    early_candidates = list(prevalidation_registry.get("candidates", []))
+    later_candidates = [{"origin_id": fact.get("origin_id") or fact.get("fact_id"),
+                         "fact_id": fact.get("fact_id"), "kind": fact.get("type"),
+                         "statement": fact.get("statement"),
+                        "evidence_ids": list(fact.get("evidence_ids", [])),
+                         "source_word_ids": list(fact.get("source_word_ids", []))}
+                        for fact in final_facts if fact.get("type") in {"action", "follow_up", "resource", "decision"}]
+    known_origins = {item["origin_id"] for item in early_candidates}
+    early_candidates.extend(item for item in later_candidates if item["origin_id"] not in known_origins)
+    atomic_json(run_dir / "early_candidates.json", {"schema_version": 1, "candidates": early_candidates})
     source_turns = transcript_utterances(transcript_document)
     total_seconds = float(transcript_document.get("duration_seconds") or coverage.get("total_seconds") or 0)
     emit(68, "summary_validate", "Отбираю факты, пригодные для публикации")
@@ -3880,6 +4070,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     )
     for fact in final_facts:
         fact["statement"] = canonicalize_people_plain(clean_publication_statement(fact))
+    final_fact_origins = {fact["fact_id"]: fact.get("origin_ids", [fact.get("origin_id") or fact["fact_id"]]) for fact in final_facts}
     semantic_registry = build_semantic_registry(client, settings["auditor"], final_facts, run_dir)
     resolved_records, dialogue_resolution = resolve_global_dialogue(
         client, settings["auditor"], semantic_registry.get("records", []), run_dir,
@@ -4014,7 +4205,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     # v23 has one production path.  The legacy document writer/auditor and its
     # unused 27B executive pass are deliberately not invoked.
-    final_document = {"schema": "PublicDocument", "schema_version": 1, "authoritative_source": "public_items.json"}
+    final_document = {"schema": "PublicDocument", "schema_version": 2, "authoritative_source": "public_document.json"}
     writer_details = {"publication_path": "canonical_public_items", "legacy_writer_invoked": False, "executive_llm_invoked": False}
     audit_rejected, document_coverage = [], {"legacy_document": "disabled"}
     final_quality = {"passed": True, "legacy_document_structure": "disabled"}
@@ -4049,24 +4240,45 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     })
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     public_items = build_public_items(state_v2, summary_plan)
+    anchor_by_id = {turn["id"]: float(turn.get("start", 0)) for turn in source_turns}
+    anchor_starts = set(anchor_by_id.values())
+    for item in public_items:
+        proposed_start = float(item.get("start", 0))
+        supporting = [anchor_by_id[value] for value in item.get("evidence_ids", []) if value in anchor_by_id]
+        if supporting:
+            item["start"] = min(supporting, key=lambda value: abs(value - proposed_start))
+            item["navigation_basis"] = "supporting_utterance"
+        elif anchor_starts:
+            item["start"] = min(anchor_starts, key=lambda value: abs(value - proposed_start))
+            item["navigation_basis"] = "nearest_utterance_fallback"
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
     if not post_render_audit["passed"]:
         atomic_json(run_dir / "post_render_verification.json", post_render_audit)
         raise RuntimeError("Post-render PublicItem verification rejected publication")
-    markdown = render_public_items(public_items, metadata={
+    final_document = build_public_document(public_items, metadata={
         "source": transcript_document.get("source"),
         "duration_seconds": transcript_document.get("duration_seconds"),
         "project": cfg.get("summary_project_name", "Aurion"),
         "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
+        "public_base_url": cfg.get("summary_public_base_url"),
     })
+    if any(float(chapter["start"]) not in anchor_starts for chapter in final_document.get("navigation", [])):
+        raise RuntimeError("Navigation target does not exist in the transcript")
+    markdown = render_public_document(final_document)
+    document_verification = verify_public_document(final_document, markdown, public_items)
+    if not document_verification["passed"]:
+        atomic_json(run_dir / "public_document_verification.json", document_verification)
+        raise RuntimeError("Final PublicDocument verification rejected publication")
     verified_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
     quality_gates = runtime_quality_gates(post_render_audit, markdown, verified_hash, public_items, summary_plan)
     actual_output_audit = post_render_audit
     final_document["public_items"] = public_items
+    final_document["verification"] = document_verification
     run_manifest["verified_artifact_sha256"] = verified_hash
     run_manifest["public_item_count"] = len(public_items)
     atomic_json(run_dir / "public_items.json", {"schema": "PublicItemSchema", "schema_version": 3, "items": public_items})
+    atomic_json(run_dir / "public_document.json", final_document)
     atomic_json(run_dir / "post_render_verification.json", post_render_audit)
     atomic_json(run_dir / "runtime_quality_gates.json", quality_gates)
     atomic_json(run_dir / "publication_audit.json", quality_gates)
@@ -4104,23 +4316,28 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(run_dir / "plan_verification.json", plan_verification)
     if not all(item["plan"]["passed"] and item["realization"]["passed"] for item in plan_audits):
         raise RuntimeError("Plan-before-write verification rejected a public sentence")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    history = output_dir / "summary_history"
-    if (output_dir / "summary.md").is_file():
-        history.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        for name in ("summary.md", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json"):
-            source = output_dir / name
-            if source.is_file():
-                __import__("shutil").copy2(source, history / f"{stamp}-{name}")
+    base_output = output_dir
+    generation_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(6).hex()
+    generations = base_output / "summary_generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    output_dir = generations / (generation_id + ".pending")
+    output_dir.mkdir(parents=True, exist_ok=False)
+    previous_public_items = []
+    try:
+        previous_pointer = load_json(base_output / "summary_current.json")
+        previous_id = str(previous_pointer.get("generation_id") or "")
+        previous_path = generations / previous_id if re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{12}", previous_id) else None
+        if previous_path and (previous_path / "public_items.json").is_file():
+            previous_public_items = load_json(previous_path / "public_items.json").get("items", [])
+    except (OSError, ValueError, json.JSONDecodeError):
+        if (base_output / "public_items.json").is_file():
+            previous_public_items = load_json(base_output / "public_items.json").get("items", [])
     atomic_text(output_dir / "summary.md", markdown)
     published_hash = hashlib.sha256((output_dir / "summary.md").read_bytes()).hexdigest()
     if published_hash != verified_hash:
         raise RuntimeError("Published artifact differs from verified artifact")
     atomic_json(output_dir / "summary.json", {"pipeline_version": PIPELINE_VERSION, "transcript_hash": settings["transcript"], "document": final_document, "facts": evidence_facts, "public_facts": final_facts, "summary_plan": summary_plan, "coverage": coverage, "semantic_records_file": "semantic_records.json", "tasks_file": "tasks.json", "run_manifest_file": "run_manifest.json"})
-    previous_public_items = []
-    if (output_dir / "public_items.json").is_file():
-        previous_public_items = load_json(output_dir / "public_items.json").get("items", [])
+    atomic_json(output_dir / "public_document.json", final_document)
     atomic_json(output_dir / "public_items.json", {"schema": "PublicItemSchema", "schema_version": 3, "verified_artifact_hash": verified_hash, "items": public_items})
     atomic_json(output_dir / "publication_audit.json", quality_gates)
     atomic_json(output_dir / "summary_plan.json", summary_plan)
@@ -4128,6 +4345,23 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "runtime_quality_gates.json", quality_gates)
     atomic_json(output_dir / "views" / "post_render_verification.json", post_render_audit)
     atomic_json(output_dir / "semantic_records.json", semantic_registry)
+    support_ids = {evidence for item in public_items for evidence in item.get("evidence_ids", [])}
+    by_turn_id = {turn["id"]: turn for turn in source_turns}
+    evidence_versions = []
+    for fact in evidence_facts:
+        for repair in fact.get("audio_repairs", []):
+            evidence_id = repair.get("evidence_id")
+            if evidence_id not in support_ids:
+                continue
+            source = by_turn_id.get(evidence_id, {})
+            evidence_versions.append({"evidence_id": evidence_id, "origin_id": fact.get("origin_id"),
+                "claim_id": fact.get("claim_id"), "transcript_original": source.get("text"),
+                "audio_repair_candidate": repair.get("text"), "alternative_candidates": repair.get("alternatives", []),
+                "used_public_statement": fact.get("statement"), "used_version": "transcript_with_disagreement_flag"
+                if repair_mismatch_reasons(source.get("text", ""), repair.get("text", "")) else "transcript",
+                "source_word_ids": fact.get("source_word_ids", []), "audio_clip_sha256": repair.get("audio_clip_sha256")})
+    atomic_json(output_dir / "evidence_versions.json", {"schema_version": 1, "items": evidence_versions,
+                "policy": "Transcript remains immutable; candidate repair is never silently substituted for audio evidence."})
     atomic_json(output_dir / "semantics" / "dialogue_events.json", {"schema_version": 1, "events": state["events"]})
     atomic_json(output_dir / "semantics" / "relations.json", {"schema_version": 1, "relations": state["relations"]})
     atomic_json(output_dir / "semantics" / "meeting_state.json", state)
@@ -4143,11 +4377,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         }.items()
     }
     atomic_json(output_dir / "run_manifest.json", run_manifest)
-    project_store = ProjectGraphStore(APPLICATION_ROOT / "state" / "projects", cfg.get("summary_project_name", "Aurion"))
-    project_state, project_change = project_store.publish(state_v2)
-    previous_project_path = output_dir / "semantics" / "project_state.json"
-    atomic_json(previous_project_path, project_state)
-    atomic_json(output_dir / "views" / "delta.json", project_change)
+    # Project memory is an optional side effect, never a publication gate.
     projections = project_views(state_v2, summary_plan)
     atomic_json(output_dir / "views" / "plan_verification.json", plan_verification)
     atomic_json(output_dir / "views" / "actual_output_verification.json", actual_output_audit)
@@ -4159,7 +4389,6 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     manifests = [
         artifact_manifest("meeting_state.v2.json", "MeetingStateSchema", "claim_graph", PIPELINE_VERSION, {"transcript": settings["transcript"]}),
         artifact_manifest("summary_plan.json", "SummaryPlanSchema", "summary_plan", PIPELINE_VERSION, {"meeting_state": stable_hash(state_v2)}),
-        artifact_manifest("project_state.json", "ProjectStateSchema", "project_state", PIPELINE_VERSION, {"meeting_state": stable_hash(state_v2)}),
     ]
     atomic_json(output_dir / "artifact_manifest.json", {"pipeline_version": PIPELINE_VERSION, "artifacts": manifests})
     atomic_json(output_dir / "views" / "decisions.json", {"schema_version": 1, "decisions": state["views"]["decisions"]})
@@ -4177,10 +4406,76 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(output_dir / "summary_audit.json", {"pipeline_version": PIPELINE_VERSION, "coverage": coverage, "coverage_interpretation": "material_accounting_not_summary_completeness", "summary_completeness": "not_measured", "accepted_facts": len(final_facts), "rejected_facts": len(fact_rejected) + len(publication_rejected) + len(semantic_rejected) + len(surface_rejected), "semantic": semantic_counts, "publication_audit": quality_gates, "cost_profile": {"legacy_writer_invoked": False, "executive_llm_invoked": False, "task_enrichment_llm_invoked": False}, "details": load_json(run_dir / "audit.json")})
     atomic_json(output_dir / "navigation.json", navigation_audit)
     atomic_text(output_dir / "summary.html", render_html(markdown))
+    transcript_lines = ['<!doctype html><html lang="ru"><meta charset="utf-8"><title>Расшифровка встречи</title>',
+                        '<style>body{font:16px/1.5 sans-serif;max-width:900px;margin:2em auto;padding:0 1em;background:#171a22;color:#eef1f7}section{padding:1em;border-bottom:1px solid #394150}section:target{background:#30486a;border-radius:8px}time{color:#9cc6ff;margin-right:1em}</style>',
+                        '<h1>Расшифровка встречи</h1>']
+    for turn in transcript_document.get("utterances", []):
+        start = float(turn.get("start", 0))
+        transcript_lines.append('<section id="t-{}"><time>{}</time><b>{}</b> — {}</section>'.format(
+            round(start * 1000), display_time(start), html.escape(str(turn.get("speaker") or "Не определён")),
+            html.escape(str(turn.get("text") or ""))))
+    atomic_text(output_dir / "transcript.html", "\n".join(transcript_lines) + "\n</html>\n")
+    disposition = []
+    rejected_sources = {}
+    for denial in list(fact_rejected) + list(publication_rejected) + list(semantic_rejected) + list(surface_rejected):
+        source = denial.get("fact", {}) if isinstance(denial, dict) else {}
+        if source.get("fact_id") or source.get("origin_id"):
+            for origin in source.get("origin_ids", [source.get("origin_id") or source.get("fact_id")]):
+                rejected_sources[origin] = str(denial.get("reason") or denial.get("verdict") or "review_rejected")
+    source_origins = dict(final_fact_origins)
+    source_origins.update({fact.get("fact_id"): fact.get("origin_ids", [fact.get("origin_id") or fact.get("fact_id")]) for fact in evidence_facts})
+    def referenced_origins(section=None):
+        return {origin for claim in state_v2.get("claims", [])
+                if any(claim.get("claim_id") in item.get("claim_ids", []) and (section is None or item.get("section") == section) for item in public_items)
+                for origin in source_origins.get(claim.get("source_record_id"), [claim.get("source_record_id")])}
+    cited_sources = referenced_origins()
+    tasks_sources = referenced_origins("tasks")
+    quarantine_sources = referenced_origins("requires_verification")
+    canonical_rejections = {origin for claim in state_v2.get("claims", []) if claim.get("lifecycle") in {"rejected", "superseded"}
+                            for origin in source_origins.get(claim.get("source_record_id"), [])}
+    for candidate in early_candidates:
+        fact_id, origin = candidate["fact_id"], candidate["origin_id"]
+        if origin in quarantine_sources: status, reason = "requires_verification", "auditor_unavailable"
+        elif origin in tasks_sources: status, reason = "published_task", "canonical_task_state"
+        elif origin in cited_sources: status, reason = "published_other", "canonical_public_item"
+        elif origin in rejected_sources: status, reason = "rejected", rejected_sources[origin]
+        elif origin in canonical_rejections: status, reason = "canonical_rejected", "state_transition_with_provenance"
+        else: status, reason = "unresolved", "candidate_lost_after_review_or_planning"
+        disposition.append({"origin_id": candidate["origin_id"], "fact_id": fact_id, "status": status, "reason": reason})
+    atomic_json(output_dir / "candidate_disposition.json", {"schema_version": 1, "candidates": early_candidates, "dispositions": disposition})
+    unresolved = [item["fact_id"] for item in disposition if item["status"] == "unresolved"]
+    if unresolved:
+        atomic_json(run_dir / "candidate_disposition_failed.json", {"unresolved": unresolved, "dispositions": disposition})
+        raise RuntimeError("Ранние кандидаты потеряны без конечного решения: " + ", ".join(unresolved[:12]))
+    required = ("summary.md", "summary.json", "public_document.json", "public_items.json", "publication_audit.json",
+                "summary_plan.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json",
+                "candidate_disposition.json", "evidence_versions.json", "summary.html", "transcript.html", "semantics/meeting_state.v2.json")
+    integrity = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in required}
+    if integrity["summary.md"] != verified_hash:
+        raise RuntimeError("Generation content differs from verified Markdown")
+    atomic_json(output_dir / "generation_manifest.json", {"schema_version": 1, "generation_id": generation_id,
+                "transcript_hash": settings["transcript"], "artifact_sha256": integrity, "verified_artifact_sha256": verified_hash})
+    if stable_hash(load_json(base_output / "transcript.json")) != settings["transcript"]:
+        raise RuntimeError("Стенограмма изменилась во время публикации поколения")
+    final_generation = generations / generation_id
+    os.replace(output_dir, final_generation)
+    atomic_json(base_output / "summary_current.json", {"schema_version": 1, "generation_id": generation_id,
+                "transcript_hash": settings["transcript"], "verified_artifact_sha256": verified_hash})
+    if cfg.get("summary_project_memory_enabled", False):
+        try:
+            project_store = ProjectGraphStore(APPLICATION_ROOT / "state" / "projects", cfg.get("summary_project_name", "Aurion"))
+            project_state, project_change = project_store.publish(state_v2)
+            atomic_json(base_output / "project_memory_status.json", {"status": "published", "generation_id": generation_id,
+                        "project_state_id": project_state.get("state_id"), "change": project_change})
+        except Exception as exc:
+            atomic_json(base_output / "project_memory_status.json", {"status": "delivery_failed", "generation_id": generation_id,
+                        "error": str(exc)})
+            diagnostic_event("project_memory", category="delivery", outcome="failed", severity="WARN", error=exc)
     emit(100, "summary_done", "Саммари готово", coverage=coverage["coverage_ratio"], facts=len(final_facts))
 
 
 def main():
+    global LLM_CACHE_ROOT, FRESH_MODEL_CALLS
     parser = argparse.ArgumentParser()
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -4189,6 +4484,8 @@ def main():
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     cfg = load_config(args.config, args.cache / "config.resolved.json")
+    LLM_CACHE_ROOT = args.cache
+    FRESH_MODEL_CALLS = bool(args.force and cfg.get("summary_force_cache_policy", "fresh_models") == "fresh_models")
     transcript = load_json(args.transcript)
     utterances = transcript_utterances(transcript)
     settings = {
@@ -4232,6 +4529,8 @@ def main():
         "min_chunk_seconds": cfg["summary_segment_min_seconds"],
         "max_chunk_seconds": cfg["summary_segment_max_seconds"],
     }
+    if FRESH_MODEL_CALLS:
+        settings["generation_nonce"] = os.urandom(16).hex()
     run_dir = args.cache / (PIPELINE_VERSION + "-" + stable_hash(settings)[:12])
     run_dir.mkdir(parents=True, exist_ok=True)
     generation_suffix = ("-" + time.strftime("%Y%m%d-%H%M%S")) if args.force else ""
@@ -4428,6 +4727,14 @@ def main():
         facts, utterances, float(cfg.get("summary_closing_pass_seconds", 600))
     )
     atomic_json(run_dir / "closing-pass.json", closing_audit)
+    early_candidates = [{"origin_id": fact.get("origin_id") or fact.get("fact_id"),
+                         "fact_id": fact.get("fact_id"), "kind": fact.get("type"),
+                         "statement": fact.get("statement"), "evidence_ids": list(fact.get("evidence_ids", [])),
+                         "source_word_ids": list(fact.get("source_word_ids", []))}
+                        for fact in facts if fact.get("type") in {"action", "follow_up", "resource", "decision"}
+                        or fact_has_commitment(fact)]
+    atomic_json(run_dir / "early_candidates.json", {"schema_version": 1, "capture_stage": "pre_validation",
+                "candidates": early_candidates})
     diagnostic_event("closing_pass", category="decision", outcome="completed", metrics={"candidates": len(closing_audit.get("candidates", [])), "covered": sum(bool(item.get("covered")) for item in closing_audit.get("candidates", [])), "rescued": len(closing_audit.get("rescued", [])), "window_seconds": closing_audit.get("window_seconds")}, refs={"rescued_evidence_ids": closing_audit.get("rescued", []), "artifact": str(run_dir / "closing-pass.json")})
     extraction_coverage = evidence_coverage(utterances, facts, reviewed_non_facts)
     atomic_json(
@@ -4484,6 +4791,12 @@ def main():
     critical_original = [item for item in risky if item.get("compute_plan", {}).get("tier") == "CRITICAL"]
     high_ids = {item["fact_id"] for item in risky if item.get("compute_plan", {}).get("tier") == "HIGH"}
     high_accepted = [item for item in primary_accepted if item["fact_id"] in high_ids]
+    high_confirmed_ids = {item["fact_id"] for item in high_accepted}
+    high_accepted.extend(dict(item, verification_status="verification_unavailable",
+                              verification_failure_stage="high_risk_verifier_rejected")
+                         for item in risky if item["fact_id"] in high_ids
+                         and item["fact_id"] not in high_confirmed_ids
+                         and (item.get("type") in {"action", "follow_up", "resource", "decision"} or fact_has_commitment(item)))
     dual_accepted, dual_rejected = [], []
     secondary_model = settings.get("critical_secondary_verifier")
     if critical_original and secondary_model:
@@ -4511,12 +4824,21 @@ def main():
             {"fact": item, "reason": "critical_secondary_verifier_unavailable"}
             for item in critical_original
         ]
+        dual_accepted = [dict(item, verification_status="verification_unavailable",
+                              verification_failure_stage="critical_secondary_unavailable") for item in critical_original]
     arbitration_rejected.extend(dual_rejected)
-    emit(68, "summary_arbitrate", f"Двойная проверка завершена: подтверждено {len(dual_accepted)} из {len(critical_original)} CRITICAL")
+    dual_confirmed = sum(item.get("verification_status") != "verification_unavailable" for item in dual_accepted)
+    emit(68, "summary_arbitrate", f"Двойная проверка завершена: подтверждено {dual_confirmed}, на проверке {len(dual_accepted)-dual_confirmed} из {len(critical_original)} CRITICAL")
     final_facts = resolve_dialogue_commitments(ordinary + high_accepted + dual_accepted, utterances)
     final_facts = sorted(final_facts, key=lambda item: (item["start"], item["fact_id"]))
     for index, fact in enumerate(final_facts, 1):
+        fact.setdefault("origin_id", "OR" + stable_hash({
+            "evidence_ids": fact.get("evidence_ids", []), "start": round(float(fact.get("start", 0)), 2),
+            "kind": fact.get("type"), "speaker_refs": fact.get("speaker_refs", []),
+        })[:16])
+        fact.setdefault("origin_ids", [fact["origin_id"]])
         fact["fact_id"] = f"F{index:05d}"
+        fact["revision_id"] = "RV" + stable_hash({"origin_id": fact["origin_id"], "statement": fact.get("statement"), "type": fact.get("type")})[:16]
     coverage = coverage_report(chunks, chunk_reports, utterances, final_facts)
     coverage.update(evidence_coverage(utterances, final_facts, reviewed_non_facts))
     coverage["reviewed_non_fact_ids"] = sorted(reviewed_non_facts)

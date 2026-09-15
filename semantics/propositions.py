@@ -36,18 +36,19 @@ def normalize_entity(raw):
 def normalize_quantity(raw, statement=""):
     if not isinstance(raw, dict):
         raw = {"value": raw}
-    value = raw.get("value")
+    normalized = raw.get("normalized") if isinstance(raw.get("normalized"), dict) else {}
+    value = raw.get("value") if raw.get("value") is not None else normalized.get("value")
     return {
-        "value": value, "unit": raw.get("unit"), "entity_id": raw.get("entity_id") or raw.get("entity"),
-        "role": raw.get("role") or raw.get("kind"), "operator": raw.get("operator", "eq"),
-        "direction": raw.get("direction"), "source_span": raw.get("source_span") or str(value or ""),
+        "value": value, "unit": raw.get("unit") or normalized.get("unit"), "entity_id": raw.get("entity_id") or raw.get("entity"),
+        "role": raw.get("role") or raw.get("kind"), "operator": raw.get("operator") or normalized.get("operator") or "unknown",
+        "direction": raw.get("direction") or normalized.get("direction"), "source_span": raw.get("source_span") or raw.get("raw_text") or str(value or ""),
         "evidence_ids": list(raw.get("evidence_ids", [])),
     }
 
 
 def normalize_condition(raw):
     if isinstance(raw, dict):
-        return {"condition_id": raw.get("condition_id"), "antecedent": raw.get("antecedent") or raw.get("text"), "consequent": raw.get("consequent"), "relation": raw.get("relation", "if_then"), "evidence_ids": list(raw.get("evidence_ids", []))}
+        return {"condition_id": raw.get("condition_id"), "antecedent": raw.get("antecedent") or raw.get("predicate") or raw.get("text"), "consequent": raw.get("consequent") or raw.get("effect"), "relation": raw.get("relation", "if_then"), "evidence_ids": list(raw.get("evidence_ids", []))}
     return {"condition_id": None, "antecedent": str(raw), "consequent": None, "relation": "if_then", "evidence_ids": []}
 
 
@@ -61,6 +62,7 @@ def proposition_signature(record, registry=None):
             normalized = registry.resolve(normalized["canonical_name"], normalized["type"]) or registry.register(normalized["canonical_name"], normalized["type"], normalized["aliases"], normalized.get("entity_id"))
         entities.append(dict(normalized))
     statement = record.get("statement") or ""
+    raw_kind = record.get("kind") or record.get("content_kind")
     signature = {
         "subject": _clean(record.get("subject")), "predicate": _clean(record.get("predicate")),
         "object": _clean(record.get("object")), "scope": record.get("scope") or {},
@@ -70,6 +72,12 @@ def proposition_signature(record, registry=None):
         "time_scope": record.get("time_scope") or record.get("time_expression"),
         "entities": sorted(x["entity_id"] for x in entities),
     }
+    subject = _clean(record.get("subject"))
+    participant_bound = raw_kind in {"action", "follow_up", "resource"} or subject in {"я", "i", "мне", "мы", "we"}
+    if participant_bound:
+        signature["actor"] = sorted(set(record.get("assignees", []) or record.get("attributed_speakers", []) or record.get("speaker_refs", [])))
+    if raw_kind in {"hypothesis", "experimental_result"}:
+        signature["epistemic_kind"] = raw_kind
     if not any((signature["subject"], signature["predicate"], signature["object"])):
         signature["lexical_fallback"] = _clean(statement)
     return signature, entities, quantities, conditions

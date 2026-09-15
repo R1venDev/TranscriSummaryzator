@@ -8,8 +8,9 @@ ACCEPT_RE = re.compile(r"(?iu)^\s*(?:да|согласен|делаем|ок(?:�
 REJECT_RE = re.compile(r"(?iu)^\s*(?:нет|не согласен|не делаем|отклоняем)\b")
 CAUSE_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|в результате|привел[оа]? к)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|при условии|после того как)\b")
-SCOPE_RE = re.compile(r"(?iu)\b(?:месяц|год|недел|день|час|минут|период|объём|объем)\b")
+SCOPE_RE = re.compile(r"(?iu)\b(?:месяц\w*|год\w*|недел\w*|день|дня|дней|час\w*|минут\w*|период\w*|объ[её]м\w*)\b")
 SCOPE_REPLY_RE = re.compile(r"(?iu)\b(?:для\s+(?:начала|проверки|этого)|достаточно|возьм[её]м|объ[её]м|период|нужн\w+\s+(?:данн\w*|выборк\w*|объ[её]м\w*|период\w*))")
+DATA_RESULT_RE = re.compile(r"(?iu)\b(?:данн\w*|выборк\w*|выгруз\w*|отрезк\w*|файл\w*|истори\w*)\b")
 
 
 def _tokens(value):
@@ -46,7 +47,7 @@ def resolve_relations(propositions, events, records):
         for answer_id in record.get("answer_record_ids", []):
             answer = prop_by_record.get(answer_id)
             if answer:
-                slot_check = verify_slot_entailment(record.get("requested_slots", []), by_record.get(answer_id, {}))
+                slot_check = verify_slot_entailment(record.get("requested_slots", []), by_record.get(answer_id, {}), record)
                 kind = "answers" if slot_check["passed"] else "partially_answers"
                 add(kind, answer["proposition_id"], source["proposition_id"], answer["evidence_ids"] + source["evidence_ids"], .98 if slot_check["passed"] else .75, "explicit_slot_entailment")
         for target_id in record.get("corrects_record_ids", []):
@@ -59,7 +60,10 @@ def resolve_relations(propositions, events, records):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]
         # Short replies are only safe inside a very small dialogue window.
-        prior_events = ordered[max(0, index - 3):index]
+        prior_events = [x for x in ordered[max(0, index - 8):index]
+                        if event.get("timestamp", 0) - x.get("timestamp", 0) <= 120]
+        local_scope_targets = [x for x in prior_events if event.get("timestamp", 0) - x.get("timestamp", 0) <= 45
+                               and next(p for p in propositions if p["proposition_id"] == x["proposition_id"])["content_kind"] in {"action", "follow_up", "resource"}]
         if event["speech_act"] in {"accept", "reject"} or ACCEPT_RE.search(text) or REJECT_RE.search(text):
             candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask", "commit"}]
             same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
@@ -67,24 +71,24 @@ def resolve_relations(propositions, events, records):
             target_event = candidates[0] if len(candidates) == 1 else None
             # A speaker's own acknowledgement is not evidence that another
             # participant accepted the proposition.
-            if target_event and (not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
-                kind = "rejects" if event["speech_act"] == "reject" or REJECT_RE.search(text) else "accepts"
+            is_rejection = event["speech_act"] == "reject" or bool(REJECT_RE.search(text))
+            if target_event and (is_rejection or not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
+                kind = "rejects" if is_rejection else "accepts"
                 add(kind, source["proposition_id"], target_event["proposition_id"], source["evidence_ids"], .96, "coreference_short_reply")
         for prior in reversed(prior_events):
             target = next(x for x in propositions if x["proposition_id"] == prior["proposition_id"])
             similarity = _similarity(text, target["statement"])
             shared_entities = {x["entity_id"] for x in source["entities"]} & {x["entity_id"] for x in target["entities"]}
-            if similarity < .18 and not shared_entities:
-                # Scope clarifications often change content kind (action ->
-                # proposal/constraint) and use different surface words.
-                local_reply = event.get("timestamp", 0) - prior.get("timestamp", 0) <= 20 and bool(SCOPE_REPLY_RE.search(text))
-                if not (target["content_kind"] in {"action", "follow_up", "resource"}
-                        and source["content_kind"] in {"proposal", "constraint", "correction", "decision"}
-                        and SCOPE_RE.search(text)
-                        and event.get("timestamp", 0) - prior.get("timestamp", 0) <= 45
-                        and (shared_entities or local_reply)):
-                    continue
+            local_reply = event.get("timestamp", 0) - prior.get("timestamp", 0) <= 20 and bool(SCOPE_REPLY_RE.search(text))
+            if (target["content_kind"] in {"action", "follow_up", "resource"}
+                    and source["content_kind"] in {"proposal", "constraint", "correction", "decision"}
+                    and SCOPE_RE.search(text)
+                    and event.get("timestamp", 0) - prior.get("timestamp", 0) <= 45
+                    and (shared_entities or local_reply or similarity >= .18 or
+                         (len(local_scope_targets) == 1 and DATA_RESULT_RE.search(text) and DATA_RESULT_RE.search(target["statement"])))):
                 add("revises_scope", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .86, "bounded_cross_kind_scope")
+                continue
+            if similarity < .18 and not shared_entities:
                 continue
             if event["speech_act"] == "correct": add("corrects", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .92, "bounded_semantic_candidate")
             elif source["polarity"] != target["polarity"]: add("contradicts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .82, "polarity_conflict")
