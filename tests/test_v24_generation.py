@@ -1,17 +1,32 @@
 """Release checks for public generations, links and stuck stage processes."""
 import json
+import sqlite3
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from pipeline import current_summary_output, run_command
+from pipeline import current_summary_output, find_existing_job, run_command, submission_fingerprint
 from scripts.summary_worker import build_public_document, render_public_document, time_link
 from summary.verifier import verify_public_document
 
 
 class GenerationTests(unittest.TestCase):
+    def test_watcher_does_not_reenqueue_web_upload_under_storage_name(self):
+        db = sqlite3.connect(":memory:")
+        db.row_factory = sqlite3.Row
+        db.execute("""CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY, fingerprint TEXT, content_sha256 TEXT,
+            source_path TEXT, original_name TEXT)""")
+        digest = "a" * 64
+        source = "/inbox/meeting-deadbeef.mkv"
+        original = "Встреча команды.mkv"
+        db.execute("INSERT INTO jobs VALUES (1, ?, ?, ?, ?)",
+                   (submission_fingerprint(digest, original), digest, source, original))
+        found = find_existing_job(db, digest, "meeting-deadbeef.mkv", source)
+        self.assertEqual(found["id"], 1)
+
     def test_only_committed_generation_is_public(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

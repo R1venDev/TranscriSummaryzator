@@ -257,11 +257,21 @@ def submission_fingerprint(content_sha256, original_name):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def find_existing_job(db, content_sha256, original_name):
+def find_existing_job(db, content_sha256, original_name, source_path=None):
     submission = submission_fingerprint(content_sha256, original_name)
+    if source_path is None:
+        return db.execute(
+            "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
+            (submission, content_sha256, Path(original_name).name),
+        ).fetchone()
     return db.execute(
-        "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
-        (submission, content_sha256, Path(original_name).name),
+        """SELECT * FROM jobs
+           WHERE fingerprint = ?
+              OR (content_sha256 = ? AND original_name = ?)
+              OR (? IS NOT NULL AND content_sha256 = ? AND source_path = ?)
+           ORDER BY id LIMIT 1""",
+        (submission, content_sha256, Path(original_name).name,
+         str(source_path), content_sha256, str(source_path)),
     ).fetchone()
 
 
@@ -290,7 +300,11 @@ def enqueue(path, known_fingerprint=None, speaker_count=None, original_name=None
     content_sha256 = known_fingerprint or fingerprint(path)
     fp = submission_fingerprint(content_sha256, original_name)
     db = connect()
-    existing = find_existing_job(db, content_sha256, original_name)
+    # The web uploader publishes under a collision-safe storage name but
+    # enqueues with the human filename.  The inbox watcher later sees that
+    # same path under its storage name; source identity must win over that
+    # presentation-name difference.
+    existing = find_existing_job(db, content_sha256, original_name, path)
     if existing:
         print("Уже в очереди: job {} ({})".format(existing["id"], existing["status"]))
         return existing["id"]
