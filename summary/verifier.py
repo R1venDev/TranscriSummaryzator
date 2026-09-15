@@ -41,6 +41,7 @@ def can_publish_as_decision(item):
 def build_public_items(meeting_graph, summary_plan):
     """Create the complete public contract before formatting Markdown."""
     claims = {x["claim_id"]: x for x in meeting_graph.get("claims", [])}
+    claims_by_source = {x.get("source_record_id"): x for x in claims.values()}
     view_plans = summary_plan.get("view_plans", {})
     task_states = {x["task_id"]: x for x in meeting_graph.get("task_states", [])}
     question_states = {x["proposition_id"]: x for x in meeting_graph.get("question_states", [])}
@@ -185,7 +186,10 @@ def build_public_items(meeting_graph, summary_plan):
             if len(speakers) == 1 and speakers[0] not in question_text:
                 question_text = re.sub(r"(?iu)^\s*(?:участник\s+)?(?:спрашивает|зада[её]т\s+вопрос)(?:\s+о\s+том)?[, :] *", "", question_text)
                 question_text = f"{speakers[0]} спрашивает: {question_text[:1].lower() + question_text[1:]}"
-            add("questions", claim, claim.get("question_status", "unanswered"), question_text + suffix, relation_ids=state.get("answer_relation_ids", []), extra_evidence=state.get("answer_evidence_ids", []))
+            answer_claim_ids = [claims_by_source[value]["claim_id"] for value in state.get("answer_record_ids", []) if value in claims_by_source]
+            add("questions", claim, claim.get("question_status", "unanswered"), question_text + suffix,
+                claim_ids=[claim["claim_id"]] + answer_claim_ids,
+                relation_ids=state.get("answer_relation_ids", []), extra_evidence=state.get("answer_evidence_ids", []))
     for claim in selected("experiments"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
@@ -246,9 +250,10 @@ def audit_realization(text, plan):
     if found_relations and not plan.get("relation_ids") and not found_relations.issubset(allowed_relations):
         errors.append("unsupported_relation_language")
     polarities = set(plan.get("polarity", []))
+    semantic_text = re.sub(r"(?iu)\b(?:не\s+уточнено|не\s+подтвержден[оаы]?|ожидает\s+подтверждения)\b", "", text or "")
     if "negative" in polarities and not NEGATION_RE.search(text or ""):
         errors.append("negation_not_preserved")
-    if polarities == {"positive"} and NEGATION_RE.search(text or ""):
+    if polarities == {"positive"} and NEGATION_RE.search(semantic_text):
         errors.append("unsupported_negation")
     modalities = set(plan.get("modality", []))
     if modalities & {"possible", "hypothetical", "unknown", "tentative"} and CERTAIN_RE.search(text or ""):
@@ -286,6 +291,7 @@ def verify_generated_items(items, sentence_plans, claims):
         source_mentions = {mention for claim_id in claim_ids for mention in re.findall(r"@[\w.-]+", str(by_claim[claim_id].get("statement") or ""))}
         merged = {"claim_ids": claim_ids, "relation_ids": sorted({r for p in plans for r in p.get("relation_ids", [])}), "allowed_numbers": [n for p in plans for n in p.get("allowed_numbers", [])], "allowed_relation_markers": sorted({r for p in plans for r in p.get("allowed_relation_markers", [])}), "allowed_speakers": sorted({s for p in plans for s in p.get("allowed_speakers", [])} | source_mentions), "allowed_assignees": sorted({s for p in plans for s in p.get("allowed_assignees", [])}), "polarity": [v for p in plans for v in p.get("polarity", [])], "modality": [v for p in plans for v in p.get("modality", [])], "conditions": [v for p in plans for v in p.get("conditions", [])], "time_scope": [v for p in plans for v in p.get("time_scope", [])]}
         task_state = item.get("task_state", {}) if item.get("section") == "tasks" else {}
+        question_state = item.get("question_state", {}) if item.get("section") == "questions" else {}
         if task_state and item.get("task_state_id") in {by_claim[x].get("canonical_task_state_id") for x in claim_ids}:
             metadata_text = " ".join(str(task_state.get(field) or "") for field in ("description", "current_scope", "data_origin", "deadline", "assignee"))
             merged["allowed_numbers"].extend(NUMBER_RE.findall(metadata_text))
@@ -295,23 +301,35 @@ def verify_generated_items(items, sentence_plans, claims):
                 merged["time_scope"].append(str(task_state["current_scope"]))
         else:
             metadata_text = ""
+        if question_state:
+            metadata_text += " " + " ".join(str(question_state.get(field) or "") for field in
+                                                ("original_question", "known_answer", "remaining_question"))
+            metadata_text += " " + " ".join(map(str, question_state.get("missing_slot_labels", [])))
+            merged["polarity"] = []  # Question-state labels are not predicate polarity.
+        cited = [by_claim[x] for x in claim_ids]
+        merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(str(x.get("statement") or "") for x in cited)))
+        merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
+        source_has_negation = any(NEGATION_RE.search(str(x.get("statement") or "")) for x in cited)
+        if source_has_negation and "negative" not in merged["polarity"]:
+            merged["polarity"].append("negative")
         realization = audit_realization(text, merged)
         if unknown_claim_ids:
             realization["errors"].append("unknown_claim")
-        cited = [by_claim[x] for x in claim_ids]
         source_tokens = {v for x in cited for v in re.findall(r"(?iu)[a-zа-яё0-9]+", str(x.get("statement") or "").casefold()) if len(v) > 2}
         source_tokens.update(v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", metadata_text.casefold()) if len(v) > 2)
         text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", text.casefold()) if len(v) > 2}
-        overlap = len(source_tokens & text_tokens)
-        if item.get("section") and overlap / max(1, len(source_tokens)) < .45:
+        editorial_tokens = {"спрашивает", "исполнитель", "статус", "объём", "срок", "условие", "участник", "назначение", "ожидает", "подтверждения", "предложен", "подтверждён", "уточнено", "известно", "осталось", "уточнить", "взял", "себя"}
+        content_tokens = text_tokens - editorial_tokens
+        overlap = len(source_tokens & content_tokens)
+        if item.get("section") and overlap / max(1, len(content_tokens)) < .45:
             realization["errors"].append("cleaned_text_semantic_drift")
-        unsupported = text_tokens - source_tokens - {"спрашивает", "исполнитель", "статус", "объём", "срок", "условие", "участник"}
-        if len(unsupported) >= 3 and overlap / max(1, len(text_tokens)) < .68:
+        unsupported = content_tokens - source_tokens
+        if len(unsupported) >= 3 and overlap / max(1, len(content_tokens)) < .68:
             realization["errors"].append("unsupported_added_clause")
         task_like = item.get("section") == "tasks" or bool(re.search(r"(?iu)\b(?:должен|должна|сделает|подготовит|отправит)\b", text))
-        allowed_actors = {x.get("assignee") for x in cited if x.get("assignee")}
-        mentioned = re.findall(r"@[\w.-]+", text)
-        if task_like and allowed_actors and mentioned and mentioned[0] not in allowed_actors:
+        expected_actor = task_state.get("assignee") if task_state else None
+        rendered_actor = re.search(r"(?iu)исполнитель:\s*(@[\w.-]+)", text)
+        if task_like and rendered_actor and (not expected_actor or rendered_actor.group(1) != expected_actor):
             realization["errors"].append("actor_recipient_swap")
         if any(x.get("lifecycle", "active") != "active" for x in cited):
             realization["errors"].append("inactive_claim_published")
