@@ -9,10 +9,41 @@ from pathlib import Path
 
 from pipeline import current_summary_output, find_existing_job, run_command, submission_fingerprint
 from scripts.summary_worker import build_public_document, render_public_document, time_link
-from summary.verifier import verify_public_document
+from summary.planner import plan
+from summary.verifier import build_public_items, verify_public_document
 
 
 class GenerationTests(unittest.TestCase):
+    def test_quarantined_claim_always_has_public_sentence_plan(self):
+        claim = {
+            "claim_id": "C1", "content_kind": "resource", "kind": "resource",
+            "statement": "Участник предоставит файл.", "lifecycle": "active",
+            "verification_status": "verification_unavailable", "start": 10, "end": 11,
+            "evidence_ids": ["U1"], "risk": {}, "speaker_refs": ["@A"],
+            "polarity": "positive", "modality": "certain", "conditions": [],
+            "quantities": [], "entities": [],
+        }
+        result = plan([claim], [], [], lambda _: 1, max_units=0)
+        self.assertIn("C1", result["view_plans"]["requires_verification"]["selected_claim_ids"])
+        self.assertTrue(any("C1" in item["claim_ids"] for item in result["public_sentence_plans"]))
+
+    def test_merged_task_cites_all_canonical_source_claims(self):
+        claims = []
+        for cid in ("C1", "C2"):
+            claims.append({"claim_id": cid, "content_kind": "action", "kind": "action",
+                           "statement": "Размечать Order Block параллельно.", "lifecycle": "active",
+                           "verification_status": "supported", "canonical_task_state_id": "TS1",
+                           "evidence_ids": ["U1"], "source_word_ids": ["W1"], "start": 10,
+                           "speaker_refs": ["@A"], "social_state": "assigned_pending"})
+        graph = {"claims": claims, "task_states": [{"task_id": "TS1", "status": "assigned_pending",
+                 "deliverable": "Размечать Order Block параллельно.", "assignee": "@A",
+                 "evidence_ids": ["U1"], "source_word_ids": ["W1"]}]}
+        summary_plan = {"view_plans": {"tasks": {"selected_claim_ids": ["C1", "C2"]}},
+                        "public_sentence_plans": [{"claim_ids": ["C1", "C2"], "relation_ids": []}]}
+        task_items = [item for item in build_public_items(graph, summary_plan) if item["section"] == "tasks"]
+        self.assertEqual(len(task_items), 1)
+        self.assertEqual(set(task_items[0]["claim_ids"]), {"C1", "C2"})
+
     def test_watcher_does_not_reenqueue_web_upload_under_storage_name(self):
         db = sqlite3.connect(":memory:")
         db.row_factory = sqlite3.Row

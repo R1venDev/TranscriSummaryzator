@@ -44,6 +44,11 @@ def build_public_items(meeting_graph, summary_plan):
     claims_by_source = {x.get("source_record_id"): x for x in claims.values()}
     view_plans = summary_plan.get("view_plans", {})
     task_states = {x["task_id"]: x for x in meeting_graph.get("task_states", [])}
+    task_claims = {}
+    for candidate in claims.values():
+        task_id = candidate.get("canonical_task_state_id")
+        if task_id and candidate.get("lifecycle", "active") == "active" and candidate.get("verification_status") != "verification_unavailable":
+            task_claims.setdefault(task_id, []).append(candidate["claim_id"])
     question_states = {x["proposition_id"]: x for x in meeting_graph.get("question_states", [])}
     planned_relations = {}
     for sentence in summary_plan.get("public_sentence_plans", []):
@@ -62,6 +67,8 @@ def build_public_items(meeting_graph, summary_plan):
         evidence_ids = list(dict.fromkeys(evidence_ids))
         source_word_ids = list(dict.fromkeys(source_word_ids))
         cited_ids = list(dict.fromkeys(claim_ids or [claim["claim_id"]]))
+        if section == "tasks" and task_state:
+            cited_ids = list(dict.fromkeys(cited_ids + task_claims.get(task_state["task_id"], [])))
         retained_relations = list(relation_ids or [])
         retained_relations.extend(value for claim_id in cited_ids for value in planned_relations.get(claim_id, []))
         if section == "tasks":
@@ -134,7 +141,7 @@ def build_public_items(meeting_graph, summary_plan):
             add("rules", claim, "accepted" if can_publish_as_decision(claim) else "described", attributed_text(claim))
         elif claim.get("content_kind") in TECHNICAL_KINDS:
             add("technical", claim, "observation", attributed_text(claim))
-    proposed, emitted_tasks = 0, set()
+    emitted_tasks = set()
     confirmed = {"self_committed", "explicit_self_commitment", "assigned", "accepted", "in_progress", "blocked", "completed"}
     for claim in selected("tasks"):
         if claim.get("verification_status") == "verification_unavailable":
@@ -168,8 +175,10 @@ def build_public_items(meeting_graph, summary_plan):
         task_text = " — ".join(details)
         if status in confirmed or status == "needs_verification":
             add("tasks", claim, status, task_text)
-        elif status in {"proposed", "idea", "assigned_pending"} and proposed < 3:
-            add("tasks", claim, status, task_text); proposed += 1
+        elif status in {"proposed", "idea", "assigned_pending"}:
+            # The planner already bounds this view. A second hidden cap loses
+            # selected, evidence-backed work candidates without disposition.
+            add("tasks", claim, status, task_text)
     for claim in selected("questions"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
@@ -204,6 +213,30 @@ def build_public_items(meeting_graph, summary_plan):
         key = (claim.get("proposition_id"), claim.get("social_state"), tuple(claim.get("evidence_ids", [])))
         if key not in seen_minutes:
             add("minutes", claim, text=attributed_text(claim)); seen_minutes.add(key)
+    # A separate source claim may describe the same tentative deliverable as
+    # an already published canonical task envelope. Keep the richer wording
+    # and union exact provenance instead of printing a near-duplicate line.
+    task_items = [item for item in sections if item["section"] == "tasks"]
+    redundant = set()
+    task_tokens = lambda value: {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(v) > 3}
+    for item in task_items:
+        if item["public_id"] in redundant: continue
+        current = task_tokens(item["text"])
+        matches = [prior for prior in task_items if prior is not item and prior["public_id"] not in redundant
+                   and prior.get("social_state") == item.get("social_state")
+                   and prior.get("task_state", {}).get("assignee") == item.get("task_state", {}).get("assignee")
+                   and abs(float(prior.get("start", 0)) - float(item.get("start", 0))) <= 120
+                   and len(prior["text"]) > len(item["text"])
+                   and current and len(task_tokens(prior["text"]) & current) / max(1, len(current)) >= .8]
+        if not matches: continue
+        keeper = max(matches, key=lambda prior: len(prior["text"]))
+        for key in ("claim_ids", "evidence_ids", "source_word_ids", "relation_ids"):
+            keeper[key] = list(dict.fromkeys(keeper.get(key, []) + item.get(key, [])))
+        redundant.add(item["public_id"])
+        for cid in item["claim_ids"]:
+            materialized.setdefault("tasks", {})[cid] = {"status": "published", "public_id": keeper["public_id"],
+                                                        "reason": "merged_equivalent_task_with_provenance"}
+    sections = [item for item in sections if item["public_id"] not in redundant]
     for view, view_plan in view_plans.items():
         for claim_id in view_plan.get("selected_claim_ids", []):
             published = next((values[claim_id] for values in materialized.values() if claim_id in values), None)
@@ -226,6 +259,11 @@ def source_aware_plan(plan, claims):
     source_polarity = {"negative" if NEGATION_RE.search(str(claim.get("statement") or "")) else "positive"
                        for claim in claims}
     result["polarity"] = sorted(source_polarity)
+    # This pre-write check realizes the verbatim source claims, not the later
+    # task envelope. Scope added by a cited revision belongs to task metadata
+    # and is checked against the rendered PublicItem in the next gate.
+    result["time_scope"] = [scope for scope in plan.get("time_scope", [])
+                            if isinstance(scope, str) and scope.casefold() in source_text.casefold()]
     return result
 
 

@@ -92,6 +92,44 @@ def plan(claims, episodes, relations, score_fn, max_units=None):
         view_units = _units(selected, claims, relations)
         view_plans[view] = {"objective": view, "budget": budget, "selected_count": len(selected), "overflow_count": overflow, "exclusion_reason": "hard_budget_or_duplicate" if overflow else None, "selected_claim_ids": [x["claim_id"] for x in selected], "summary_units": view_units, "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(view_units, 1)], "dispositions": {x["claim_id"]: {"status": "selected", "section": view} for x in selected}}
         union.update({x["claim_id"]: x for x in selected})
+    # A per-view editorial budget cannot silently drop a distinct canonical
+    # work result. Include one anchor per task state, then let the renderer
+    # label tentative states instead of pretending they were commitments.
+    task_view = view_plans["tasks"]
+    represented_states = {by_id[cid].get("canonical_task_state_id") for cid in task_view["selected_claim_ids"]}
+    missing_tasks = [x for x in claims if x.get("lifecycle", "active") == "active"
+                     and x.get("canonical_task_anchor", True)
+                     and x.get("canonical_task_state_id")
+                     and x.get("verification_status") != "verification_unavailable"
+                     and x.get("canonical_task_state_id") not in represented_states]
+    for claim in sorted(missing_tasks, key=lambda x: (float(x.get("start", 0)), x["claim_id"])):
+        state_id = claim["canonical_task_state_id"]
+        if state_id in represented_states: continue
+        represented_states.add(state_id)
+        task_view["selected_claim_ids"].append(claim["claim_id"])
+        task_view["dispositions"][claim["claim_id"]] = {"status": "selected", "section": "tasks"}
+        union[claim["claim_id"]] = claim
+    task_view["selected_count"] = len(task_view["selected_claim_ids"])
+    task_view["budget"] = max(task_view["budget"], task_view["selected_count"])
+    task_view["summary_units"] = _units([by_id[cid] for cid in task_view["selected_claim_ids"]], claims, relations)
+    task_view["sentence_plans"] = [_sentence(i, unit, by_id) for i, unit in enumerate(task_view["summary_units"], 1)]
+    # Fail-open verifier results are published only in an explicit quarantine
+    # section. They still need the same sentence contract as every other
+    # PublicItem, even when a view budget did not select the source claim.
+    quarantine = [x for x in claims
+                  if x.get("lifecycle", "active") == "active"
+                  and x.get("verification_status") == "verification_unavailable"
+                  and _kind(x) in {"action", "follow_up", "resource", "decision"}]
+    quarantine_units = _units(quarantine, claims, relations)
+    view_plans["requires_verification"] = {
+        "objective": "requires_verification", "budget": len(quarantine),
+        "selected_count": len(quarantine), "overflow_count": 0, "exclusion_reason": None,
+        "selected_claim_ids": [x["claim_id"] for x in quarantine],
+        "summary_units": quarantine_units,
+        "sentence_plans": [_sentence(i, unit, by_id) for i, unit in enumerate(quarantine_units, 1)],
+        "dispositions": {x["claim_id"]: {"status": "selected", "section": "requires_verification"} for x in quarantine},
+    }
+    union.update({x["claim_id"]: x for x in quarantine})
     ordered = sorted(union.values(), key=lambda x: float(x.get("start", 0)))
     units = _units(ordered, claims, relations)
     sentences = [_sentence(i, unit, by_id) for i, unit in enumerate(units, 1)]
