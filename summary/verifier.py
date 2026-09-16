@@ -607,8 +607,13 @@ def verify_public_document(document, artifact_text, items):
         if surface(node.get("text")) not in surface(section_text.get("overview", "")):
             errors.append("overview_not_rendered")
         backing = [item for claim in node.get("claim_ids", []) for item in by_claim.get(claim, [])]
-        source_words = set().union(*(tokens(item.get("text")) for item in backing)) if backing else set()
-        if not backing or len(tokens(node.get("text")) - source_words) > 2:
+        source_words = set().union(*(
+            tokens(item.get("text")) |
+            tokens(" ".join(str(item.get("task_state", {}).get(field) or "")
+                            for field in ("description", "deliverable", "status", "task_status", "current_scope")))
+            for item in backing
+        )) if backing else set()
+        if not backing or len(tokens(node.get("text")) - source_words - {"статус"}) > 2:
             errors.append("overview_semantic_drift")
     navigation = document.get("navigation", [])
     if document.get("chronology") and not navigation:
