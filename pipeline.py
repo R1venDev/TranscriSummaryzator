@@ -486,6 +486,20 @@ def current_summary_output(base):
         return None
 
 
+def current_summary_generation_id(base):
+    """Read the atomic pointer cheaply for status polling.
+
+    Integrity is still enforced by ``current_summary_output`` before any file
+    is served.  This helper only lets an already-open page notice that the
+    committed pointer changed after a rerun.
+    """
+    try:
+        generation_id = str(load_json(Path(base) / "summary_current.json").get("generation_id") or "")
+        return generation_id if re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{12}", generation_id) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def profile_path(profile_id):
     if not profile_id or any(character not in "0123456789abcdef" for character in profile_id) or len(profile_id) != 32:
         raise ValueError("Профиль не найден")
@@ -2193,6 +2207,11 @@ def show_status():
 
 def dashboard_payload():
     rows = status_rows(connect())
+    jobs = []
+    for row in rows:
+        job = dict(row)
+        job["summary_generation_id"] = current_summary_generation_id(job["output_dir"]) if job.get("output_dir") else None
+        jobs.append(job)
     uploads = []
     for metadata_path in INBOX.glob(".*.upload.json"):
         try:
@@ -2209,7 +2228,7 @@ def dashboard_payload():
             })
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             continue
-    return {"jobs": [dict(row) for row in rows], "uploads": uploads, "inbox": str(INBOX), "outputs": str(OUTPUTS), "processing_enabled": config().get("processing_enabled", True), "updated_at": now()}
+    return {"jobs": jobs, "uploads": uploads, "inbox": str(INBOX), "outputs": str(OUTPUTS), "processing_enabled": config().get("processing_enabled", True), "updated_at": now()}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2758,8 +2777,9 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                     for name, label, primary in download_specs
                     if (package / name if name in {"summary.md", "summary.html", "transcript.html", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
                 )
-            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';if(j.summary_status==='done'&&document.querySelector('#content').style.display==='none')location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
+            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id},generation={generation};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';const changed=j.summary_generation_id&&j.summary_generation_id!==generation;if(j.summary_status==='done'&&(changed||document.querySelector('#content').style.display==='none'))location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
                 title=title, job_id=int(job_id), content=content,
+                generation=json.dumps(package.name if package else None),
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
                 state_display="none" if ready and row["summary_status"] == "done" else "block", content_display="block" if ready else "none",
                 downloads=downloads,

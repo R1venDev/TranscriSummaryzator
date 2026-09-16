@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from contracts.meeting import PublicItemContract
-from pipeline import REQUIRED_GENERATION_FILES, current_summary_output
+from pipeline import REQUIRED_GENERATION_FILES, current_summary_generation_id, current_summary_output
 from scripts.speech_acts import primary_speech_act
 from scripts.summary_worker import build_public_document, deterministic_fact_check, render_public_document
 from semantics.entities import EntityRegistry
@@ -103,6 +103,14 @@ class Run13PublicationRegressions(unittest.TestCase):
             (base / "summary_current.json").write_text(json.dumps({"generation_id": gid}))
             self.assertTrue(REQUIRED_GENERATION_FILES - {"summary.md"})
             self.assertIsNone(current_summary_output(base))
+
+    def test_generation_pointer_is_visible_to_status_polling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory); gid = "20260915-120000-abcdef123456"
+            (base / "summary_current.json").write_text(json.dumps({"generation_id": gid}))
+            self.assertEqual(current_summary_generation_id(base), gid)
+            (base / "summary_current.json").write_text(json.dumps({"generation_id": "../unsafe"}))
+            self.assertIsNone(current_summary_generation_id(base))
 
 
 if __name__ == "__main__":
