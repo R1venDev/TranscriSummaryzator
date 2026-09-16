@@ -74,7 +74,7 @@ def verify_slot_entailment(requested_slots, answer, question=None):
             entailed[original_slot] = text
         elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
             entailed[original_slot] = text
-        elif slot == "cross_day_closure" and re.search(r"(?iu)\b(?:автоматическ\w*\s+)?закрыва\w*\b", text) and re.search(r"(?iu)(?:00\s*:\s*00|полуноч\w*|следующ\w*\s+д(?:ень|ня))", text):
+        elif slot == "cross_day_closure" and re.search(r"(?iu)\b(?:автоматическ\w*\s+)?закрыва\w*\b", text) and re.search(r"(?iu)(?:после\s+00(?:\s*:\s*00)?\b|полуноч\w*|следующ\w*\s+д(?:ень|ня))", text):
             entailed[original_slot] = text
         elif original_slot == "closing" and relevant and re.search(r"(?iu)\b(?:закрыва\w*|закро\w*)\b", text):
             entailed[original_slot] = text

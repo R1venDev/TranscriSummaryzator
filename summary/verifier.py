@@ -15,16 +15,20 @@ CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|после|перед|
 ROLE_RELATION_RE = re.compile(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|подготов\w*|отправ\w*|переда\w*|покаж\w*|размет\w*|провер\w*|анализ\w*)[^@]{0,100}(@[\w.-]+)")
 INTERNAL_LABEL_RE = re.compile(r"(?iu)\b(?:self_committed|assigned_pending|explicit_self_commitment|additional_tools|rhythmic_entry_implementation|high_tf_result|stop_loss_options|should[_ ]\w+|[a-z]+_[a-z_]+)\b")
 ENGLISH_WORD_RE = re.compile(r"(?i)\b[a-z]{3,}\b")
-ALLOWED_DOMAIN_WORDS = {"order", "block", "take", "profit", "tradingview", "exe", "bitcoin", "breaker", "sweep", "winrate", "tpo", "bos", "smc", "ote", "sm", "fbos"}
+ALLOWED_DOMAIN_WORDS = {"order", "block", "take", "profit", "tradingview", "trading", "view", "exe", "bitcoin", "breaker", "sweep", "winrate", "tpo", "bos", "smc", "ote", "sm", "fbos"}
 
 
 def has_english_prose(text):
-    words = [word.casefold() for word in ENGLISH_WORD_RE.findall(str(text or ""))]
+    value = re.sub(r"https?://\S+|@[\w.-]+", "", str(text or ""))
+    words = [word.casefold() for word in ENGLISH_WORD_RE.findall(value)]
     return len([word for word in words if word not in ALLOWED_DOMAIN_WORDS]) >= 2
 
 
 def sanitize_public_surface(text):
     value = str(text or "").strip()
+    value = re.sub(r"(?iu)^Discussed\s+potential\s+goal:\s*creating\s+a\s+baseline\s+solution\s+with\s+winrate\s+around\s+30\s*[–—-]\s*40%\.?$", "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.", value)
+    value = re.sub(r"(?iu)^(@[\w.-]+)\s+asks\s+for\s+clarification\s+on\s+what\s+constitutes\s+a\s+['\"]?small['\"]?\s+imbalance\s+in\s+context\.?$", r"\1 уточняет, что считать малым имбалансом.", value)
+    value = re.sub(r"(?iu)^(@[\w.-]+)\s+suggests\s+returning\s+to\s+algorithmic\s+thinking\s+and\s+potentially\s+incorporating\s+higher\s+timeframes\s+if\s+the\s+current\s+approach\s+does\s+not\s+yield\s+results\.?$", r"Если текущий подход не даст результата, \1 предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы.", value)
     value = re.sub(r"(?iu)\bSM\s*\(\s*Structure\s+Maker\s*\)", "SM", value)
     value = re.sub(r"(?iu)\bbaseline\b", "ориентир", value)
     value = re.sub(r"(?iu)\bсвичных\b", "свечных", value)

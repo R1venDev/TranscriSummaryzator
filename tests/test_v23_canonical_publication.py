@@ -83,6 +83,22 @@ class CanonicalStateTests(unittest.TestCase):
             rec(2, "system_rule", "Если сделка не дошла до Take Profit, она закрывается автоматически после 00:00", "answer", speaker="@B"),
         ])
         self.assertEqual(graph["question_states"][0]["status"], "answered")
+        short_midnight = build_meeting_graph([
+            rec(1, "question", "Может ли сделка закрыться на следующий день?", "ask", requested_slots=["cross_day_closure_feasibility"], answer_record_ids=["F2"]),
+            rec(2, "system_rule", "Если сделка не дошла до Take Profit, она закрывается автоматически после 00.", "answer", speaker="@B"),
+        ])
+        self.assertEqual(short_midnight["question_states"][0]["status"], "answered")
+
+    def test_repeated_acknowledgement_does_not_span_the_meeting(self):
+        graph = build_meeting_graph([
+            rec(1, "observation", "Сервис работает"),
+            rec(2, "observation", "Угу.", "accept", speaker="@B"),
+            rec(200, "observation", "Угу.", "accept", speaker="@A"),
+            rec(201, "observation", "Проверка завершена"),
+        ])
+        acknowledgement = next(claim for claim in graph["claims"] if claim["statement"] == "Угу.")
+        self.assertTrue(acknowledgement["dialogue_only"])
+        self.assertFalse(any(acknowledgement["claim_id"] in episode["claim_ids"] for episode in graph["episodes"]))
 
     def test_proposal_with_local_other_speaker_yes_is_accepted(self):
         graph = build_meeting_graph([rec(1, "proposal", "@A предложил сделать разметчик для @B", "propose", speaker="@A", dialogue_evidence=[

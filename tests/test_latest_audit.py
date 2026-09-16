@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
-from summary.verifier import publication_audit, verify_generated_items
+from summary.verifier import has_english_prose, publication_audit, sanitize_public_surface, verify_generated_items
 from scripts.diagnostics import _safe, summarize
 
 
@@ -29,6 +29,10 @@ class LatestAuditRegressionTests(unittest.TestCase):
         self.assertGreater(audit["internal_labels_exposed"], 0)
         self.assertGreater(audit["zero_duration_chapters"], 0)
         self.assertFalse(audit["passed"])
+
+    def test_handles_are_not_mistaken_for_english_prose(self):
+        self.assertFalse(has_english_prose("@Yachoy подготовит TradingView — исполнитель: @Yachoy"))
+        self.assertEqual(sanitize_public_surface("Discussed potential goal: creating a baseline solution with winrate around 30–40%."), "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.")
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}

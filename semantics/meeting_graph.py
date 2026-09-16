@@ -103,8 +103,8 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
         if prop["proposition_id"] in question_by_prop:
             question = question_by_prop[prop["proposition_id"]]
             claim.update(question_status=question["status"], question_slots=question.get("missing_slots", []))
-        generic_reply = bool(re.fullmatch(r"(?iu)\s*(?:(?:да[\s,!.—-]*)+|нет|неа|ага|угу|ну\s+ладно)\s*", str(claim.get("statement") or "")))
-        claim["dialogue_only"] = generic_reply and bool(prop_events) and all(x.get("speech_act") in {"accept", "reject"} for x in prop_events)
+        generic_reply = bool(re.fullmatch(r"(?iu)\s*(?:(?:да[\s,!.—-]*)+|(?:нет|неа|ага|угу|ну\s+ладно)[\s,!.—-]*)", str(claim.get("statement") or "")))
+        claim["dialogue_only"] = generic_reply and bool(prop_events) and all(x.get("speech_act") in {"accept", "reject", "answer", "assert"} for x in prop_events)
         claims.append(claim)
     claim_relations = [{**x, "source_claim_id": "C" + x["source_proposition_id"][1:], "target_claim_id": "C" + x["target_proposition_id"][1:]} for x in relations]
     episodes = build_episodes([claim for claim in claims if not claim.get("dialogue_only")])
