@@ -119,6 +119,8 @@ def plan(claims, episodes, relations, score_fn, max_units=None):
         union[claim["claim_id"]] = claim
     task_view["selected_count"] = len(task_view["selected_claim_ids"])
     task_view["budget"] = max(task_view["budget"], task_view["selected_count"])
+    task_view["overflow_count"] = 0
+    task_view["exclusion_reason"] = None
     task_view["summary_units"] = _units([by_id[cid] for cid in task_view["selected_claim_ids"]], claims, relations)
     task_view["sentence_plans"] = [_sentence(i, unit, by_id) for i, unit in enumerate(task_view["summary_units"], 1)]
     # Fail-open verifier results are published only in an explicit quarantine

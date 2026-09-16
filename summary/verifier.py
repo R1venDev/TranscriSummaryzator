@@ -8,10 +8,15 @@ from summary.policy import RULE_KINDS, TECHNICAL_KINDS
 
 CAUSAL_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|привел[оа]? к|в результате|для этого)\b")
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*%)?")
-NEGATION_RE = re.compile(r"(?iu)\b(?:не|нет|нельзя|без|никогда)\b")
+NEGATION_RE = re.compile(r"(?iu)\b(?:не|нет|нельзя|никогда)\b")
 CERTAIN_RE = re.compile(r"(?iu)\b(?:точно|обязательно|гарантированно|решено|утверждено)\b")
 COMPLETED_RE = re.compile(r"(?iu)\b(?:проверен[аоы]?|завершен[аоы]?|готов[аоы]?|выполнен[аоы]?|сделан[аоы]?)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|после|перед|пока|при|до тех пор)\b")
+ROLE_RELATION_RE = re.compile(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|подготов\w*|отправ\w*|переда\w*|покаж\w*|размет\w*|провер\w*|анализ\w*)[^@]{0,100}(@[\w.-]+)")
+
+
+def role_relations(text):
+    return {(left, right) for left, right in ROLE_RELATION_RE.findall(str(text or ""))}
 
 
 @dataclass(frozen=True)
@@ -79,7 +84,7 @@ def build_public_items(meeting_graph, summary_plan):
             text=str(text or claim.get("statement") or "").strip(), claim_ids=cited_ids,
             evidence_ids=list(dict.fromkeys(evidence_ids + list(extra_evidence or []))), source_word_ids=list(source_word_ids), content_kind=claim.get("content_kind") or claim.get("kind"),
             social_state=social_state or claim.get("social_state", "candidate"), lifecycle=claim.get("lifecycle", "active"), relation_ids=list(dict.fromkeys(retained_relations)),
-        ).as_dict() | {"start": claim.get("primary_evidence_start", claim.get("start", 0)), "episode_id": claim.get("episode_id"), "aspect_id": claim.get("aspect_id") or (("ownership:" + str(task_state.get("task_id"))) if section == "tasks" and task_state else ("decision:" + claim["claim_id"] if section == "decisions" else None)), "task_state_id": claim.get("canonical_task_state_id"), "task_state": task_state, "action_frame": task_state.get("action_frame", {}), "question_state": question_states.get(claim.get("proposition_id"), {}), "topic_entities": [x.get("canonical_name") or x.get("name") for x in claim.get("entities", []) if isinstance(x, dict) and (x.get("canonical_name") or x.get("name"))], "context_ids": claim.get("context_ids", []), "verification_status": claim.get("verification_status", "supported")}
+        ).as_dict() | {"start": claim.get("primary_evidence_start", claim.get("start", 0)), "end": claim.get("end", claim.get("start", 0)), "episode_id": claim.get("episode_id"), "aspect_id": claim.get("aspect_id") or (("ownership:" + str(task_state.get("task_id"))) if section == "tasks" and task_state else ("decision:" + claim["claim_id"] if section == "decisions" else None)), "task_state_id": claim.get("canonical_task_state_id"), "task_state": task_state, "action_frame": task_state.get("action_frame", {}), "question_state": question_states.get(claim.get("proposition_id"), {}), "topic_entities": [x.get("canonical_name") or x.get("name") for x in claim.get("entities", []) if isinstance(x, dict) and (x.get("canonical_name") or x.get("name"))], "context_ids": claim.get("context_ids", []), "verification_status": claim.get("verification_status") or "verification_unavailable"}
         sections.append(public)
         for claim_id in cited_ids:
             materialized.setdefault(section, {})[claim_id] = {"status": "published", "public_id": public["public_id"]}
@@ -245,6 +250,15 @@ def build_public_items(meeting_graph, summary_plan):
     return sections
 
 
+def validate_public_items_contract(items):
+    """Validate the exact public objects that will cross the publication boundary."""
+    from contracts.meeting import PublicItemContract
+    validated = []
+    for item in items:
+        validated.append(PublicItemContract.model_validate(item).model_dump(mode="json"))
+    return validated
+
+
 def relation_markers(text):
     """Return relation wording that was already present in a source claim."""
     return {match.casefold() for match in CAUSAL_RE.findall(text or "")}
@@ -351,6 +365,15 @@ def verify_generated_items(items, sentence_plans, claims):
             metadata_text += " " + " ".join(map(str, question_state.get("missing_slot_labels", [])))
             merged["polarity"] = []  # Question-state labels are not predicate polarity.
         cited = [by_claim[x] for x in claim_ids]
+        allowed_evidence = {value for source in cited for value in source.get("evidence_ids", [])}
+        allowed_evidence.update(task_state.get("evidence_ids", []))
+        allowed_evidence.update(question_state.get("answer_evidence_ids", []))
+        allowed_evidence.update(question_state.get("residual_support", []))
+        if not set(item.get("evidence_ids", [])) <= allowed_evidence:
+            realization = audit_realization(text, merged)
+            realization["errors"].append("evidence_outside_closure")
+        else:
+            realization = audit_realization(text, merged)
         merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(str(x.get("statement") or "") for x in cited)))
         merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
         source_has_negation = any(NEGATION_RE.search(str(x.get("statement") or "")) for x in cited)
@@ -361,7 +384,6 @@ def verify_generated_items(items, sentence_plans, claims):
             merged["polarity"] = []
         elif source_has_negation and "negative" not in merged["polarity"]:
             merged["polarity"].append("negative")
-        realization = audit_realization(text, merged)
         if unknown_claim_ids:
             realization["errors"].append("unknown_claim")
         source_tokens = {v for x in cited for v in re.findall(r"(?iu)[a-zа-яё0-9]+", str(x.get("statement") or "").casefold()) if len(v) > 2}
@@ -390,6 +412,10 @@ def verify_generated_items(items, sentence_plans, claims):
             source_actor = next(iter(source_actor_mentions))
         public_subject = re.search(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|подготов\w*|отправ\w*|переда\w*|покаж\w*|размет\w*)", text)
         if task_like and source_actor and public_subject and public_subject.group(1) != source_actor:
+            realization["errors"].append("actor_recipient_swap")
+        source_relations = set().union(*(role_relations(x.get("statement")) for x in cited))
+        rendered_relations = role_relations(text)
+        if rendered_relations and not rendered_relations <= source_relations:
             realization["errors"].append("actor_recipient_swap")
         if item.get("section") == "tasks" and task_state.get("action_frame", {}).get("state") == "reported_plan" and item.get("social_state") not in {"proposed", "reported_plan", "requires_confirmation"}:
             realization["errors"].append("reported_plan_promoted")
@@ -528,18 +554,33 @@ def verify_public_document(document, artifact_text, items):
     source_ids = {claim for item in items for claim in item.get("claim_ids", [])}
     by_claim = {claim: item for item in items for claim in item.get("claim_ids", [])}
     tokens = lambda value: set(re.findall(r"(?iu)[a-zа-яё0-9]+", re.sub(r"[*`]", "", str(value or "")).casefold()))
-    public_words = tokens(artifact_text)
+    evidence_for = lambda claim_ids: {evidence for claim_id in claim_ids for evidence in by_claim.get(claim_id, {}).get("evidence_ids", [])}
+    heading_sections = {"Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Что осталось уточнить": "questions", "Технические выводы и ограничения": "technical", "Идеи и эксперименты, ещё не проверенные": "experiments", "Требует проверки источника": "requires_verification", "Подробная хронология встречи": "chronology"}
+    section_text = {}
+    current = None
+    for line in artifact_text.splitlines():
+        if line.startswith("## "):
+            current = heading_sections.get(line[3:].strip())
+        elif current:
+            section_text[current] = section_text.get(current, "") + "\n" + line
     title = document.get("title", {})
     if not title.get("text") or not set(title.get("claim_ids", [])) <= source_ids or not title.get("evidence_ids"):
         errors.append("unsupported_title")
     if not artifact_text.splitlines() or not artifact_text.splitlines()[0].endswith(" — " + str(title.get("text") or "")):
         errors.append("title_not_rendered")
+    if not set(title.get("evidence_ids", [])) <= evidence_for(title.get("claim_ids", [])):
+        errors.append("title_evidence_outside_closure")
     title_source = set().union(*(tokens(by_claim[claim].get("text")) for claim in title.get("claim_ids", []) if claim in by_claim))
-    if tokens(title.get("text")) - title_source - {"следующие", "шаги", "итоги", "встречи", "результаты", "проверки", "и"}:
+    if tokens(title.get("text")) - title_source - {"следующие", "шаги", "итоги", "встречи", "результаты", "результат", "проверки", "ограничения", "и"}:
         errors.append("title_semantic_drift")
+    title_source_relations = set().union(*(role_relations(by_claim[claim].get("text")) for claim in title.get("claim_ids", []) if claim in by_claim))
+    if role_relations(title.get("text")) and not role_relations(title.get("text")) <= title_source_relations:
+        errors.append("title_role_swap")
     for node in document.get("overview", []):
         if not node.get("claim_ids") or not set(node["claim_ids"]) <= source_ids or not node.get("evidence_ids"):
             errors.append("unsupported_overview")
+        if not set(node.get("evidence_ids", [])) <= evidence_for(node.get("claim_ids", [])):
+            errors.append("overview_evidence_outside_closure")
         if node.get("text") not in artifact_text:
             errors.append("overview_not_rendered")
         backing = [item for item in items if item.get("section") == "overview" and item.get("claim_ids") == node.get("claim_ids")]
@@ -564,9 +605,21 @@ def verify_public_document(document, artifact_text, items):
     for card in document.get("outcome_cards", []):
         if not card.get("claim_ids") or not set(card["claim_ids"]) <= source_ids or not card.get("evidence_ids"):
             errors.append("unsupported_outcome_card")
+        if not set(card.get("evidence_ids", [])) <= evidence_for(card.get("claim_ids", [])):
+            errors.append("outcome_evidence_outside_closure")
+        for name, raw in card.get("fields", {}).items():
+            fields = raw if isinstance(raw, list) else [raw] if raw else []
+            for field in fields:
+                if not field.get("claim_ids") or not set(field["claim_ids"]) <= source_ids:
+                    errors.append("unsupported_outcome_field")
+                if not set(field.get("evidence_ids", [])) <= evidence_for(field.get("claim_ids", [])):
+                    errors.append("outcome_field_evidence_outside_closure")
+                if field.get("value") and field["value"] not in artifact_text:
+                    errors.append("outcome_field_not_rendered")
     for section, section_items in document.get("sections", {}).items():
         for item in section_items:
-            if item not in items or len(tokens(item.get("text")) - public_words) > 2:
+            target_words = tokens(section_text.get(section, ""))
+            if item not in items or len(tokens(item.get("text")) - target_words) > 2:
                 errors.append("section_not_rendered_from_verified_items")
     chronology_ids = {item.get("public_id") for chapter in document.get("chronology", []) for item in chapter.get("items", [])}
     minute_ids = {item.get("public_id") for item in items if item.get("section") == "minutes"}

@@ -31,3 +31,18 @@ def project_views(state, selected_ids):
         "open_questions": [x for x in kinds("questions", "question", "schedule") if x.get("question_status") not in {"answered", "rhetorical", "superseded"}],
         "minutes": sorted(selected("minutes"), key=lambda x: (x.get("episode_id", ""), float(x.get("start", 0)))),
     }
+
+
+def project_verified_document(document):
+    """Project all public/API views from the exact verified document nodes."""
+    sections = document.get("sections", {})
+    return {
+        "executive": list(document.get("overview", [])),
+        "technical": list(sections.get("technical", [])),
+        "tasks": list(sections.get("tasks", [])),
+        "decisions": list(sections.get("decisions", [])),
+        "mentioned_rules": list(sections.get("rules", [])),
+        "experiments": list(sections.get("experiments", [])),
+        "open_questions": list(sections.get("questions", [])),
+        "minutes": list(document.get("outcome_cards", [])),
+    }

@@ -30,7 +30,7 @@ def boundary_score(claim, prior, recent):
     return min(1.0, gap / 300.0 + lexical_shift * .25 + entity_shift + act_shift + explicit + embedding_shift * .5)
 
 
-def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
+def build_episodes(claims, max_gap=150.0, topic_threshold=0.72):
     ordered = sorted(claims, key=lambda x: (float(x.get("start", 0)), x.get("claim_id", "")))
     groups = []
     for claim in ordered:
@@ -42,7 +42,7 @@ def build_episodes(claims, max_gap=150.0, topic_threshold=0.08):
         topic = claim.get("topic") or claim.get("statement") or ""
         prior_topic = " ".join(str(x.get("topic") or x.get("statement") or "") for x in groups[-1][-3:])
         score = boundary_score(claim, prior, groups[-1][-4:])
-        if gap > max_gap or score >= .72:
+        if gap > max_gap or score >= topic_threshold:
             groups.append([claim])
         else:
             groups[-1].append(claim)

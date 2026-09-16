@@ -16,7 +16,9 @@ def update_project_state(previous, meeting):
             continue
         if field == "open_questions" and claim.get("question_status") == "answered":
             continue
-        item = {"claim_id": claim["claim_id"], "statement": claim["statement"], "meeting_id": meeting.get("meeting_id"), "evidence_ids": claim.get("evidence_ids", []), "context_only": True}
+        item = {"claim_id": claim["claim_id"], "statement": claim["statement"], "meeting_id": meeting.get("meeting_id"), "evidence_ids": claim.get("evidence_ids", []), "context_only": True,
+                "semantic_state": {key: claim.get(key) for key in ("task_status", "decision_status", "question_status", "time_scope", "assignee", "polarity", "modality", "lifecycle")},
+                "transition_provenance": {"event_ids": claim.get("event_ids", []), "source_record_ids": claim.get("source_record_ids", [])}}
         state[field] = [x for x in state[field] if x.get("statement") != item["statement"]] + [item]
     payload = json.dumps(state, ensure_ascii=False, sort_keys=True).encode()
     state["project_state_id"] = "PS" + hashlib.sha256(payload).hexdigest()[:16]
@@ -31,5 +33,8 @@ def delta(previous, current):
         new = {x.get("statement"): x for x in current.get(field, [])}
         changes.extend({"status": "NEW", "category": field, **item} for key, item in new.items() if key not in old)
         changes.extend({"status": "RESOLVED" if field in {"open_questions", "blockers", "active_tasks"} else "CHANGED", "category": field, **item} for key, item in old.items() if key not in new)
-        changes.extend({"status": "STILL_OPEN" if field in {"open_questions", "blockers", "active_tasks"} else "CONFIRMED", "category": field, **new[key]} for key in new.keys() & old.keys())
+        for key in new.keys() & old.keys():
+            changed = old[key].get("semantic_state") != new[key].get("semantic_state")
+            status = "CHANGED" if changed else "STILL_OPEN" if field in {"open_questions", "blockers", "active_tasks"} else "CONFIRMED"
+            changes.append({"status": status, "category": field, "previous_semantic_state": old[key].get("semantic_state"), **new[key]})
     return {"schema_version": 1, "changes": changes}

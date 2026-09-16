@@ -221,6 +221,9 @@ def connect():
         "summary_error": "ALTER TABLE jobs ADD COLUMN summary_error TEXT",
         "summary_started_at": "ALTER TABLE jobs ADD COLUMN summary_started_at TEXT",
         "summary_finished_at": "ALTER TABLE jobs ADD COLUMN summary_finished_at TEXT",
+        "summary_worker_id": "ALTER TABLE jobs ADD COLUMN summary_worker_id TEXT",
+        "summary_attempt_id": "ALTER TABLE jobs ADD COLUMN summary_attempt_id TEXT",
+        "summary_lease_until": "ALTER TABLE jobs ADD COLUMN summary_lease_until TEXT",
         "worker_id": "ALTER TABLE jobs ADD COLUMN worker_id TEXT",
         "lease_until": "ALTER TABLE jobs ADD COLUMN lease_until TEXT",
         "attempt_id": "ALTER TABLE jobs ADD COLUMN attempt_id TEXT",
@@ -441,8 +444,17 @@ def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+REQUIRED_GENERATION_FILES = {
+    "summary.md", "summary.json", "public_document.json", "public_items.json",
+    "publication_audit.json", "summary_plan.json", "summary_audit.json",
+    "semantic_records.json", "tasks.json", "run_manifest.json",
+    "candidate_disposition.json", "evidence_versions.json", "summary.html",
+    "transcript.html", "semantics/meeting_state.v2.json", "release_manifest.json",
+}
+
+
 def current_summary_output(base):
-    """Return only a complete generation whose files match its signed manifest."""
+    """Return a complete generation whose files match its SHA-256 manifest."""
     base = Path(base)
     try:
         pointer = load_json(base / "summary_current.json")
@@ -452,14 +464,21 @@ def current_summary_output(base):
         target = base / "summary_generations" / generation_id
         manifest = load_json(target / "generation_manifest.json")
         digests = manifest.get("artifact_sha256")
-        if manifest.get("generation_id") != generation_id or not isinstance(digests, dict) or not digests:
+        if manifest.get("generation_id") != generation_id or not isinstance(digests, dict) or not REQUIRED_GENERATION_FILES <= set(digests):
             return None
         for name, expected in digests.items():
-            path = target / str(name)
+            relative = Path(str(name))
+            if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != str(name):
+                return None
+            path = target / relative
+            if target.resolve() not in path.resolve().parents:
+                return None
             if not path.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(expected or "")):
                 return None
             if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
                 return None
+        if pointer.get("verified_artifact_sha256") and pointer.get("verified_artifact_sha256") != digests.get("summary.md"):
+            return None
         return target
     except (OSError, ValueError, json.JSONDecodeError):
         # Legacy loose files have no integrity/provenance envelope and must
@@ -1973,7 +1992,7 @@ def process_summary(job_id, force=False):
     if not transcript.is_file():
         raise FileNotFoundError("Не найден transcript.json")
     job_dir = Path(job["job_dir"])
-    summary_run_id = uuid.uuid4().hex
+    summary_run_id = job["summary_attempt_id"] if "summary_attempt_id" in job.keys() and job["summary_attempt_id"] else uuid.uuid4().hex
     diagnostic_environment.run_id = summary_run_id
     configure_diagnostics(job_dir / "diagnostics.jsonl", component="pipeline.summary", run_id=summary_run_id, job_id=job_id)
     log = job_dir / "summary-processing.log"
@@ -1994,11 +2013,13 @@ def process_summary(job_id, force=False):
         package = current_summary_output(output_dir)
         manifest = load_json(package / "generation_manifest.json") if package else {}
         rejected = []
-        candidates = sorted((job_dir / "summary_cache").glob("*/post_render_verification.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
+        failure_path = output_dir / "last_summary_failure.json"
+        if failure_path.is_file():
             try:
-                audit = load_json(candidates[0])
-                for item in audit.get("abstentions", [])[:25]:
+                audit = load_json(failure_path)
+                if audit.get("attempt_id") != summary_run_id:
+                    audit = {}
+                for item in audit.get("failure_items", [])[:25]:
                     rejected.append({key: item.get(key) for key in ("public_id", "section", "claim_ids", "evidence_ids", "errors")})
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
@@ -2032,7 +2053,6 @@ def process_summary(job_id, force=False):
             summary_progress=float(payload.get("progress", 0)),
             summary_detail=payload.get("detail", "Создаю саммари"),
         )
-        publish_attempt("published")
 
     command = [
         sys.executable, str(ROOT / "scripts" / "summary_worker.py"),
@@ -2051,6 +2071,10 @@ def process_summary(job_id, force=False):
             deadline_seconds=float(cfg.get("subprocess_deadline_seconds", 21600)),
             idle_seconds=float(cfg.get("subprocess_idle_seconds", 1800)),
         )
+        package = current_summary_output(output_dir)
+        if not package:
+            raise RuntimeError("Summary worker exited without a complete committed generation")
+        publish_attempt("published")
         update_job(
             db, job_id,
             summary_status="done", summary_stage="summary_done", summary_progress=100,
@@ -2082,12 +2106,25 @@ def run_next_summary():
     if not config().get("summary_enabled", True):
         return False
     db = connect()
+    worker_id = "{}:{}".format(os.uname().nodename, os.getpid())
+    attempt_id = uuid.uuid4().hex
+    lease_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds")
+    db.execute("BEGIN IMMEDIATE")
     job = db.execute(
         "SELECT id, summary_status FROM jobs WHERE status = 'done' AND summary_status IN ('queued', 'queued_force') ORDER BY id LIMIT 1"
     ).fetchone()
     if not job:
+        db.commit()
         return False
-    process_summary(job["id"], force=job["summary_status"] == "queued_force")
+    prior_status = job["summary_status"]
+    claimed = db.execute(
+        "UPDATE jobs SET summary_status='running', summary_stage='summary_claimed', summary_worker_id=?, summary_attempt_id=?, summary_lease_until=?, updated_at=? WHERE id=? AND summary_status=?",
+        (worker_id, attempt_id, lease_until, now(), job["id"], prior_status),
+    )
+    db.commit()
+    if claimed.rowcount != 1:
+        return False
+    process_summary(job["id"], force=prior_status == "queued_force")
     return True
 
 

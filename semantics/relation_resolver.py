@@ -4,7 +4,7 @@ import hashlib
 import re
 from .questions import verify_slot_entailment
 
-ACCEPT_RE = re.compile(r"(?iu)^\s*(?:да|согласен|делаем|ок(?:ей)?|подтверждаю)\b")
+ACCEPT_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|согласен|делаем|ок(?:ей)?|подтверждаю|(?:а[\s,]*)?(?:месяца?[\s,.:—-]*)?ну\s+ладно)\b")
 REJECT_RE = re.compile(r"(?iu)^\s*(?:нет|не согласен|не делаем|отклоняем)\b")
 CAUSE_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|в результате|привел[оа]? к)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|при условии|после того как)\b")
@@ -25,6 +25,15 @@ def _similarity(left, right):
 def _relation(kind, source, target, evidence, confidence, basis):
     raw = f"{kind}|{source}|{target}|{'|'.join(evidence)}"
     return {"relation_id": "R" + hashlib.sha256(raw.encode()).hexdigest()[:16], "type": kind, "source_proposition_id": source, "target_proposition_id": target, "evidence_ids": list(dict.fromkeys(evidence)), "confidence": confidence, "basis": basis}
+
+
+def _quantity_directions(proposition):
+    return {str(item.get("direction")) for item in proposition.get("quantities", []) if item.get("direction")}
+
+
+def _opposite_change(left, right):
+    directions = (_quantity_directions(left), _quantity_directions(right))
+    return ({"increase"} <= directions[0] and {"decrease"} <= directions[1]) or ({"decrease"} <= directions[0] and {"increase"} <= directions[1])
 
 
 def resolve_relations(propositions, events, records):
@@ -71,7 +80,15 @@ def resolve_relations(propositions, events, records):
             candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask", "commit"}]
             same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
             candidates = same_thread or candidates
-            target_event = candidates[0] if len(candidates) == 1 else None
+            # Resolve a short reply to the nearest compatible exchange.  A
+            # second, almost equally recent candidate is genuine ambiguity and
+            # must not be guessed.
+            candidates = sorted(candidates, key=lambda value: value.get("timestamp", 0), reverse=True)
+            target_event = candidates[0] if candidates and (
+                len(candidates) == 1 or
+                candidates[0].get("timestamp", 0) - candidates[1].get("timestamp", 0) >= 8 or
+                candidates[0].get("thread_hint") and candidates[0].get("thread_hint") == event.get("thread_hint")
+            ) else None
             # A speaker's own acknowledgement is not evidence that another
             # participant accepted the proposition.
             is_rejection = event["speech_act"] == "reject" or bool(REJECT_RE.search(text))
@@ -94,7 +111,7 @@ def resolve_relations(propositions, events, records):
             if similarity < .18 and not shared_entities:
                 continue
             if event["speech_act"] == "correct": add("corrects", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .92, "bounded_semantic_candidate")
-            elif source["polarity"] != target["polarity"]: add("contradicts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .82, "polarity_conflict")
+            elif source["polarity"] != target["polarity"] or _opposite_change(source, target): add("contradicts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .82, "typed_semantic_conflict")
             elif CONDITION_RE.search(text): add("condition_for", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .78, "condition_marker")
             elif CAUSE_RE.search(text): add("explains", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .75, "causal_marker")
             elif source["content_kind"] in {"hypothesis", "experimental_result"} and target["content_kind"] in {"trading_rule", "system_rule", "design_choice"}: add("tests", source["proposition_id"], target["proposition_id"], source["evidence_ids"], .74, "experiment_candidate")

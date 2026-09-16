@@ -6,7 +6,10 @@ import re
 from .ontology import require_content_kind
 
 TOKEN_RE = re.compile(r"(?iu)[a-zа-яё0-9]+")
-NEGATION_RE = re.compile(r"(?iu)\b(?:не|нет|нельзя|без|никогда)\b")
+# `без ошибок` negates an argument (errors), not the predicate `работает`.
+# Predicate polarity and argument restrictions are therefore separate axes.
+NEGATION_RE = re.compile(r"(?iu)\b(?:не|нет|нельзя|никогда)\b")
+ARGUMENT_NEGATION_RE = re.compile(r"(?iu)\bбез\s+([a-zа-яё0-9_-]+)")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|после|перед|пока|при|до тех пор)\b")
 MODALITY = {
     "asserted": "certain", "committed": "certain", "certain": "certain",
@@ -59,7 +62,18 @@ def proposition_signature(record, registry=None):
     for raw in record.get("entities", []):
         normalized = normalize_entity(raw)
         if registry is not None:
-            normalized = registry.resolve(normalized["canonical_name"], normalized["type"]) or registry.register(normalized["canonical_name"], normalized["type"], normalized["aliases"], normalized.get("entity_id"))
+            candidates = registry.resolve_candidates(normalized["canonical_name"], normalized["type"])
+            resolved = registry.resolve(normalized["canonical_name"], normalized["type"])
+            if resolved:
+                normalized = resolved
+            elif len(candidates) > 1:
+                normalized = {
+                    **normalized,
+                    "entity_id": "AMB" + hashlib.sha256(_clean(normalized["canonical_name"]).encode()).hexdigest()[:12],
+                    "ambiguous_candidate_ids": sorted(item["entity_id"] for item in candidates),
+                }
+            else:
+                normalized = registry.register(normalized["canonical_name"], normalized["type"], normalized["aliases"], normalized.get("entity_id"))
         entities.append(dict(normalized))
     statement = record.get("statement") or ""
     raw_kind = record.get("kind") or record.get("content_kind")
@@ -68,9 +82,10 @@ def proposition_signature(record, registry=None):
         "object": _clean(record.get("object")), "scope": record.get("scope") or {},
         "conditions": [{"antecedent": _clean(x["antecedent"]), "consequent": _clean(x["consequent"])} for x in conditions],
         "polarity": record.get("polarity") or ("negative" if NEGATION_RE.search(statement) else "positive"),
-        "quantities": [{k: x.get(k) for k in ("value", "unit", "entity_id", "role", "operator")} for x in quantities],
+        "quantities": [{k: x.get(k) for k in ("value", "unit", "entity_id", "role", "operator", "direction")} for x in quantities],
         "time_scope": record.get("time_scope") or record.get("time_expression"),
         "entities": sorted(x["entity_id"] for x in entities),
+        "negated_arguments": sorted(_clean(value) for value in ARGUMENT_NEGATION_RE.findall(statement)),
     }
     subject = _clean(record.get("subject"))
     participant_bound = raw_kind in {"action", "follow_up", "resource"} or subject in {"я", "i", "мне", "мы", "we"}

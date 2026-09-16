@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 
-from pipeline import current_summary_output, find_existing_job, run_command, submission_fingerprint
+from pipeline import REQUIRED_GENERATION_FILES, current_summary_output, find_existing_job, run_command, submission_fingerprint
 from scripts.summary_worker import build_public_document, render_public_document, time_link
 from summary.planner import plan
 from summary.verifier import build_public_items, publication_audit, verify_generated_items, verify_public_document
@@ -124,9 +124,11 @@ class GenerationTests(unittest.TestCase):
             self.assertIsNone(current_summary_output(base))
             final = pending.with_name(generation)
             pending.rename(final)
-            digest = hashlib.sha256((final / "summary.md").read_bytes()).hexdigest()
+            for name in REQUIRED_GENERATION_FILES - {"summary.md"}:
+                path = final / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("{}")
+            digests = {name: hashlib.sha256((final / name).read_bytes()).hexdigest() for name in REQUIRED_GENERATION_FILES}
             (final / "generation_manifest.json").write_text(json.dumps({
-                "generation_id": generation, "artifact_sha256": {"summary.md": digest}}), encoding="utf-8")
+                "generation_id": generation, "artifact_sha256": digests}), encoding="utf-8")
             (base / "summary_current.json").write_text(json.dumps({"generation_id": generation}), encoding="utf-8")
             self.assertEqual(current_summary_output(base), final)
             (base / "summary_current.json").write_text(json.dumps({"generation_id": "../unsafe"}), encoding="utf-8")

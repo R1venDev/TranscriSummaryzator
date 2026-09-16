@@ -41,18 +41,19 @@ from meeting_intelligence import (
 from semantics.ontology import CLAIM_KINDS
 from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
-from summary.views import project_views
-from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, verify_generated_items, verify_public_document, verify_sentence_plan
+from summary.views import project_verified_document, project_views
+from summary.outcomes import build_outcome_cards
+from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
 
 
-PIPELINE_VERSION = "meeting-intelligence-v24"
+PIPELINE_VERSION = "meeting-intelligence-v25"
 FACT_TYPES = set(CLAIM_KINDS)
 CRITICAL_TYPES = {"decision", "action", "metric", "schedule", "goal"}
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*[%×xх])?(?!\w)", re.I)
-PROFILE_RE = re.compile(r"@[\w.-]+", re.U)
+PROFILE_RE = re.compile(r"@[\w]+(?:[-.][\w]+)*", re.U)
 MATERIAL_MARKERS = (
     "нужно", "надо", "предлага", "решил", "решили", "договор", "соглас",
     "проблем", "ошиб", "не работает", "не получается", "провер", "тест",
@@ -627,6 +628,7 @@ def apply_resolution_response(response, focused, targets, facts, rejected_dir):
 
 
 LLM_CACHE_ROOT = None
+GLOBAL_LLM_CACHE_ROOT = None
 FRESH_MODEL_CALLS = False
 
 
@@ -634,7 +636,7 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     schema = contract_schema(contract) if contract else None
     digest = client.model_digest(model) if hasattr(client, "model_digest") else "nonproduction-client:" + client.__class__.__name__
     request_key = stable_hash({"version": PIPELINE_VERSION, "model": model, "model_digest": digest, "system": system, "prompt": prompt, "num_predict": num_predict, "num_ctx": num_ctx, "schema": schema})
-    global_cache = (LLM_CACHE_ROOT / "_global_llm_cache" / request_key[:2] / f"{request_key}.json") if LLM_CACHE_ROOT else None
+    global_cache = (GLOBAL_LLM_CACHE_ROOT / request_key[:2] / f"{request_key}.json") if GLOBAL_LLM_CACHE_ROOT else None
     candidates = () if FRESH_MODEL_CALLS else ((cache_path, "run_cache"), (global_cache, "global_content_addressed"))
     for candidate, reason in candidates:
         if candidate and candidate.is_file():
@@ -723,7 +725,8 @@ def run_evidence_repair(facts, cache_root, cfg):
     directory.mkdir(parents=True, exist_ok=True)
     manifest = directory / "manifest.json"
     output = directory / "repairs.json"
-    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "secondary_model": cfg.get("summary_independent_asr_model") if cfg.get("summary_independent_asr_enabled", True) else None, "secondary_revision": cfg.get("summary_independent_asr_revision") if cfg.get("summary_independent_asr_enabled", True) else None, "audio_size": audio.stat().st_size})
+    audio_sha256 = hashlib.sha256(audio.read_bytes()).hexdigest()
+    request_key = stable_hash({"version": PIPELINE_VERSION, "requests": requests, "model": cfg.get("gigaam_model"), "secondary_model": cfg.get("summary_independent_asr_model") if cfg.get("summary_independent_asr_enabled", True) else None, "secondary_revision": cfg.get("summary_independent_asr_revision") if cfg.get("summary_independent_asr_enabled", True) else None, "audio_sha256": audio_sha256, "repair_config": {key: cfg.get(key) for key in sorted(cfg) if key.startswith("summary_") and "repair" in key}})
     if output.is_file():
         cached = load_json(output)
         if cached.get("request_key") == request_key:
@@ -818,7 +821,18 @@ def normalize_fact(raw, chunk, sequence):
 
 
 def numeric_tokens(text):
-    return {match.group(0).casefold().replace(" ", "") for match in NUMBER_RE.finditer(text)}
+    words = {"ноль": "0", "один": "1", "одного": "1", "одну": "1", "два": "2", "две": "2", "три": "3", "четыре": "4", "пять": "5", "шесть": "6", "семь": "7", "восемь": "8", "девять": "9", "десять": "10"}
+    result = {words[value.casefold()] for value in re.findall(r"(?iu)\b(?:ноль|один|одного|одну|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b", text)}
+    for match in NUMBER_RE.finditer(text):
+        value = match.group(0).casefold().replace(" ", "")
+        suffix = "%" if value.endswith("%") else ""
+        core = value[:-1] if suffix else value
+        if re.fullmatch(r"\d{1,2}:00", core):
+            core = str(int(core.split(":", 1)[0]))
+        elif re.fullmatch(r"\d+", core):
+            core = str(int(core))
+        result.add(core + suffix)
+    return result
 
 
 def alphanumeric_technical_tokens(text):
@@ -2482,7 +2496,10 @@ def render_public_items_legacy(items, metadata=None):
 def _public_text(item):
     text = canonicalize_people(item.get("text") or "")
     text = re.sub(r"(?iu)^\s*говорящий\s+(@[\w.-]+)\s+", r"\1 ", text)
-    return re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text).strip()
+    text = re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text)
+    text = re.sub(r"(?iu)\bbaseline\b", "ориентир", text)
+    text = re.sub(r"(?iu)\bсвичных\b", "свечных", text)
+    return text.strip()
 
 
 def _chapter_label(text, limit=78):
@@ -2494,71 +2511,85 @@ def _chapter_label(text, limit=78):
     return value if value and not re.search(r"(?iu)\b(?:и|или|что|чтобы|из-за|после)$", value) else "Ключевой результат эпизода"
 
 
-def build_public_document(items, metadata=None):
-    """Materialize every authored node before rendering it."""
+def build_public_document(items, metadata=None, graph=None):
+    """Build the one verified document from field-grounded outcomes and items."""
     metadata = metadata or {}
     by_section = {}
     for item in items:
         by_section.setdefault(item["section"], []).append(item)
+
     def utility(item):
         text = _public_text(item)
-        score = 2 * bool(re.search(r"(?iu)\b(?:не\s+работ|неуспеш|огранич|проблем|решил|соглас|провер|следующ|задерж|результат)\w*", text))
-        score += 2 * (item.get("section") in {"decisions", "tasks", "technical"})
-        score += bool(item.get("evidence_ids")) + bool(item.get("source_word_ids"))
-        score -= 3 * bool(re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|определяется|называется)\b", text))
-        score -= 3 * bool(item.get("verification_status") in {"verification_unavailable", "insufficient_evidence"})
-        return score
-    overview = sorted(by_section.get("overview", []), key=lambda item: (-utility(item), float(item.get("start", 0))))[:5]
-    title_sources = sorted(overview + by_section.get("technical", []) + by_section.get("tasks", []), key=lambda item: (-utility(item), float(item.get("start", 0))))[:3]
-    if not title_sources:
-        title_sources = list(items[:1])
-    entities = list(dict.fromkeys(entity for item in title_sources for entity in item.get("topic_entities", []) if entity))[:3]
-    title = ("Результаты и следующие проверки: " + ", ".join(entities)) if entities else _chapter_label(_public_text(title_sources[0]), 104)
-    title = shorten_text(title, 110).rstrip(".…")
+        roles = bool(re.search(r"(?iu)\b(?:работ|готов|огранич|проблем|решил|соглас|провер|следующ|задерж|результат|создал|переда)\w*", text))
+        return 3 * roles + 2 * (item.get("section") in {"decisions", "tasks", "technical"}) + bool(item.get("evidence_ids")) - 4 * bool(item.get("verification_status") in {"verification_unavailable", "insufficient_evidence"})
+
+    allowed_claims = {claim for item in items for claim in item.get("claim_ids", [])}
+    outcome_cards = build_outcome_cards(graph, allowed_claims) if graph else []
     minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
-    episode_groups = []
-    for item in minute_items:
-        episode = item.get("episode_id")
-        topics = set(item.get("topic_entities", []))
-        previous = episode_groups[-1] if episode_groups else None
-        same_topic = previous and topics and topics & previous["topics"]
-        near = previous and float(item.get("start", 0)) - float(previous["items"][-1].get("start", 0)) <= 240
-        if previous and ((episode and episode == previous["episode"]) or (not episode and same_topic and near)):
-            previous["items"].append(item); previous["topics"].update(topics)
-        else:
-            episode_groups.append({"episode": episode, "topics": topics, "items": [item]})
-    # Avoid dozens of micro-chapters while preserving the beginning and end.
-    while len(episode_groups) > 9:
-        smallest = min(range(len(episode_groups)), key=lambda i: len(episode_groups[i]["items"]))
-        target = smallest - 1 if smallest else 1
-        episode_groups[target]["items"] = sorted(episode_groups[target]["items"] + episode_groups[smallest]["items"], key=lambda x: float(x.get("start", 0)))
-        episode_groups[target]["topics"].update(episode_groups[smallest]["topics"])
-        episode_groups.pop(smallest)
+    if not outcome_cards:
+        grouped = {}
+        for item in minute_items or sorted(items, key=lambda value: float(value.get("start", 0))):
+            grouped.setdefault(item.get("episode_id") or item.get("public_id"), []).append(item)
+        for index, members in enumerate(grouped.values(), 1):
+            best = max(members, key=utility)
+            field = {"value": _public_text(best), "claim_ids": best.get("claim_ids", []), "evidence_ids": best.get("evidence_ids", [])}
+            outcome_cards.append({
+                "outcome_id": f"OC{index:02d}", "topic": _chapter_label(field["value"]),
+                "ranges": [{"start": min(float(x.get("start", 0)) for x in members), "end": max(float(x.get("end", x.get("start", 0))) for x in members)}],
+                "fields": {"current_state": field, "constraint": None, "resolution": None, "work_result": None, "next_step": None, "remaining_unknown": []},
+                "claim_ids": list(dict.fromkeys(c for x in members for c in x.get("claim_ids", []))),
+                "evidence_ids": list(dict.fromkeys(e for x in members for e in x.get("evidence_ids", []))),
+                "status": "verified_input", "verification": {"status": "pending", "errors": []},
+            })
+
+    # Overview roles are selected from different semantic needs, not a global
+    # lexical score.  This keeps state, constraint and next action distinct.
+    overview = []
+    for field_name in ("current_state", "constraint", "resolution", "work_result", "next_step"):
+        for card in outcome_cards:
+            field = card.get("fields", {}).get(field_name)
+            if field and field.get("value") and field.get("value") not in {x["text"] for x in overview}:
+                overview.append({"text": field["value"], "claim_ids": field["claim_ids"], "evidence_ids": field["evidence_ids"], "role": field_name})
+                break
+        if len(overview) >= 5:
+            break
+    if not overview:
+        overview = [{"text": _public_text(item), "claim_ids": item.get("claim_ids", []), "evidence_ids": item.get("evidence_ids", []), "role": "result"} for item in sorted(by_section.get("overview", []), key=lambda item: (-utility(item), float(item.get("start", 0))))[:5]]
+
+    topic_candidates = []
+    for card in outcome_cards:
+        topic = _chapter_label(card.get("topic") or "")
+        if topic and topic != "Ключевой результат эпизода" and not re.search(r"(?iu)^участник\s+спрашивает", topic):
+            topic_candidates.append(topic)
+    entities = sorted({entity for item in items for entity in item.get("topic_entities", []) if entity}, key=str.casefold)
+    subjects = entities[:3] or topic_candidates[:3]
+    title = (", ".join(subjects) + ": результаты, ограничения и следующие шаги") if subjects else "Итоги встречи: результаты, ограничения и следующие шаги"
+    title_claims = {claim for card in outcome_cards[:3] for claim in card.get("claim_ids", [])}
+    title_sources = [item for item in items if set(item.get("claim_ids", [])) & title_claims] or [item for item in items if set(item.get("claim_ids", [])) & set(c for node in overview[:3] for c in node.get("claim_ids", []))] or list(items[:1])
+    title = shorten_text(title, 110).rstrip(".…")
+
     chapters = []
-    for index, group in enumerate(episode_groups):
-        members = group["items"]
-        if not members:
-            continue
-        label = ", ".join(list(group["topics"])[:3]) if group["topics"] else _chapter_label(_public_text(max(members, key=utility)))
+    for index, card in enumerate(outcome_cards, 1):
+        ranges = card.get("ranges") or [{"start": 0, "end": 0}]
+        start = min(float(value.get("start", 0)) for value in ranges)
+        end = max(float(value.get("end", value.get("start", 0))) for value in ranges)
+        if end <= start:
+            matching = [item for item in minute_items if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
+            end = max([float(item.get("end", item.get("start", 0))) for item in matching] or [start + .001])
         chapters.append({
-            "chapter_id": f"CH{index + 1:02d}", "label": _chapter_label(label),
-            "start": float(members[0].get("start", 0)), "end": float(members[-1].get("start", 0)),
-            "claim_ids": [claim for item in members for claim in item.get("claim_ids", [])],
-            "evidence_ids": [evidence for item in members for evidence in item.get("evidence_ids", [])],
-            "items": members,
+            "chapter_id": f"CH{index:02d}", "label": _chapter_label(card.get("topic") or "Результат темы"),
+            "start": start, "end": end, "ranges": ranges,
+            "claim_ids": card.get("claim_ids", []), "evidence_ids": card.get("evidence_ids", []),
+            "items": [item for item in minute_items if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))],
+            "outcome_id": card["outcome_id"],
         })
-    outcome_cards = [{"outcome_id": f"OC{i + 1:02d}", "topic": chapter["label"],
-                      "current_state": _public_text(max(chapter["items"], key=utility)),
-                      "status": "evidence_backed", "claim_ids": chapter["claim_ids"], "evidence_ids": chapter["evidence_ids"]}
-                     for i, chapter in enumerate(chapters)]
     return {
-        "schema": "PublicDocument", "schema_version": 3,
-        "title": {"text": title, "claim_ids": [claim for item in title_sources for claim in item.get("claim_ids", [])], "evidence_ids": [evidence for item in title_sources for evidence in item.get("evidence_ids", [])]},
-        "overview": [{"text": _public_text(item), "claim_ids": item.get("claim_ids", []), "evidence_ids": item.get("evidence_ids", [])} for item in overview],
+        "schema": "VerifiedDocument", "schema_version": 4,
+        "title": {"text": title, "claim_ids": list(dict.fromkeys(claim for item in title_sources for claim in item.get("claim_ids", []))), "evidence_ids": list(dict.fromkeys(evidence for item in title_sources for evidence in item.get("evidence_ids", [])))},
+        "overview": overview,
         "sections": {key: value for key, value in by_section.items() if key not in {"overview", "minutes"}},
-        "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "claim_ids", "evidence_ids")} for chapter in chapters],
-        "chronology": chapters,
-        "outcome_cards": outcome_cards,
+        "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "ranges", "claim_ids", "evidence_ids", "outcome_id")} for chapter in chapters],
+        "chronology": chapters, "outcome_cards": outcome_cards,
         "metadata": dict(metadata),
     }
 
@@ -2583,7 +2614,7 @@ def render_public_document(document):
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
             lines.append(f"- {start}–{end} — {chapter['label']}")
-    headings = {"decisions": "Принятые решения", "rules": "Упомянутые действующие правила", "tasks": "Действия и планы на подтверждение", "questions": "Что осталось уточнить", "technical": "Технические выводы и ограничения", "experiments": "Идеи и эксперименты, ещё не проверенные", "requires_verification": "Требует проверки источника"}
+    headings = {"decisions": "Принятые решения", "rules": "Упомянутые действующие правила", "tasks": "Задачи и следующие шаги", "questions": "Что осталось уточнить", "technical": "Технические выводы и ограничения", "experiments": "Идеи и эксперименты, ещё не проверенные", "requires_verification": "Требует проверки источника"}
     prefixes = {"decisions": "D", "rules": "R", "tasks": "T", "questions": "Q", "experiments": "H", "technical": "X", "requires_verification": "V"}
     for section in ("decisions", "rules", "tasks", "questions", "technical", "experiments", "requires_verification"):
         section_items = document.get("sections", {}).get(section, [])
@@ -2595,10 +2626,25 @@ def render_public_document(document):
             lines.append(f"- **{prefixes[section]}-{index:02d}.** {_public_text(item)}{qualifier} {stamp}")
     if document.get("chronology"):
         lines.extend(["", "## Подробная хронология встречи", ""])
+        cards = {card.get("outcome_id"): card for card in document.get("outcome_cards", [])}
+        field_labels = {"current_state": "Состояние", "constraint": "Ограничение", "resolution": "Решение", "work_result": "Результат", "next_step": "Дальше", "remaining_unknown": "Осталось уточнить"}
         for chapter in document["chronology"]:
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
-            lines.extend([f"### {start}–{end} — {chapter['label']}", "", " ".join(terminate_sentence(_public_text(item)) for item in chapter["items"]), ""])
+            lines.extend([f"### {start}–{end} — {chapter['label']}", ""])
+            card = cards.get(chapter.get("outcome_id"), {})
+            rendered_fields = []
+            for name in ("current_state", "constraint", "resolution", "work_result", "next_step", "remaining_unknown"):
+                value = card.get("fields", {}).get(name)
+                values = value if isinstance(value, list) else [value] if value else []
+                for field in values:
+                    if field and field.get("value"):
+                        rendered_fields.append(f"**{field_labels[name]}:** {terminate_sentence(_public_text({'text': field['value']}))}")
+            if rendered_fields:
+                lines.extend(rendered_fields)
+            else:
+                lines.append(" ".join(terminate_sentence(_public_text(item)) for item in chapter["items"]))
+            lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -4055,14 +4101,44 @@ def release_commit():
 
 
 def declared_release_marker():
+    current = release_commit()
+    if current:
+        return current
     marker = Path(__file__).resolve().parents[1] / "RELEASE_COMMIT"
     return marker.read_text(encoding="utf-8").strip() if marker.is_file() else None
+
+
+def build_release_manifest(settings, cfg):
+    roots = ("scripts", "contracts", "semantics", "summary", "pipeline_core", "project_memory", "evaluation", "evidence")
+    paths = [APPLICATION_ROOT / "pipeline.py", APPLICATION_ROOT / "run_evidence_summary.py"]
+    paths.extend(path for name in roots for path in (APPLICATION_ROOT / name).rglob("*.py"))
+    paths.extend(APPLICATION_ROOT.glob("requirements-*.txt"))
+    files = {
+        str(path.relative_to(APPLICATION_ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths)) if path.is_file()
+    }
+    try:
+        dirty = subprocess.run(["git", "diff", "--quiet", "--ignore-submodules", "HEAD", "--"], cwd=APPLICATION_ROOT).returncode != 0
+    except Exception:
+        dirty = None
+    payload = {
+        "schema": "ReleaseManifest", "schema_version": 1,
+        "git_commit": release_commit(), "declared_release_marker": declared_release_marker(),
+        "dirty": dirty, "files": files,
+        "config_sha256": stable_hash(cfg),
+        "pipeline_schema_version": PIPELINE_VERSION,
+        "model_digests": settings.get("model_inventory", {}),
+    }
+    payload["release_identity_consistent"] = bool(payload["git_commit"] and payload["git_commit"] == payload["declared_release_marker"])
+    payload["release_fingerprint"] = stable_hash(payload)
+    return payload
 
 
 def build_run_manifest(settings, cfg, source_manifest):
     vocabulary = Path(__file__).resolve().parents[1] / "vocabulary.json"
     roles = ("extractor", "arbitrator", "high_risk_verifier", "critical_secondary_verifier", "writer", "auditor", "public_auditor")
     inventory = settings.get("model_inventory", {})
+    release = build_release_manifest(settings, cfg)
     return {
         "schema_version": 3,
         "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
@@ -4072,6 +4148,8 @@ def build_run_manifest(settings, cfg, source_manifest):
         "git_commit": release_commit(),
         "declared_release_marker": declared_release_marker(),
         "worker_sha256": settings.get("worker_hash"),
+        "release_fingerprint": release["release_fingerprint"],
+        "release_manifest": release,
         "config_sha256": stable_hash(cfg),
         "resolved_config_redacted": {key: ("[REDACTED]" if any(mark in key.casefold() for mark in ("token", "secret", "password", "api_key")) else value) for key, value in cfg.items()},
         "prompt_versions": {
@@ -4374,6 +4452,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         elif anchor_starts:
             item["start"] = min(anchor_starts, key=lambda value: abs(value - proposed_start))
             item["navigation_basis"] = "nearest_utterance_fallback"
+    public_items = validate_public_items_contract(public_items)
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
     if not post_render_audit["passed"]:
@@ -4386,7 +4465,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "project": cfg.get("summary_project_name", "Aurion"),
         "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
         "public_base_url": cfg.get("summary_public_base_url"),
-    })
+    }, graph=state_v2)
     if any(float(chapter["start"]) not in anchor_starts for chapter in final_document.get("navigation", [])):
         raise RuntimeError("Navigation target does not exist in the transcript")
     markdown = render_public_document(final_document)
@@ -4507,14 +4586,15 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     run_manifest["publication_outcome"] = "published"
     run_manifest["performance_metric_scope"] = "published_generation"
     atomic_json(output_dir / "run_manifest.json", run_manifest)
+    atomic_json(output_dir / "release_manifest.json", run_manifest["release_manifest"])
     # Project memory is an optional side effect, never a publication gate.
-    projections = project_views(state_v2, summary_plan)
+    projections = project_verified_document(final_document)
     atomic_json(output_dir / "views" / "plan_verification.json", plan_verification)
     atomic_json(output_dir / "views" / "actual_output_verification.json", actual_output_audit)
     view_titles = {"executive": "Итог встречи", "technical": "Техническое саммари", "tasks": "Задачи", "decisions": "Принятые решения", "mentioned_rules": "Упомянутые действующие правила", "experiments": "Эксперименты и гипотезы", "open_questions": "Открытые вопросы", "minutes": "Протокол по эпизодам"}
     for view_name, claims in projections.items():
         atomic_json(output_dir / "views" / f"{view_name}.json", {"schema_version": 1, "claims": claims})
-        body = "# " + view_titles[view_name] + "\n\n" + ("\n".join(f"- {item.get('statement')}" for item in claims) or "Нет подтвержденных элементов.") + "\n"
+        body = "# " + view_titles[view_name] + "\n\n" + ("\n".join(f"- {item.get('statement') or item.get('text') or item.get('topic')}" for item in claims) or "Нет подтвержденных элементов.") + "\n"
         atomic_text(output_dir / "views" / f"{view_name}.md", body)
     manifests = [
         artifact_manifest("meeting_state.v2.json", "MeetingStateSchema", "claim_graph", PIPELINE_VERSION, {"transcript": settings["transcript"]}),
@@ -4530,8 +4610,10 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     review_candidates = [item for item in state["views"]["tasks"] if item.get("automation_eligible") is not True]
     atomic_json(output_dir / "tasks.json", {
         "schema_version": semantic_registry["schema_version"],
+        "human_tasks": final_document.get("sections", {}).get("tasks", []),
         "tasks": safe_tasks,
         "review_candidates": review_candidates,
+        "automation_contract": "Only tasks[] may be executed automatically; human_tasks is the complete reading view.",
     })
     atomic_json(output_dir / "summary_audit.json", {"pipeline_version": PIPELINE_VERSION, "coverage": coverage, "coverage_interpretation": "material_accounting_not_summary_completeness", "summary_completeness": "not_measured", "accepted_facts": len(final_facts), "rejected_facts": len(fact_rejected) + len(publication_rejected) + len(semantic_rejected) + len(surface_rejected), "semantic": semantic_counts, "publication_audit": quality_gates, "cost_profile": {"legacy_writer_invoked": False, "executive_llm_invoked": False, "task_enrichment_llm_invoked": False}, "details": load_json(run_dir / "audit.json")})
     atomic_json(output_dir / "navigation.json", navigation_audit)
@@ -4604,7 +4686,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         raise RuntimeError("Ранние кандидаты потеряны без конечного решения: " + ", ".join(unresolved[:12]))
     required = ("summary.md", "summary.json", "public_document.json", "public_items.json", "publication_audit.json",
                 "summary_plan.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json",
-                "candidate_disposition.json", "evidence_versions.json", "summary.html", "transcript.html", "semantics/meeting_state.v2.json")
+                "candidate_disposition.json", "evidence_versions.json", "summary.html", "transcript.html", "semantics/meeting_state.v2.json", "release_manifest.json")
     integrity = {name: hashlib.sha256((output_dir / name).read_bytes()).hexdigest() for name in required}
     if integrity["summary.md"] != verified_hash:
         raise RuntimeError("Generation content differs from verified Markdown")
@@ -4612,6 +4694,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
                 "job_id": os.environ.get("TRANSCRISUMMARY_JOB_ID"),
                 "attempt_id": os.environ.get("TRANSCRISUMMARY_ATTEMPT_ID") or os.environ.get("TRANSCRISUMMARY_RUN_ID"),
                 "git_commit": release_commit(), "created_at": run_manifest.get("generation_created_at"),
+                "release_fingerprint": run_manifest.get("release_fingerprint"),
                 "transcript_hash": settings["transcript"], "utterance_content_sha256": settings.get("utterance_content_sha256"),
                 "artifact_sha256": integrity, "verified_artifact_sha256": verified_hash})
     if stable_hash(load_json(base_output / "transcript.json").get("utterances", [])) != settings["transcript"]:
@@ -4636,7 +4719,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
 
 
 def main():
-    global LLM_CACHE_ROOT, FRESH_MODEL_CALLS
+    global LLM_CACHE_ROOT, GLOBAL_LLM_CACHE_ROOT, FRESH_MODEL_CALLS
     parser = argparse.ArgumentParser()
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -4646,6 +4729,7 @@ def main():
     args = parser.parse_args()
     cfg = load_config(args.config, args.cache / "config.resolved.json")
     LLM_CACHE_ROOT = args.cache
+    GLOBAL_LLM_CACHE_ROOT = APPLICATION_ROOT / "state" / "llm-content-cache" / PIPELINE_VERSION
     FRESH_MODEL_CALLS = bool(args.force and cfg.get("summary_force_cache_policy", "fresh_models") == "fresh_models")
     transcript = load_json(args.transcript)
     utterances = transcript_utterances(transcript)

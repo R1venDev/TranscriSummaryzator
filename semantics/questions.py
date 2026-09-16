@@ -5,7 +5,8 @@ import re
 
 SLOT_ALIASES = {
     "closing": "yes_no", "decision": "yes_no", "possibility": "yes_no",
-    "диапазон времени": "time_range", "exact_time": "time_range",
+    "диапазон времени": "time_range", "exact_time": "exact_time",
+    "time alternatives": "time_alternatives", "варианты времени": "time_alternatives",
     "should_misha_make_orderblock_labeler": "actor_commitment",
     "rhythmic entry success": "implementation_status",
     "rhythmic_entry_implementation": "implementation_status",
@@ -57,13 +58,17 @@ def verify_slot_entailment(requested_slots, answer, question=None):
         elif slot in {"number", "quantity", "number_of_trades", "threshold_value"} and len(numbers) == 1 and relevant and (
                 slot not in {"number_of_trades", "threshold_value"} or re.search(r"(?iu)\b(?:сделк\w*|вход\w*|позици\w*|порог\w*|размер\w*|ширин\w*)\b", text)):
             entailed[original_slot] = numbers[0]
-        elif slot == "time_range" and (relevant or answer.get("speech_act") == "answer") and re.search(r"(?iu)\b\d{1,2}(?::\d{2})?\s*(?:[-–—]|или|до)\s*\d{1,2}(?::\d{2})?\b", text):
+        elif slot == "time_range" and (relevant or answer.get("speech_act") == "answer") and re.search(r"(?iu)\b\d{1,2}(?::\d{2})?\s*(?:[-–—]|до)\s*\d{1,2}(?::\d{2})?\b", text):
+            entailed[original_slot] = text
+        elif slot == "time_alternatives" and (relevant or answer.get("speech_act") == "answer") and re.search(r"(?iu)\b\d{1,2}(?::\d{2})?\s*(?:или|либо)\s*\d{1,2}(?::\d{2})?\b", text):
+            entailed[original_slot] = text
+        elif slot == "exact_time" and (relevant or answer.get("speech_act") == "answer") and re.fullmatch(r"(?iu)\s*(?:в\s+)?\d{1,2}(?::\d{2})?\s*", text):
             entailed[original_slot] = text
         elif (slot in {"yes_no", "actor_commitment"} and
-              re.fullmatch(r"(?iu)\s*(?:нет|неа|да|ага)(?:[.!])?\s*", text) and
+              re.match(r"(?iu)^\s*(?:нет|неа|(?:да[\s,!.—-]*)+|ага|угу|ну\s+ладно)\b", text) and
               answer.get("speech_act") in {"answer", "accept", "reject"}):
             entailed[original_slot] = "нет" if re.search(r"(?iu)\b(?:нет|неа)\b", text) else "да"
-        elif slot == "implementation_status" and relevant and re.search(r"(?iu)\b(?:работа\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*)\b", text):
+        elif slot == "implementation_status" and relevant and re.search(r"(?iu)\b(?:работа\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*|задерж\w*|не\s+закончен\w*)\b", text):
             entailed[original_slot] = text
         elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
             entailed[original_slot] = text

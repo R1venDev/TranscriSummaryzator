@@ -51,14 +51,17 @@ class LatestAuditRegressionTests(unittest.TestCase):
 
     def test_reader_hash_validation(self):
         try:
-            from pipeline import current_summary_output
+            from pipeline import REQUIRED_GENERATION_FILES, current_summary_output
         except ModuleNotFoundError:
             self.skipTest("local interpreter lacks production dependencies")
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp); gid = "20260915-120000-abcdef123456"
             target = base / "summary_generations" / gid; target.mkdir(parents=True)
             body = b"ok"; (target / "summary.md").write_bytes(body)
-            (target / "generation_manifest.json").write_text(json.dumps({"generation_id": gid, "artifact_sha256": {"summary.md": hashlib.sha256(body).hexdigest()}}))
+            for name in REQUIRED_GENERATION_FILES - {"summary.md"}:
+                path = target / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text("{}")
+            digests = {name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in REQUIRED_GENERATION_FILES}
+            (target / "generation_manifest.json").write_text(json.dumps({"generation_id": gid, "artifact_sha256": digests}))
             (base / "summary_current.json").write_text(json.dumps({"generation_id": gid}))
             self.assertEqual(current_summary_output(base), target)
             (target / "summary.md").write_text("corrupt")

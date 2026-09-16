@@ -142,9 +142,11 @@ class DecisionState(StrictModel):
 class ActionFrame(StrictModel):
     """Actor-safe representation built before a task is projected publicly."""
     speaker: Optional[str] = None
+    reporter: Optional[str] = None
     grammatical_actor: Optional[str] = None
     mentioned_people: list[str] = Field(default_factory=list)
     beneficiary: Optional[str] = None
+    recipient: Optional[str] = None
     proposed_by: Optional[str] = None
     proposed_for: Optional[str] = None
     assignment_target: Optional[str] = None
@@ -159,7 +161,9 @@ class OutcomeCard(StrictModel):
     outcome_id: str
     topic: str
     user_need: Optional[str] = None
-    current_state: str
+    bundle_id: Optional[str] = None
+    ranges: list[dict[str, float]] = Field(default_factory=list)
+    current_state: Optional[str] = None
     issue_or_risk: Optional[str] = None
     work_result: Optional[str] = None
     next_action: Optional[str] = None
@@ -167,6 +171,25 @@ class OutcomeCard(StrictModel):
     status: str
     claim_ids: list[str] = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
+    fields: dict[str, Any] = Field(default_factory=dict)
+    verification: dict[str, Any] = Field(default_factory=dict)
+
+
+class DialogueBundleContract(StrictModel):
+    bundle_id: str
+    episode_id: str
+    thread_id: Optional[str] = None
+    topic: str
+    ranges: list[dict[str, float]] = Field(min_length=1)
+    utterances: list[dict[str, Any]] = Field(min_length=1)
+    claim_ids: list[str] = Field(min_length=1)
+    question_ids: list[str] = Field(default_factory=list)
+    task_ids: list[str] = Field(default_factory=list)
+    relations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(min_length=1)
+    context_ids: list[str] = Field(default_factory=list)
+    continuation_episode_ids: list[str] = Field(default_factory=list)
+    participants: list[str] = Field(default_factory=list)
 
 
 class PublicItemContract(StrictModel):
@@ -181,6 +204,9 @@ class PublicItemContract(StrictModel):
     lifecycle: ClaimLifecycle = ClaimLifecycle.ACTIVE
     relation_ids: list[str] = Field(default_factory=list)
     start: float = Field(0, ge=0)
+    end: Optional[float] = Field(None, ge=0)
+    episode_id: Optional[str] = None
+    action_frame: dict[str, Any] = Field(default_factory=dict)
     task_state_id: Optional[str] = None
     task_state: dict[str, Any] = Field(default_factory=dict)
     question_state: dict[str, Any] = Field(default_factory=dict)
