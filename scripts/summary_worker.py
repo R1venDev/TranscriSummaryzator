@@ -2793,6 +2793,7 @@ def render_public_document(document):
         lines.extend(["", "## Подробная хронология встречи", ""])
         cards = {card.get("outcome_id"): card for card in document.get("outcome_cards", [])}
         field_labels = {"current_state": "Состояние", "constraint": "Ограничение", "resolution": "Решение", "work_result": "Результат", "next_step": "Дальше", "remaining_unknown": "Осталось уточнить"}
+        render_tokens = lambda value: {token for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(token) > 2}
         for chapter in document["chronology"]:
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
@@ -2808,8 +2809,8 @@ def render_public_document(document):
                         if field and field.get("value"):
                             field_text = terminate_sentence(_public_text({"text": field["value"]}))
                             normalized = normalize_space(re.sub(r"[*`]", "", field_text)).casefold()
-                            normalized_tokens = context_tokens(normalized)
-                            if any(normalized_tokens and len(normalized_tokens & context_tokens(previous)) / max(1, min(len(normalized_tokens), len(context_tokens(previous)))) >= .82 for previous in rendered_values):
+                            normalized_tokens = render_tokens(normalized)
+                            if any(normalized_tokens and len(normalized_tokens & render_tokens(previous)) / max(1, min(len(normalized_tokens), len(render_tokens(previous)))) >= .82 for previous in rendered_values):
                                 continue
                             rendered_values.append(normalized)
                             rendered_fields.append(f"**{field_labels[name]}:** {field_text}")
