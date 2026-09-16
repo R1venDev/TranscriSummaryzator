@@ -130,9 +130,6 @@ class Run13PublicationRegressions(unittest.TestCase):
         claim = {"claim_id": "C1", "statement": text, "evidence_ids": ["U1"], "lifecycle": "active"}
         result = verify_generated_items([item], [self.sentence_plan("C1")], [claim])
         self.assertTrue(result["passed"], result)
-        concise = {**item, "text": "На минутном графике можно получить полную структуру с BOS."}
-        result = verify_generated_items([concise], [self.sentence_plan("C1")], [claim])
-        self.assertTrue(result["passed"], result)
 
     def test_exact_evidence_surface_numbers_and_negation_are_source_backed(self):
         text = "На минутке задержка в 2 мин — это не страшно, а на старшем ждать 8 часов больно."
@@ -143,6 +140,9 @@ class Run13PublicationRegressions(unittest.TestCase):
             "dialogue_evidence": [{"id": "U1", "text": text}],
         }
         result = verify_generated_items([item], [self.sentence_plan("C1")], [claim])
+        self.assertTrue(result["passed"], result)
+        concise = {**item, "text": "На минутном графике можно получить полную структуру с BOS."}
+        result = verify_generated_items([concise], [self.sentence_plan("C1")], [claim])
         self.assertTrue(result["passed"], result)
 
     def test_sanitized_translation_preserves_source_negation(self):
