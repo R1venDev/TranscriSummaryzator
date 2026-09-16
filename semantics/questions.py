@@ -11,6 +11,7 @@ SLOT_ALIASES = {
     "rhythmic entry success": "implementation_status",
     "rhythmic_entry_implementation": "implementation_status",
     "high_tf_result": "implementation_status", "result on higher timeframes": "implementation_status",
+    "статус работы со структурами": "implementation_status",
     "definition small imbalance": "threshold_value",
     "reversal zone bos condition": "reason_hypothesis",
     "cross day closure feasibility": "cross_day_closure",
@@ -70,7 +71,7 @@ def verify_slot_entailment(requested_slots, answer, question=None):
               re.match(r"(?iu)^\s*(?:нет|неа|(?:да[\s,!.—-]*)+|ага|угу|ну\s+ладно)\b", text) and
               answer.get("speech_act") in {"answer", "accept", "reject"}):
             entailed[original_slot] = "нет" if re.search(r"(?iu)\b(?:нет|неа)\b", text) else "да"
-        elif slot == "implementation_status" and relevant and re.search(r"(?iu)\b(?:работа\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*|задерж\w*|не\s+закончен\w*)\b", text):
+        elif slot == "implementation_status" and re.search(r"(?iu)\b(?:работа\w*|работал\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*|задерж\w*|не\s+закончен\w*)\b", text):
             entailed[original_slot] = text
         elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
             entailed[original_slot] = text

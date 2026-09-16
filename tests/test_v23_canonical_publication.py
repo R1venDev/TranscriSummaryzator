@@ -119,11 +119,15 @@ class CanonicalStateTests(unittest.TestCase):
 
     def test_proposal_with_local_other_speaker_yes_is_accepted(self):
         graph = build_meeting_graph([rec(1, "proposal", "@A предложил сделать разметчик для @B", "propose", speaker="@A", dialogue_evidence=[
+            {"id": "U0", "speaker": "@B", "text": "Да, другой план подходит.", "start": 0},
             {"id": "U1", "speaker": "@A", "text": "Мне сделать разметчик тебе?", "start": 1},
             {"id": "U2", "speaker": "@B", "text": "Да-да-да. Дальше этап апробации.", "start": 2},
         ], evidence_ids=["U1", "U2"])])
-        self.assertEqual(graph["decision_states"][0]["status"], "accepted")
-        self.assertTrue(graph["decision_states"][0]["acceptance_check"] == "entailed")
+        decision = graph["decision_states"][0]
+        self.assertEqual(decision["status"], "accepted")
+        self.assertEqual(decision["acceptance_evidence_ids"], ["U2"])
+        self.assertEqual(decision["accepted_by"], ["@B"])
+        self.assertTrue(decision["acceptance_check"] == "entailed")
 
     def test_neighboring_commitment_does_not_promote_confirmed_plan(self):
         graph = build_meeting_graph([rec(1, "proposal", "@A предложил создать разметчик для @B, чтобы экспериментировать с имбалансами", "propose", speaker="@A", dialogue_evidence=[
@@ -133,6 +137,28 @@ class CanonicalStateTests(unittest.TestCase):
         ], evidence_ids=["U1", "U2"])])
         self.assertEqual(graph["decision_states"][0]["status"], "accepted")
         self.assertEqual(graph["task_states"], [])
+
+    def test_reported_plan_does_not_assign_the_reporter(self):
+        graph = build_meeting_graph([rec(1, "action", "@B / @C проанализирует рынок и разметит данные", "commit", speaker="@A", assignees=["@A"], commitment_strength="implicit", verification_status="verification_unavailable")])
+        task = graph["task_states"][0]
+        self.assertIsNone(task["owner"])
+        self.assertEqual(task["assignees"], [])
+        self.assertEqual(task["action_frame"]["state"], "reported_plan")
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        item = next(value for value in build_public_items(graph, planned) if value["section"] == "requires_verification")
+        self.assertTrue(item["text"].startswith("По словам @A, один из @B или @C"))
+
+    def test_structure_status_answer_closes_question_and_minutes(self):
+        graph = build_meeting_graph([
+            rec(1, "question", "Со структурами полностью закончили?", "ask", speaker="@A", requested_slots=["статус работы со структурами"], answer_record_ids=["F2", "F3"], question_status="answered"),
+            rec(2, "problem", "На старших таймфреймах остаётся задержка", "answer", speaker="@B"),
+            rec(3, "observation", "На минутном таймфрейме алгоритм работал корректно", "answer", speaker="@B"),
+        ])
+        question = graph["question_states"][0]
+        self.assertEqual(question["status"], "answered")
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        items = build_public_items(graph, planned)
+        self.assertFalse(any(item["content_kind"] == "question" for item in items))
 
     def test_unrelated_month_does_not_revise_task_scope(self):
         graph = build_meeting_graph([
@@ -207,6 +233,23 @@ class PublicationDocumentGateTests(unittest.TestCase):
         self.assertEqual(tasks[0]["task_state_id"], graph["task_states"][0]["task_id"])
         audit = verify_generated_items(items, result["public_sentence_plans"], graph["claims"])
         self.assertTrue(audit["passed"], audit)
+
+    def test_overview_must_expose_readiness_constraint_and_next_step(self):
+        report = {"audits": [{"passed": True, "errors": []}]}
+        base = {"claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "start": 1}
+        items = [
+            {**base, "public_id": "PI1", "section": "overview", "text": "На минутном таймфрейме алгоритм работал корректно", "content_kind": "observation", "social_state": "asserted"},
+            {**base, "public_id": "PI2", "section": "overview", "text": "На старших таймфреймах остаётся задержка", "content_kind": "problem", "social_state": "asserted"},
+            {**base, "public_id": "PI3", "section": "tasks", "text": "@A подготовит демонстрацию в TradingView", "content_kind": "action", "social_state": "self_committed", "task_state_id": "T1", "task_state": {"status": "self_committed", "deliverable": "демонстрация в TradingView", "commitment_strength": "explicit"}},
+        ]
+        incomplete = publication_audit(report, "# Встреча — Структуры\n\n## Главное\n- Обсудили структуры.\n\n## Задачи и следующие шаги\n- @A подготовит демонстрацию в TradingView", items, {})
+        self.assertEqual(incomplete["overview_missing_htf_readiness"], 1)
+        self.assertEqual(incomplete["overview_missing_htf_constraint"], 1)
+        self.assertEqual(incomplete["overview_missing_committed_next_step"], 1)
+        complete = publication_audit(report, "# Встреча — Структуры\n\n## Главное\n- На минутном таймфрейме алгоритм работал корректно.\n- На старших таймфреймах остаётся задержка.\n- @A подготовит демонстрацию в TradingView.\n\n## Задачи и следующие шаги\n- @A подготовит демонстрацию в TradingView", items, {})
+        self.assertEqual(complete["overview_missing_htf_readiness"], 0)
+        self.assertEqual(complete["overview_missing_htf_constraint"], 0)
+        self.assertEqual(complete["overview_missing_committed_next_step"], 0)
 
 
 if __name__ == "__main__":

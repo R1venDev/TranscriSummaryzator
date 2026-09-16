@@ -1470,6 +1470,16 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(accepted[0]["verification_status"], "verification_unavailable")
         self.assertEqual(accepted[0]["critical_consensus"]["reason"], "critical_correction_mismatch")
 
+    def test_question_metrics_use_canonical_final_states(self):
+        metrics = summary.canonical_question_metrics([
+            {"status": "answered"}, {"status": "answered"},
+            {"status": "partially_answered"}, {"status": "unanswered"},
+        ])
+        self.assertEqual(metrics["questions_resolved"], 2)
+        self.assertEqual(metrics["questions_partially_answered"], 1)
+        self.assertEqual(metrics["questions_unresolved"], 1)
+        self.assertEqual(metrics["question_status_counts"], {"answered": 2, "partially_answered": 1, "unanswered": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

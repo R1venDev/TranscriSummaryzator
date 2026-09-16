@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -1756,6 +1757,19 @@ def semantic_metrics(registry, facts=None):
     }
 
 
+def canonical_question_metrics(question_states):
+    """Count the canonical reducer output consumed by the final document."""
+    counts = Counter(str(item.get("status") or "unanswered") for item in question_states)
+    return {
+        "questions_resolved": sum(counts[value] for value in ("answered", "resolved")),
+        "questions_partially_answered": counts["partially_answered"],
+        "questions_tentatively_answered": counts["tentatively_answered"],
+        "questions_unresolved": sum(counts[value] for value in ("unanswered", "deferred", "requires_external_verification", "unresolved")),
+        "questions_unclear": counts["unclear"],
+        "question_status_counts": dict(sorted(counts.items())),
+    }
+
+
 def shorten_text(value, limit=260):
     text = normalize_space(value).rstrip(". ")
     if len(text) <= limit:
@@ -2600,8 +2614,9 @@ def build_public_document(items, metadata=None, graph=None):
             field = card.get("fields", {}).get(field_name)
             if not field or not field.get("value") or field.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
                 continue
-            htf_priority = 12 * bool(re.search(r"(?iu)\b(?:минутн\w*|старш\w*\s+таймфрейм\w*|четыр[её]хчасов\w*)\b", field["value"]))
-            score = htf_priority + 5 * bool(re.search(role_patterns[field_name], field["value"])) + len(field.get("evidence_ids", []))
+            htf_priority = 12 * bool(field_name in {"current_state", "constraint", "resolution"} and re.search(r"(?iu)\b(?:минутн\w*|старш\w*\s+таймфрейм\w*|четыр[её]хчасов\w*)\b", field["value"]))
+            committed_step = 15 * bool(field_name == "next_step" and re.search(r"(?iu)статус:\s*(?:участник\s+взял\s+на\s+себя|согласовано|назначено)", field["value"]))
+            score = htf_priority + committed_step + 5 * bool(re.search(role_patterns[field_name], field["value"])) + len(field.get("evidence_ids", []))
             candidates.append((score, field))
         for _score, field in sorted(candidates, key=lambda value: value[0], reverse=True):
             if field["value"] not in {x["text"] for x in overview}:
@@ -4521,6 +4536,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     atomic_json(run_dir / "summary_plan.json", summary_plan)
     public_items = build_public_items(state_v2, summary_plan)
     question_states = state_v2.get("question_states", [])
+    semantic_counts.update(canonical_question_metrics(question_states))
     semantic_counts.update({
         "retrieved_question_count": len(question_states),
         "resolved_question_count": sum(q.get("status") in {"answered", "rhetorical", "superseded"} for q in question_states),

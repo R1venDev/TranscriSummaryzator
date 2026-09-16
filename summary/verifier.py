@@ -137,6 +137,12 @@ def build_public_items(meeting_graph, summary_plan):
         if claim.get("verification_status") == "verification_unavailable" and claim.get("content_kind") in {"action", "follow_up", "resource", "decision"}:
             text = str(claim.get("statement") or "")
             if not re.search(r"(?iu)\b(?:шутк|dow\s*jones|s&p|столет|тысячелет)\w*", text):
+                task_state = task_states.get(claim.get("canonical_task_state_id"), {})
+                frame = task_state.get("action_frame", {})
+                if frame.get("state") == "reported_plan" and frame.get("reporter"):
+                    text = re.sub(r"(@[\w.-]+)\s*/\s*(@[\w.-]+)", r"один из \1 или \2", text)
+                    if frame["reporter"] not in text:
+                        text = f"По словам {frame['reporter']}, {text[:1].lower() + text[1:]}"
                 add("requires_verification", claim, "needs_verification", text=text)
 
     def attributed_text(claim):
@@ -259,6 +265,8 @@ def build_public_items(meeting_graph, summary_plan):
     seen_minutes = set()
     for claim in sorted(selected("minutes"), key=lambda x: (float(x.get("start", 0)), x.get("claim_id", ""))):
         if claim.get("verification_status") == "verification_unavailable":
+            continue
+        if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") in {"answered", "rhetorical", "superseded"}:
             continue
         key = (claim.get("proposition_id"), claim.get("social_state"), tuple(claim.get("evidence_ids", [])))
         if key not in seen_minutes:
@@ -522,7 +530,8 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     title_line = next((line for line in artifact_text.splitlines() if line.startswith("# ")), "")
     authored_title = title_line.split("—", 1)[-1]
     overview_match = re.search(r"(?s)## (?:Главное|Краткое описание[^\n]*)\n(.*?)(?=\n## |\Z)", artifact_text)
-    authored_surface = authored_title + "\n" + (overview_match.group(1) if overview_match else "")
+    authored_overview = overview_match.group(1) if overview_match else ""
+    authored_surface = authored_title + "\n" + authored_overview
     allowed_document_numbers = {x.replace(" ", "") for item in items for x in NUMBER_RE.findall(str(item.get("text") or ""))}
     found_document_numbers = {x.replace(" ", "") for x in NUMBER_RE.findall(authored_surface)}
     state_conflicts = sum(bool(
@@ -544,10 +553,32 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     double_modality = re.compile(r"(?iu)\b(?:предлагалось|предложено)\b.{0,40}\b(?:договорились|решили|принято)\b")
     mixed_token = re.compile(r"(?iu)\b(?:[а-яё]+[a-z]+|[a-z]+[а-яё]+)\b")
     readability_lint = sum(bool(dangling.search(str(x.get("text") or "").strip()) or double_modality.search(str(x.get("text") or "")) or mixed_token.search(str(x.get("text") or ""))) for x in items)
+    overview_surface = re.sub(r"[*`]", "", authored_overview).casefold()
+    overview_surface_tokens = tokens(overview_surface)
+    readiness_available = any(
+        re.search(r"(?iu)минутн\w*\s+таймфрейм", str(x.get("text") or ""))
+        and re.search(r"(?iu)\b(?:работал\w*|корректн\w*|готов\w*)\b", str(x.get("text") or ""))
+        for x in items
+    )
+    higher_tf_constraint_available = any(
+        re.search(r"(?iu)старш\w*\s+таймфрейм", str(x.get("text") or ""))
+        and re.search(r"(?iu)\bзадерж\w*\b", str(x.get("text") or ""))
+        for x in items
+    )
+    confirmed_tasks = [
+        x for x in items
+        if x.get("section") == "tasks" and x.get("social_state") in {"accepted", "self_committed", "assigned", "completed"}
+    ]
+    overview_has_committed_next_step = any(
+        bool(task_words := tokens(task.get("text")))
+        and len(task_words & overview_surface_tokens) / max(1, min(len(task_words), len(overview_surface_tokens))) >= .45
+        for task in confirmed_tasks
+    )
     counters.update({
         "duplicate_items": duplicates,
         "cross_view_repetitions": cross_view_repetitions,
         "answered_questions_published_as_open": sum(x.get("section") == "questions" and x.get("question_state", {}).get("status") in {"answered", "rhetorical", "superseded"} for x in items),
+        "answered_questions_in_minutes": sum(x.get("section") == "minutes" and x.get("content_kind") == "question" and x.get("question_state", {}).get("status") in {"answered", "rhetorical", "superseded"} for x in items),
         "unconfirmed_tasks_published_as_committed": sum(x.get("section") == "tasks" and x.get("social_state") == "self_committed" and x.get("task_state", {}).get("commitment_strength") != "explicit" for x in items),
         "duplicate_task_states": len([x for x in task_ids if x]) - len({x for x in task_ids if x}),
         "chronology_inversions": sum(a > b for a, b in zip(minute_starts, minute_starts[1:])),
@@ -563,6 +594,20 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "readability_lint_failures": readability_lint,
         "task_without_deliverable": sum(x.get("section") == "tasks" and not str(x.get("task_state", {}).get("deliverable") or "").strip() for x in items),
         "vague_focus_tasks": sum(x.get("section") == "tasks" and bool(re.search(r"(?iu)\b(?:сделать\s+упор|сосредоточиться|ещ[её]\s+над\s+этим\s+посидеть)\b", str(x.get("text") or ""))) for x in items),
+        "reported_plan_assignee_leaks": sum(
+            x.get("task_state", {}).get("action_frame", {}).get("state") == "reported_plan"
+            and bool(x.get("task_state", {}).get("owner") or x.get("task_state", {}).get("assignee") or x.get("task_state", {}).get("assignees"))
+            for x in items
+        ),
+        "overview_missing_htf_readiness": int(readiness_available and not (
+            re.search(r"(?iu)минутн\w*\s+таймфрейм", overview_surface)
+            and re.search(r"(?iu)\b(?:работал\w*|корректн\w*|готов\w*)\b", overview_surface)
+        )),
+        "overview_missing_htf_constraint": int(higher_tf_constraint_available and not (
+            re.search(r"(?iu)старш\w*\s+таймфрейм", overview_surface)
+            and re.search(r"(?iu)\bзадерж\w*\b", overview_surface)
+        )),
+        "overview_missing_committed_next_step": int(bool(confirmed_tasks) and not overview_has_committed_next_step),
         "overview_task_overlap": (len(overview_tokens & task_tokens) / max(1, len(overview_tokens))) if overview_tokens else 0,
         # Overview items are intentionally merged into prose paragraphs rather
         # than rendered one bullet per PublicItem.
@@ -587,7 +632,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
     counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0

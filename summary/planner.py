@@ -7,7 +7,7 @@ from summary.policy import TECHNICAL_KINDS
 
 TECHNICAL = set(TECHNICAL_KINDS)
 VIEW_KINDS = {
-    "executive": {"decision", "proposal", "current_state", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
+    "executive": {"decision", "proposal", "current_state", "observation", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
     "technical": TECHNICAL, "tasks": {"action", "follow_up"},
     "experiments": {"hypothesis", "experimental_result", "metric"},
     "questions": {"question", "blocker", "schedule"}, "minutes": set(),
@@ -46,7 +46,13 @@ def _utility(claim, score_fn, view):
     no_deliverable = _kind(claim) in {"action", "follow_up"} and not re.search(r"(?iu)\b(?:показ|переда|отправ|сдела|размет|провер|исправ|встро|подготов)\w*", text)
     raw_slot = bool(re.search(r"(?u)\b[a-z]+_[a-z_]+\b", text))
     penalty = 4 * definition_only + 8 * non_work + 4 * no_deliverable + 8 * raw_slot + 4 * (claim.get("verification_status") == "verification_unavailable")
-    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + 2 * (1-risk) + 2 * _mandatory(claim) + closing_schedule - penalty
+    executive_priority = 0
+    if view == "executive":
+        if re.search(r"(?iu)\bминутн\w*\b.*\b(?:работ\w*|корректн\w*|структур\w*)\b", text):
+            executive_priority += 30
+        if re.search(r"(?iu)\bстарш\w*\s+таймфрейм\w*\b.*\bзадерж\w*\b", text):
+            executive_priority += 30
+    return float(score_fn(claim)) + VIEW_BOOST[view].get(_kind(claim), 0) + executive_priority + 2 * (1-risk) + 2 * _mandatory(claim) + closing_schedule - penalty
 
 
 def _select(claims, score_fn, view, budget):
