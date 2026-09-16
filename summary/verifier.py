@@ -29,6 +29,7 @@ def sanitize_public_surface(text):
     value = re.sub(r"(?iu)^Discussed\s+potential\s+goal:\s*creating\s+a\s+baseline\s+solution\s+with\s+winrate\s+around\s+30\s*[–—-]\s*40%\.?$", "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.", value)
     value = re.sub(r"(?iu)^(@[\w.-]+)\s+asks\s+for\s+clarification\s+on\s+what\s+constitutes\s+a\s+['\"]?small['\"]?\s+imbalance\s+in\s+context\.?$", r"\1 уточняет, что считать малым имбалансом.", value)
     value = re.sub(r"(?iu)^(@[\w.-]+)\s+suggests\s+returning\s+to\s+algorithmic\s+thinking\s+and\s+potentially\s+incorporating\s+higher\s+timeframes\s+if\s+the\s+current\s+approach\s+does\s+not\s+yield\s+results\.?$", r"Если текущий подход не даст результата, \1 предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы.", value)
+    value = re.sub(r"(?iu)\bBOS\s*\(\s*Break\s+of\s+Structure\s*\)", "BOS (слом структуры)", value)
     value = re.sub(r"(?iu)\bSM\s*\(\s*Structure\s+Maker\s*\)", "SM", value)
     value = re.sub(r"(?iu)\bbaseline\b", "ориентир", value)
     value = re.sub(r"(?iu)\bсвичных\b", "свечных", value)
@@ -420,9 +421,19 @@ def verify_generated_items(items, sentence_plans, claims):
         # Complete the source-derived contract before auditing the realization.
         # Previously these fields were appended after audit_realization(), so
         # verbatim source negation and source numbers could be rejected as new.
-        merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(str(x.get("statement") or "") for x in cited)))
+        exact_source_surfaces = []
+        for source in cited:
+            exact_ids = set(source.get("evidence_ids", []))
+            exact_turns = [
+                str(turn.get("text") or "") for turn in source.get("dialogue_evidence", [])
+                if turn.get("id") in exact_ids
+            ]
+            exact_source_surfaces.append(" ".join([
+                str(source.get("statement") or ""), public_surface_text(source), *exact_turns,
+            ]))
+        merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(exact_source_surfaces)))
         merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
-        source_has_negation = any(NEGATION_RE.search(str(x.get("statement") or "")) for x in cited)
+        source_has_negation = any(NEGATION_RE.search(value) for value in exact_source_surfaces)
         if item.get("section") == "questions":
             # A residual question is not an assertion of its cited answer or
             # schedule state. Keep its source-backed wording and provenance
@@ -441,7 +452,7 @@ def verify_generated_items(items, sentence_plans, claims):
             realization = audit_realization(text, merged)
         if unknown_claim_ids:
             realization["errors"].append("unknown_claim")
-        source_tokens = {v for x in cited for v in re.findall(r"(?iu)[a-zа-яё0-9]+", (str(x.get("statement") or "") + " " + public_surface_text(x)).casefold()) if len(v) > 2}
+        source_tokens = {v for value in exact_source_surfaces for v in re.findall(r"(?iu)[a-zа-яё0-9]+", value.casefold()) if len(v) > 2}
         source_tokens.update(v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", metadata_text.casefold()) if len(v) > 2)
         text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", text.casefold()) if len(v) > 2}
         editorial_tokens = {"спрашивает", "исполнитель", "статус", "объём", "срок", "условие", "участник", "назначение", "ожидает", "подтверждения", "предложен", "подтверждён", "уточнено", "известно", "осталось", "уточнить", "взял", "себя"}

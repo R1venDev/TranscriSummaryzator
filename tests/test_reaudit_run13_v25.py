@@ -131,6 +131,25 @@ class Run13PublicationRegressions(unittest.TestCase):
         result = verify_generated_items([item], [self.sentence_plan("C1")], [claim])
         self.assertTrue(result["passed"], result)
 
+    def test_exact_evidence_surface_numbers_and_negation_are_source_backed(self):
+        text = "На минутке задержка в 2 мин — это не страшно, а на старшем ждать 8 часов больно."
+        item = {"section": "overview", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"]}
+        claim = {
+            "claim_id": "C1", "statement": "На минутном графике можно получить полную структуру с BOS.",
+            "evidence_ids": ["U1"], "lifecycle": "active",
+            "dialogue_evidence": [{"id": "U1", "text": text}],
+        }
+        result = verify_generated_items([item], [self.sentence_plan("C1")], [claim])
+        self.assertTrue(result["passed"], result)
+
+    def test_sanitized_translation_preserves_source_negation(self):
+        source = "@Yachoy suggests returning to algorithmic thinking and potentially incorporating higher timeframes if the current approach does not yield results."
+        text = "Если текущий подход не даст результата, @Yachoy предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы."
+        item = {"section": "minutes", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"]}
+        claim = {"claim_id": "C1", "statement": source, "evidence_ids": ["U1"], "lifecycle": "active", "speaker_refs": ["@Yachoy"]}
+        result = verify_generated_items([item], [self.sentence_plan("C1", allowed_speakers=["@Yachoy"])], [claim])
+        self.assertTrue(result["passed"], result)
+
     def test_repeated_task_actor_metadata_is_not_a_role_swap(self):
         text = "@Yachoy подготовит TradingView. — исполнитель: @Yachoy — статус: участник взял на себя"
         item = {"section": "tasks", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"],
