@@ -2569,7 +2569,10 @@ def build_public_document(items, metadata=None, graph=None):
     title = shorten_text(title, 110).rstrip(".…")
 
     chapters = []
-    for index, card in enumerate(outcome_cards, 1):
+    # Legacy callers may provide only overview items.  Their outcome fields are
+    # already rendered in ``## Главное``; emitting an empty chronology would
+    # manufacture navigation semantics without a chronological source item.
+    for index, card in enumerate(outcome_cards if minute_items else [], 1):
         ranges = card.get("ranges") or [{"start": 0, "end": 0}]
         start = min(float(value.get("start", 0)) for value in ranges)
         end = max(float(value.get("end", value.get("start", 0))) for value in ranges)
