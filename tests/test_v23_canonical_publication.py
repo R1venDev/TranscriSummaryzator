@@ -163,6 +163,17 @@ class CanonicalStateTests(unittest.TestCase):
         items = build_public_items(graph, planned)
         self.assertFalse(any(item["content_kind"] == "question" for item in items))
 
+    def test_direct_range_and_reason_answers_close_questions(self):
+        graph = build_meeting_graph([
+            rec(1, "question", "Какой диапазон имеет сессия AM?", "ask", requested_slots=["range_start", "range_end"], answer_record_ids=["F2"], question_status="answered"),
+            rec(2, "observation", "Для AM используются диапазоны с 17 до 18 и с 16:30 до 18", "answer", speaker="@B"),
+            rec(3, "question", "Почему нужно ждать две свечи?", "ask", requested_slots=["reason"], answer_record_ids=["F4"], question_status="answered"),
+            rec(4, "observation", "Чтобы свинг стал подтверждённым, нужно подождать две свечи", "answer", speaker="@B"),
+        ])
+        self.assertEqual([value["status"] for value in graph["question_states"]], ["answered", "answered"])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        self.assertFalse(any(item["section"] == "questions" for item in build_public_items(graph, planned)))
+
     def test_unrelated_month_does_not_revise_task_scope(self):
         graph = build_meeting_graph([
             rec(1, "resource", "Я передам выгрузку Bitcoin", "commit", assignees=["@A"]),

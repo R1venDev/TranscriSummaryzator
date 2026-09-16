@@ -25,6 +25,12 @@ def _field(claim, text=None):
     }
 
 
+def _near_duplicate(left, right, threshold=.82):
+    tokens = lambda value: {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 2}
+    a, b = tokens(left), tokens(right)
+    return bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= threshold)
+
+
 def build_outcome_cards(graph, allowed_claim_ids=None):
     """Produce useful topic cards whose every field has its own evidence."""
     by_claim = {item["claim_id"]: item for item in graph.get("claims", [])}
@@ -53,6 +59,9 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
                 labels = {"self_committed": "участник взял на себя", "assigned_pending": "назначение ожидает подтверждения", "assigned": "назначено", "accepted": "согласовано", "completed": "выполнено", "blocked": "заблокировано", "proposed": "предложено, не подтверждено", "idea": "идея, не подтверждена"}
                 label += f" (статус: {labels.get(task['status'], task['status'])})"
             next_field = _field(next_claim, label)
+        resolution_field = _field(resolution)
+        if resolution_field and next_field and _near_duplicate(resolution_field["value"], next_field["value"]):
+            next_field = None
         remaining = []
         for claim in claims:
             question = question_by_prop.get(claim.get("proposition_id"))
@@ -68,7 +77,7 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
                     })
         fields = {
             "current_state": _field(state), "constraint": _field(constraint),
-            "resolution": _field(resolution), "work_result": _field(work),
+            "resolution": resolution_field, "work_result": _field(work),
             "next_step": next_field, "remaining_unknown": remaining,
         }
         populated = [value for key, value in fields.items() if value and key != "remaining_unknown"]

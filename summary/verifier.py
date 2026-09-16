@@ -259,6 +259,13 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in selected("experiments"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
+        experiment_text = str(claim.get("statement") or "")
+        goal_only = bool(
+            re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", experiment_text)
+            and not re.search(r"(?iu)\b(?:проверить|протестировать|обучить|эксперимент|гипотез|предсказывать|детектировать)\b", experiment_text)
+        )
+        if goal_only:
+            continue
         if claim.get("content_kind") == "hypothesis" and re.search(r"(?iu)\b(?:нельзя|невозможно|ограничен)\b", claim.get("statement", "")):
             add("technical", claim, "constraint", attributed_text(claim))
         else:
@@ -510,7 +517,7 @@ def verify_generated_items(items, sentence_plans, claims):
     return {"passed": all(x["passed"] for x in audits), "audits": audits, "abstentions": [x for x in audits if not x["passed"]]}
 
 
-def publication_audit(report, artifact_text, items=None, summary_plan=None, verified_hash=None):
+def publication_audit(report, artifact_text, items=None, summary_plan=None, verified_hash=None, document=None):
     items = items or []
     summary_plan = summary_plan or {}
     audits = report.get("audits", [])
@@ -641,6 +648,25 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "excessive_technical_items": int(sum(x.get("section") == "technical" and not (x.get("content_kind") == "hypothesis" and x.get("social_state") == "constraint") for x in items) > 6),
         "definition_only_technical_items": sum(x.get("section") == "technical" and bool(re.search(r"(?iu)\b(?:называется|определяется|ширина\s*[—–-]\s*ширина)\b", str(x.get("text") or ""))) for x in items),
     })
+    if document is not None:
+        contextual_sections = {"tasks", "questions", "technical", "experiments"}
+        contextual_items = [item for section, values in document.get("sections", {}).items() if section in contextual_sections for item in values]
+        counters["section_items_missing_context"] = sum(not item.get("context") for item in contextual_items)
+        counters["section_context_repetitions"] = sum(
+            bool(context.get("text")) and len(tokens(context.get("text")) & tokens(item.get("text"))) / max(1, min(len(tokens(context.get("text"))), len(tokens(item.get("text"))))) >= .72
+            for item in contextual_items for context in item.get("context", [])
+        )
+        counters["goal_only_experiments"] = sum(
+            bool(re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", str(item.get("text") or "")))
+            for item in document.get("sections", {}).get("experiments", [])
+        )
+        chronology_duplicates = 0
+        for block in re.split(r"(?m)^### ", artifact_text.split("## Подробная хронология встречи", 1)[-1] if "## Подробная хронология встречи" in artifact_text else ""):
+            values = [normalize.group(1).casefold() for line in block.splitlines() if (normalize := re.match(r"^\*\*[^*]+:\*\*\s*(.+)$", line.strip()))]
+            chronology_duplicates += len(values) - len(set(values))
+        counters["chronology_duplicate_fields"] = chronology_duplicates
+    else:
+        counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})
     counters["section_counts"] = item_counts
     counters["rendered_section_counts"] = rendered_counts
     counters["planner_overflow"] = {name: value.get("overflow_count", 0) for name, value in summary_plan.get("view_plans", {}).items()}
@@ -652,7 +678,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
     counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_items_missing_context", "section_context_repetitions", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0
@@ -661,8 +687,8 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     return {"schema": "PublicationAudit", "schema_version": 4, "passed": integrity and grounding and coverage and readability and utility, "dimensions": {"integrity": integrity, "grounding": grounding, "candidate_disposition_integrity": coverage, "readability": readability, "utility": utility}, **counters}
 
 
-def runtime_quality_gates(report, artifact_text, verified_hash=None, items=None, summary_plan=None):
-    return publication_audit(report, artifact_text, items, summary_plan, verified_hash)
+def runtime_quality_gates(report, artifact_text, verified_hash=None, items=None, summary_plan=None, document=None):
+    return publication_audit(report, artifact_text, items, summary_plan, verified_hash, document)
 
 
 def verify_public_document(document, artifact_text, items):
@@ -765,13 +791,24 @@ def verify_public_document(document, artifact_text, items):
                 if not set(field.get("evidence_ids", [])) <= evidence_for(field.get("claim_ids", [])):
                     errors.append("outcome_field_evidence_outside_closure")
                 rendered_card_block = chapter_blocks.get(card.get("outcome_id")) or section_text.get("overview", "")
-                if field.get("value") and surface(field["value"]) not in surface(rendered_card_block):
+                field_tokens = tokens(field.get("value"))
+                rendered_tokens = tokens(rendered_card_block)
+                semantically_rendered = bool(field_tokens and len(field_tokens & rendered_tokens) / len(field_tokens) >= .8)
+                if field.get("value") and surface(field["value"]) not in surface(rendered_card_block) and not semantically_rendered:
                     errors.append("outcome_field_not_rendered")
     for section, section_items in document.get("sections", {}).items():
         for item in section_items:
             target_words = tokens(section_text.get(section, ""))
-            if item not in items or len(tokens(item.get("text")) - target_words) > 2:
+            original = next((source for source in items if source.get("public_id") == item.get("public_id")), None)
+            if not original or original.get("text") != item.get("text") or len(tokens(item.get("text")) - target_words) > 2:
                 errors.append("section_not_rendered_from_verified_items")
+            for context in item.get("context", []):
+                if not context.get("claim_ids") or not set(context["claim_ids"]) <= source_ids or not context.get("evidence_ids"):
+                    errors.append("unsupported_section_context")
+                if not set(context.get("evidence_ids", [])) <= evidence_for(context.get("claim_ids", [])):
+                    errors.append("section_context_evidence_outside_closure")
+                if surface(context.get("text")) not in surface(section_text.get(section, "")):
+                    errors.append("section_context_not_rendered")
     chronology_ids = {item.get("public_id") for chapter in document.get("chronology", []) for item in chapter.get("items", [])}
     minute_ids = {item.get("public_id") for item in items if item.get("section") == "minutes"}
     if chronology_ids != minute_ids:

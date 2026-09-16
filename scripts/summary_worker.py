@@ -44,7 +44,7 @@ from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_verified_document, project_views
 from summary.outcomes import build_outcome_cards
-from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
+from summary.verifier import audit_realization, build_public_items, diff_public_items, has_english_prose, public_surface_text, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
@@ -2598,6 +2598,61 @@ def build_public_document(items, metadata=None, graph=None):
         })
         covered_claims.update(item.get("claim_ids", []))
 
+    # Section bullets stay concise, while one evidence-bound related statement
+    # supplies the local "why / what this is about" context requested by a
+    # reader who should not have to replay the recording for every item.
+    graph_claims = (graph or {}).get("claims", [])
+    graph_by_source = {claim.get("source_record_id"): claim for claim in graph_claims if claim.get("source_record_id")}
+    contextual_sections = {"tasks", "questions", "technical", "experiments"}
+
+    def context_tokens(value):
+        return {token for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(token) > 2}
+
+    def context_duplicate(left, right, threshold=.72):
+        a, b = context_tokens(left), context_tokens(right)
+        return bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= threshold)
+
+    def context_node(text, claim_ids, evidence_ids, score):
+        value = sanitize_public_surface(text)
+        if not value or has_english_prose(value):
+            return None
+        return {"text": value, "claim_ids": list(dict.fromkeys(claim_ids)),
+                "evidence_ids": list(dict.fromkeys(evidence_ids)), "_score": score}
+
+    def item_context(item):
+        if item.get("section") not in contextual_sections:
+            return []
+        candidates = []
+        question = item.get("question_state", {})
+        for index, record_id in enumerate(question.get("answer_record_ids", [])):
+            claim = graph_by_source.get(record_id)
+            if claim:
+                node = context_node(public_surface_text(claim), [claim.get("claim_id")], claim.get("evidence_ids", []), 120 - index)
+                if node: candidates.append(node)
+        related_cards = [card for card in outcome_cards if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
+        for card in related_cards:
+            for raw in card.get("fields", {}).values():
+                for field in raw if isinstance(raw, list) else [raw] if raw else []:
+                    node = context_node(field.get("value"), field.get("claim_ids", []), field.get("evidence_ids", []), 80)
+                    if node: candidates.append(node)
+            for claim_id in card.get("claim_ids", []):
+                for related in items_by_claim.get(claim_id, []):
+                    node = context_node(_public_text(related), related.get("claim_ids", []), related.get("evidence_ids", []), 70 + utility(related))
+                    if node: candidates.append(node)
+        for related in items:
+            if related.get("public_id") == item.get("public_id") or related.get("episode_id") != item.get("episode_id"):
+                continue
+            node = context_node(_public_text(related), related.get("claim_ids", []), related.get("evidence_ids", []), 40 + utility(related))
+            if node: candidates.append(node)
+        valid = [node for node in candidates
+                 if node.get("claim_ids") and node.get("evidence_ids")
+                 and not context_duplicate(node["text"], _public_text(item))]
+        if not valid:
+            return []
+        best = max(valid, key=lambda node: (node["_score"], len(node["evidence_ids"]), -len(node["text"])))
+        best.pop("_score", None)
+        return [best]
+
     # Overview roles are selected from different semantic needs, not a global
     # lexical score.  This keeps state, constraint and next action distinct.
     overview = []
@@ -2680,11 +2735,21 @@ def build_public_document(items, metadata=None, graph=None):
         if not members:
             continue
         chapters.append({"chapter_id": f"CH{len(chapters)+1:02d}", "label": members[0]["label"], "start": min(x["start"] for x in members), "end": max(max(x["end"], x["start"] + .001) for x in members), "ranges": [value for x in members for value in x["ranges"]], "claim_ids": list(dict.fromkeys(value for x in members for value in x["claim_ids"])), "evidence_ids": list(dict.fromkeys(value for x in members for value in x["evidence_ids"])), "items": list({item["public_id"]: item for x in members for item in x["items"]}.values()), "outcome_id": members[0]["outcome_id"], "outcome_ids": [value for x in members for value in x["outcome_ids"]]})
+    document_sections = {}
+    for section, section_items in by_section.items():
+        if section in {"overview", "minutes"}:
+            continue
+        document_sections[section] = []
+        for item in section_items:
+            rendered = dict(item)
+            if section in contextual_sections:
+                rendered["context"] = item_context(item)
+            document_sections[section].append(rendered)
     return {
-        "schema": "VerifiedDocument", "schema_version": 4,
+        "schema": "VerifiedDocument", "schema_version": 5,
         "title": {"text": title, "claim_ids": list(dict.fromkeys(claim for item in title_sources for claim in item.get("claim_ids", []))), "evidence_ids": list(dict.fromkeys(evidence for item in title_sources for evidence in item.get("evidence_ids", [])))},
         "overview": overview,
-        "sections": {key: value for key, value in by_section.items() if key not in {"overview", "minutes"}},
+        "sections": document_sections,
         "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "ranges", "claim_ids", "evidence_ids", "outcome_id", "outcome_ids")} for chapter in chapters],
         "chronology": chapters, "outcome_cards": outcome_cards,
         "metadata": dict(metadata),
@@ -2721,6 +2786,9 @@ def render_public_document(document):
             stamp = time_link(float(item.get("start", 0)), total_seconds, job_id, base_url)
             qualifier = " (проверка недоступна; не подтверждено как договорённость)" if section == "requires_verification" else ""
             lines.append(f"- **{prefixes[section]}-{index:02d}.** {_public_text(item)}{qualifier} {stamp}")
+            context_label = {"questions": "Связанный контекст", "technical": "Практический контекст", "experiments": "Контекст гипотезы"}.get(section, "Контекст")
+            for context in item.get("context", []):
+                lines.append(f"  - **{context_label}:** {terminate_sentence(context['text'])}")
     if document.get("chronology"):
         lines.extend(["", "## Подробная хронология встречи", ""])
         cards = {card.get("outcome_id"): card for card in document.get("outcome_cards", [])}
@@ -2730,6 +2798,7 @@ def render_public_document(document):
             end = display_time(chapter["end"], total_seconds)
             lines.extend([f"### {start}–{end} — {chapter['label']}", ""])
             rendered_fields = []
+            rendered_values = []
             chapter_cards = [cards[value] for value in chapter.get("outcome_ids", [chapter.get("outcome_id")]) if value in cards]
             for card in chapter_cards:
                 for name in ("current_state", "constraint", "resolution", "work_result", "next_step", "remaining_unknown"):
@@ -2737,7 +2806,12 @@ def render_public_document(document):
                     values = value if isinstance(value, list) else [value] if value else []
                     for field in values:
                         if field and field.get("value"):
-                            rendered_fields.append(f"**{field_labels[name]}:** {terminate_sentence(_public_text({'text': field['value']}))}")
+                            field_text = terminate_sentence(_public_text({"text": field["value"]}))
+                            normalized = normalize_space(re.sub(r"[*`]", "", field_text)).casefold()
+                            if normalized in rendered_values:
+                                continue
+                            rendered_values.append(normalized)
+                            rendered_fields.append(f"**{field_labels[name]}:** {field_text}")
             if rendered_fields:
                 lines.extend(rendered_fields)
             covered = {claim for card in chapter_cards for value in card.get("fields", {}).values() for field in (value if isinstance(value, list) else [value] if value else []) for claim in field.get("claim_ids", [])}
@@ -4581,7 +4655,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         persist_publication_failure("public_document_verification", document_verification)
         raise RuntimeError("Final PublicDocument verification rejected publication")
     verified_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
-    quality_gates = runtime_quality_gates(post_render_audit, markdown, verified_hash, public_items, summary_plan)
+    quality_gates = runtime_quality_gates(post_render_audit, markdown, verified_hash, public_items, summary_plan, final_document)
     actual_output_audit = post_render_audit
     final_document["public_items"] = public_items
     final_document["verification"] = document_verification

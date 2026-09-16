@@ -6,6 +6,7 @@ import re
 SLOT_ALIASES = {
     "closing": "yes_no", "decision": "yes_no", "possibility": "yes_no",
     "диапазон времени": "time_range", "exact_time": "exact_time",
+    "range start": "time_range", "range end": "time_range",
     "time alternatives": "time_alternatives", "варианты времени": "time_alternatives",
     "should_misha_make_orderblock_labeler": "actor_commitment",
     "rhythmic entry success": "implementation_status",
@@ -13,7 +14,7 @@ SLOT_ALIASES = {
     "high_tf_result": "implementation_status", "result on higher timeframes": "implementation_status",
     "статус работы со структурами": "implementation_status",
     "definition small imbalance": "threshold_value",
-    "reversal zone bos condition": "reason_hypothesis",
+    "reason": "reason_hypothesis", "reversal zone bos condition": "reason_hypothesis",
     "cross day closure feasibility": "cross_day_closure",
     "cross_day_closure_feasibility": "cross_day_closure",
 }
@@ -73,7 +74,7 @@ def verify_slot_entailment(requested_slots, answer, question=None):
             entailed[original_slot] = "нет" if re.search(r"(?iu)\b(?:нет|неа)\b", text) else "да"
         elif slot == "implementation_status" and re.search(r"(?iu)\b(?:работа\w*|работал\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*|задерж\w*|не\s+закончен\w*)\b", text):
             entailed[original_slot] = text
-        elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
+        elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*|чтобы)\b", text):
             entailed[original_slot] = text
         elif slot == "cross_day_closure" and re.search(r"(?iu)\b(?:автоматическ\w*\s+)?закрыва\w*\b", text) and re.search(r"(?iu)(?:после\s+00(?:\s*:\s*00)?\b|полуноч\w*|следующ\w*\s+д(?:ень|ня))", text):
             entailed[original_slot] = text

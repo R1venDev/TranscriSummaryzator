@@ -99,6 +99,32 @@ class Run13PublicationRegressions(unittest.TestCase):
         document["outcome_cards"][0]["fields"]["current_state"]["value"] = "Выдуманное состояние"
         self.assertFalse(verify_public_document(document, artifact, [item])["passed"])
 
+    def test_contextual_sections_render_evidence_bound_explanations(self):
+        task = {"public_id": "PI1", "section": "tasks", "text": "@A подготовит демонстрацию", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "action", "social_state": "self_committed", "start": 10, "end": 11, "episode_id": "E1"}
+        hypothesis = {"public_id": "PI2", "section": "experiments", "text": "Демонстрация нужна для проверки точки входа", "claim_ids": ["C2"], "evidence_ids": ["U2"], "source_word_ids": ["W2"], "content_kind": "hypothesis", "social_state": "candidate", "start": 9, "end": 10, "episode_id": "E1"}
+        document = build_public_document([task, hypothesis])
+        self.assertEqual(document["sections"]["tasks"][0]["context"][0]["text"], hypothesis["text"])
+        self.assertEqual(document["sections"]["experiments"][0]["context"][0]["text"], task["text"])
+        artifact = render_public_document(document)
+        self.assertIn("  - **Контекст:**", artifact)
+        self.assertIn("  - **Контекст гипотезы:**", artifact)
+        self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
+
+    def test_goal_only_claim_is_not_labeled_as_experiment(self):
+        graph = build_meeting_graph([rec(1, "hypothesis", "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%")])
+        result = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
+        self.assertFalse(any(item["section"] == "experiments" for item in build_public_items(graph, result)))
+
+    def test_outcome_card_does_not_repeat_resolution_as_next_step(self):
+        graph = {
+            "claims": [{"claim_id": "C1", "proposition_id": "P1", "content_kind": "proposal", "statement": "Можно проверить точку входа", "publication_text": "Можно проверить точку входа", "decision_status": "accepted", "evidence_ids": ["U1"]}],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Точка входа", "claim_ids": ["C1"], "ranges": [{"start": 1, "end": 2}]}],
+            "task_states": [], "question_states": [],
+        }
+        card = build_outcome_cards(graph)[0]
+        self.assertEqual(card["fields"]["resolution"]["value"], "Можно проверить точку входа")
+        self.assertIsNone(card["fields"]["next_step"])
+
     def test_chapter_uses_episode_end(self):
         item = {"public_id": "PI1", "section": "minutes", "text": "Сервис работает", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "current_state", "social_state": "candidate", "start": 10, "end": 18, "episode_id": "E1"}
         chapter = build_public_document([item])["chronology"][0]
