@@ -16,7 +16,10 @@ ROLE_RELATION_RE = re.compile(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|�
 
 
 def role_relations(text):
-    return {(left, right) for left, right in ROLE_RELATION_RE.findall(str(text or ""))}
+    # Repeating the same actor in a rendered metadata suffix (for example,
+    # ``@A подготовит … — исполнитель: @A``) is not a role relation.  Only a
+    # pair of distinct people can demonstrate an actor/recipient swap.
+    return {(left, right) for left, right in ROLE_RELATION_RE.findall(str(text or "")) if left != right}
 
 
 @dataclass(frozen=True)
@@ -365,15 +368,9 @@ def verify_generated_items(items, sentence_plans, claims):
             metadata_text += " " + " ".join(map(str, question_state.get("missing_slot_labels", [])))
             merged["polarity"] = []  # Question-state labels are not predicate polarity.
         cited = [by_claim[x] for x in claim_ids]
-        allowed_evidence = {value for source in cited for value in source.get("evidence_ids", [])}
-        allowed_evidence.update(task_state.get("evidence_ids", []))
-        allowed_evidence.update(question_state.get("answer_evidence_ids", []))
-        allowed_evidence.update(question_state.get("residual_support", []))
-        if not set(item.get("evidence_ids", [])) <= allowed_evidence:
-            realization = audit_realization(text, merged)
-            realization["errors"].append("evidence_outside_closure")
-        else:
-            realization = audit_realization(text, merged)
+        # Complete the source-derived contract before auditing the realization.
+        # Previously these fields were appended after audit_realization(), so
+        # verbatim source negation and source numbers could be rejected as new.
         merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(str(x.get("statement") or "") for x in cited)))
         merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
         source_has_negation = any(NEGATION_RE.search(str(x.get("statement") or "")) for x in cited)
@@ -384,6 +381,15 @@ def verify_generated_items(items, sentence_plans, claims):
             merged["polarity"] = []
         elif source_has_negation and "negative" not in merged["polarity"]:
             merged["polarity"].append("negative")
+        allowed_evidence = {value for source in cited for value in source.get("evidence_ids", [])}
+        allowed_evidence.update(task_state.get("evidence_ids", []))
+        allowed_evidence.update(question_state.get("answer_evidence_ids", []))
+        allowed_evidence.update(question_state.get("residual_support", []))
+        if not set(item.get("evidence_ids", [])) <= allowed_evidence:
+            realization = audit_realization(text, merged)
+            realization["errors"].append("evidence_outside_closure")
+        else:
+            realization = audit_realization(text, merged)
         if unknown_claim_ids:
             realization["errors"].append("unknown_claim")
         source_tokens = {v for x in cited for v in re.findall(r"(?iu)[a-zа-яё0-9]+", str(x.get("statement") or "").casefold()) if len(v) > 2}

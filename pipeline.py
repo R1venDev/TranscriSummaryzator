@@ -500,6 +500,17 @@ def current_summary_generation_id(base):
         return None
 
 
+def current_release_commit():
+    """Return the checked-out release before consulting a deployment hint."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return os.environ.get("TRANSCRISUMMARY_GIT_COMMIT", "").strip() or None
+
+
 def profile_path(profile_id):
     if not profile_id or any(character not in "0123456789abcdef" for character in profile_id) or len(profile_id) != 32:
         raise ValueError("Профиль не найден")
@@ -2039,7 +2050,7 @@ def process_summary(job_id, force=False):
                 pass
         envelope = {
             "schema_version": 1, "job_id": job_id, "attempt_id": summary_run_id,
-            "attempted_commit": os.environ.get("TRANSCRISUMMARY_GIT_COMMIT"),
+            "attempted_commit": current_release_commit(),
             "attempt_status": status, "failure_stage": "post_render_verification" if rejected else ("summary_worker" if failure else None),
             "failure_code": failure, "failure_items": rejected,
             "displayed_generation_id": manifest.get("generation_id"),

@@ -12,7 +12,7 @@ from semantics.entities import EntityRegistry
 from semantics.meeting_graph import build_meeting_graph
 from semantics.propositions import proposition_from_record
 from summary.planner import plan
-from summary.verifier import build_public_items, verify_public_document
+from summary.verifier import build_public_items, verify_generated_items, verify_public_document
 
 
 def rec(number, kind, statement, act="assert", **extra):
@@ -71,6 +71,17 @@ class Run13SemanticRegressions(unittest.TestCase):
 
 
 class Run13PublicationRegressions(unittest.TestCase):
+    @staticmethod
+    def sentence_plan(claim_id, **extra):
+        value = {
+            "claim_ids": [claim_id], "relation_ids": [], "allowed_numbers": [],
+            "allowed_relation_markers": [], "allowed_speakers": [],
+            "allowed_assignees": [], "polarity": ["positive"],
+            "modality": ["certain"], "conditions": [], "time_scope": [],
+        }
+        value.update(extra)
+        return value
+
     def test_public_contract_matches_runtime_fields(self):
         graph = build_meeting_graph([rec(1, "action", "Я подготовлю отчёт", "commit", assignees=["@A"])])
         result = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
@@ -111,6 +122,25 @@ class Run13PublicationRegressions(unittest.TestCase):
             self.assertEqual(current_summary_generation_id(base), gid)
             (base / "summary_current.json").write_text(json.dumps({"generation_id": "../unsafe"}))
             self.assertIsNone(current_summary_generation_id(base))
+
+    def test_verbatim_source_negation_is_not_rejected(self):
+        text = "Если сделка не дошла до Take Profit, она закрывается автоматически после 00."
+        item = {"section": "technical", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"]}
+        claim = {"claim_id": "C1", "statement": text, "evidence_ids": ["U1"], "lifecycle": "active"}
+        result = verify_generated_items([item], [self.sentence_plan("C1")], [claim])
+        self.assertTrue(result["passed"], result)
+
+    def test_repeated_task_actor_metadata_is_not_a_role_swap(self):
+        text = "@Yachoy подготовит TradingView. — исполнитель: @Yachoy — статус: участник взял на себя"
+        item = {"section": "tasks", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"],
+                "task_state_id": "T1", "social_state": "self_committed",
+                "task_state": {"assignee": "@Yachoy", "evidence_ids": ["U1"],
+                               "action_frame": {"state": "self_committed"}}}
+        claim = {"claim_id": "C1", "statement": "@Yachoy подготовит TradingView.",
+                 "evidence_ids": ["U1"], "lifecycle": "active", "canonical_task_state_id": "T1"}
+        plan = self.sentence_plan("C1", allowed_speakers=["@Yachoy"], allowed_assignees=["@Yachoy"])
+        result = verify_generated_items([item], [plan], [claim])
+        self.assertTrue(result["passed"], result)
 
 
 if __name__ == "__main__":
