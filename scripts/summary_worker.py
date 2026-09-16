@@ -2808,7 +2808,8 @@ def render_public_document(document):
                         if field and field.get("value"):
                             field_text = terminate_sentence(_public_text({"text": field["value"]}))
                             normalized = normalize_space(re.sub(r"[*`]", "", field_text)).casefold()
-                            if normalized in rendered_values:
+                            normalized_tokens = context_tokens(normalized)
+                            if any(normalized_tokens and len(normalized_tokens & context_tokens(previous)) / max(1, min(len(normalized_tokens), len(context_tokens(previous)))) >= .82 for previous in rendered_values):
                                 continue
                             rendered_values.append(normalized)
                             rendered_fields.append(f"**{field_labels[name]}:** {field_text}")

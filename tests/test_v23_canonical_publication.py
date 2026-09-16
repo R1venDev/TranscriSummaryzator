@@ -93,6 +93,8 @@ class CanonicalStateTests(unittest.TestCase):
     def test_vague_focus_intention_is_not_a_task(self):
         graph = build_meeting_graph([rec(1, "action", "Меньше условно часть ИИ пилить и сделать упор на это", "commit", assignees=["@A"], commitment_strength="implicit")])
         self.assertEqual(graph["task_states"], [])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        self.assertFalse(any(item["section"] == "minutes" for item in build_public_items(graph, planned)))
 
     def test_cross_day_rule_closes_question(self):
         graph = build_meeting_graph([

@@ -111,7 +111,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
 
     def test_goal_only_claim_is_not_labeled_as_experiment(self):
-        graph = build_meeting_graph([rec(1, "hypothesis", "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%")])
+        graph = build_meeting_graph([rec(1, "hypothesis", "Discussed potential goal: creating a baseline solution with winrate around 30–40%.")])
         result = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
         self.assertFalse(any(item["section"] == "experiments" for item in build_public_items(graph, result)))
 

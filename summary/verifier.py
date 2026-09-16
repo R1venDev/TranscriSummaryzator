@@ -259,7 +259,7 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in selected("experiments"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
-        experiment_text = str(claim.get("statement") or "")
+        experiment_text = public_surface_text(claim)
         goal_only = bool(
             re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", experiment_text)
             and not re.search(r"(?iu)\b(?:проверить|протестировать|обучить|эксперимент|гипотез|предсказывать|детектировать)\b", experiment_text)
@@ -663,7 +663,12 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         chronology_duplicates = 0
         for block in re.split(r"(?m)^### ", artifact_text.split("## Подробная хронология встречи", 1)[-1] if "## Подробная хронология встречи" in artifact_text else ""):
             values = [normalize.group(1).casefold() for line in block.splitlines() if (normalize := re.match(r"^\*\*[^*]+:\*\*\s*(.+)$", line.strip()))]
-            chronology_duplicates += len(values) - len(set(values))
+            for index, value in enumerate(values):
+                value_tokens = tokens(value)
+                chronology_duplicates += any(
+                    value_tokens and len(value_tokens & tokens(previous)) / max(1, min(len(value_tokens), len(tokens(previous)))) >= .82
+                    for previous in values[:index]
+                )
         counters["chronology_duplicate_fields"] = chronology_duplicates
     else:
         counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})

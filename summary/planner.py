@@ -57,6 +57,8 @@ def _utility(claim, score_fn, view):
 
 def _select(claims, score_fn, view, budget):
     eligible = [x for x in claims if not x.get("dialogue_only") and x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view] or (view == "tasks" and x.get("canonical_task_state_id")))]
+    if view == "minutes":
+        eligible = [x for x in eligible if not re.search(r"(?iu)\b(?:сделать\s+упор|сосредоточиться|ещ[её]\s+над\s+этим\s+посидеть)\b", str(x.get("statement") or ""))]
     if view == "technical":
         eligible = [x for x in eligible if not re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|называется|определяется)\b", str(x.get("statement") or ""))]
     if view == "tasks":
