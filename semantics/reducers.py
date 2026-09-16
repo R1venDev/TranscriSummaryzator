@@ -33,7 +33,9 @@ def _task_object_tokens(value):
 
 
 def _task_predicates(value):
-    return {match.group(0).casefold()[:5] for match in WORK_PREDICATE_RE.finditer(str(value or ""))}
+    # "разметчик" is an object (labeling tool), not the verb "размечать".
+    source = re.sub(r"(?iu)\bразметчик\w*\b", "", str(value or ""))
+    return {match.group(0).casefold()[:5] for match in WORK_PREDICATE_RE.finditer(source)}
 
 
 def _incoming(target, relations, kinds):
@@ -63,9 +65,21 @@ def _scope_value(text):
     return f"{count} {form}"
 
 
-def _source_commitment(record, owner=None):
+def _commitment_matches_statement(statement, turn_text):
+    """Require the recovered promise to express the same action, not just the same topic."""
+    statement_predicates = _task_predicates(statement)
+    turn_predicates = _task_predicates(turn_text)
+    if statement_predicates & turn_predicates:
+        return True
+    transfer = re.compile(r"(?iu)\b(?:предостав\w*|переда\w*|отправ\w*|скин\w*|кин\w*|дам|даю|отдам)\b")
+    return bool(transfer.search(str(statement or "")) and transfer.search(str(turn_text or "")))
+
+
+def _source_commitment(record, owner=None, statement=None):
     """Find a first-person promise in the exact source dialogue."""
     turns = [turn for turn in record.get("dialogue_evidence", []) if FIRST_PERSON_COMMIT_RE.search(str(turn.get("text") or ""))]
+    if statement:
+        turns = [turn for turn in turns if _commitment_matches_statement(statement, turn.get("text"))]
     if owner:
         turns = [turn for turn in turns if turn.get("speaker") == owner]
     speakers = {turn.get("speaker") for turn in turns if turn.get("speaker")}
@@ -141,11 +155,11 @@ def reduce_tasks(propositions, events, relations, records):
         prop_events = [x for x in events if x["proposition_id"] == prop["proposition_id"]]
         event = max(prop_events, key=lambda x: x.get("timestamp", 0))
         record = by_record.get(event.get("source_record_id"), {})
-        source_commitment_evidence, source_commitment_actor = _source_commitment(record)
+        source_statement = str(prop.get("statement") or "")
+        source_commitment_evidence, source_commitment_actor = _source_commitment(record, statement=source_statement)
         commitment_candidate = event["speech_act"] == "commit" or record.get("commitment_strength") in {"explicit", "implicit"} or prop["content_kind"] in {"action", "follow_up"} or bool(source_commitment_evidence)
         if not commitment_candidate:
             continue
-        source_statement = str(prop.get("statement") or "")
         if META_ACTION_RE.search(source_statement) or not WORK_PREDICATE_RE.search(source_statement):
             continue
         if event["speech_act"] == "assert" and record.get("commitment_strength") not in {"explicit", "implicit"} and not FIRST_PERSON_COMMIT_RE.search(source_statement) and not source_commitment_evidence:
@@ -168,7 +182,7 @@ def reduce_tasks(propositions, events, relations, records):
             owners = [commit_event["speaker"]]
         statement = str(prop.get("statement") or "")
         sole_owner = owners[0] if len(owners) == 1 else None
-        source_commitment_evidence, source_commitment_actor = _source_commitment(record, sole_owner)
+        source_commitment_evidence, source_commitment_actor = _source_commitment(record, sole_owner, statement)
         explicit_commitment = bool(
             record.get("commitment_strength") == "explicit"
             or FIRST_PERSON_COMMIT_RE.search(statement)

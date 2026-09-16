@@ -125,6 +125,15 @@ class CanonicalStateTests(unittest.TestCase):
         self.assertEqual(graph["decision_states"][0]["status"], "accepted")
         self.assertTrue(graph["decision_states"][0]["acceptance_check"] == "entailed")
 
+    def test_neighboring_commitment_does_not_promote_confirmed_plan(self):
+        graph = build_meeting_graph([rec(1, "proposal", "@A предложил создать разметчик для @B, чтобы экспериментировать с имбалансами", "propose", speaker="@A", dialogue_evidence=[
+            {"id": "U0", "speaker": "@B", "text": "Order Block я буду параллельно размечивать, и параллельно мы их будем встраивать.", "start": 0},
+            {"id": "U1", "speaker": "@A", "text": "Мне сделать разметчик тебе Order Block и пойти экспериментировать с имбалансами?", "start": 1},
+            {"id": "U2", "speaker": "@B", "text": "Да-да-да. Дальше этап апробации.", "start": 2},
+        ], evidence_ids=["U1", "U2"])])
+        self.assertEqual(graph["decision_states"][0]["status"], "accepted")
+        self.assertEqual(graph["task_states"], [])
+
     def test_unrelated_month_does_not_revise_task_scope(self):
         graph = build_meeting_graph([
             rec(1, "resource", "Я передам выгрузку Bitcoin", "commit", assignees=["@A"]),
