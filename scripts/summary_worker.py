@@ -2526,6 +2526,22 @@ def build_public_document(items, metadata=None, graph=None):
     allowed_claims = {claim for item in items for claim in item.get("claim_ids", [])}
     outcome_cards = build_outcome_cards(graph, allowed_claims) if graph else []
     minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
+    items_by_claim = {}
+    for item in items:
+        for claim_id in item.get("claim_ids", []):
+            items_by_claim.setdefault(claim_id, []).append(item)
+    # Episode topics are useful clustering hints, but can be model-authored and
+    # are not necessarily supported by the claims selected into a card.  The
+    # public label is therefore chosen from a verified PublicItem in that card.
+    for card in outcome_cards:
+        candidates = list(dict.fromkeys(
+            item.get("public_id") for claim_id in card.get("claim_ids", [])
+            for item in items_by_claim.get(claim_id, []) if item.get("public_id")
+        ))
+        card_items = [item for item in items if item.get("public_id") in candidates]
+        if card_items:
+            best = max(card_items, key=lambda item: (utility(item), -len(_public_text(item)), -float(item.get("start", 0))))
+            card["topic"] = _chapter_label(_public_text(best))
     if not outcome_cards:
         grouped = {}
         for item in minute_items or sorted(items, key=lambda value: float(value.get("start", 0))):
@@ -2541,6 +2557,24 @@ def build_public_document(items, metadata=None, graph=None):
                 "evidence_ids": list(dict.fromkeys(e for x in members for e in x.get("evidence_ids", []))),
                 "status": "verified_input", "verification": {"status": "pending", "errors": []},
             })
+
+    # Every canonical minute must belong to a rendered outcome.  If episode
+    # reduction did not retain its claim as a field, add a small verified card
+    # instead of silently losing the item from the one-document projection.
+    covered_claims = {claim for card in outcome_cards for claim in card.get("claim_ids", [])}
+    for item in minute_items:
+        if set(item.get("claim_ids", [])) & covered_claims:
+            continue
+        field = {"value": _public_text(item), "claim_ids": item.get("claim_ids", []), "evidence_ids": item.get("evidence_ids", [])}
+        outcome_cards.append({
+            "outcome_id": "OC" + hashlib.sha256((item.get("public_id") or field["value"]).encode()).hexdigest()[:12],
+            "topic": _chapter_label(field["value"]),
+            "ranges": [{"start": float(item.get("start", 0)), "end": float(item.get("end", item.get("start", 0))) or float(item.get("start", 0)) + .001}],
+            "fields": {"current_state": field, "constraint": None, "resolution": None, "work_result": None, "next_step": None, "remaining_unknown": []},
+            "claim_ids": list(item.get("claim_ids", [])), "evidence_ids": list(item.get("evidence_ids", [])),
+            "status": "verified_input", "verification": {"status": "pending", "errors": []},
+        })
+        covered_claims.update(item.get("claim_ids", []))
 
     # Overview roles are selected from different semantic needs, not a global
     # lexical score.  This keeps state, constraint and next action distinct.
@@ -2562,10 +2596,31 @@ def build_public_document(items, metadata=None, graph=None):
         if topic and topic != "Ключевой результат эпизода" and not re.search(r"(?iu)^участник\s+спрашивает", topic):
             topic_candidates.append(topic)
     entities = sorted({entity for item in items for entity in item.get("topic_entities", []) if entity}, key=str.casefold)
-    subjects = entities[:3] or topic_candidates[:3]
+    title_sources = []
+    subjects = entities[:3]
+    if subjects:
+        title_sources = [item for item in items if set(item.get("topic_entities", [])) & set(subjects)]
+    if not subjects:
+        corpus = " ".join(_public_text(item) for item in items)
+        topic_specs = (
+            ("имбалансы", r"(?iu)\bимбаланс\w*"),
+            ("структура и таймфреймы", r"(?iu)\b(?:структур\w*|таймфрейм\w*|свинг\w*)"),
+            ("точки входа", r"(?iu)\bточк\w*\s+вход\w*"),
+            ("Order Block", r"(?iu)\border\s+block\b"),
+            ("TPO", r"(?iu)\bTPO\b"),
+        )
+        ranked = sorted(((len(re.findall(pattern, corpus)), index, label, pattern)
+                         for index, (label, pattern) in enumerate(topic_specs)),
+                        key=lambda value: (-value[0], value[1]))
+        selected = [(label, pattern) for count, _index, label, pattern in ranked if count][:3]
+        subjects = [label for label, _pattern in selected]
+        title_sources = [item for item in items if any(re.search(pattern, _public_text(item)) for _label, pattern in selected)]
+    if not subjects:
+        subjects = topic_candidates[:2]
+        title_sources = [item for item in items if any(set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))
+                        for card in outcome_cards if _chapter_label(card.get("topic") or "") in subjects)]
     title = (", ".join(subjects) + ": результаты, ограничения и следующие шаги") if subjects else "Итоги встречи: результаты, ограничения и следующие шаги"
-    title_claims = {claim for card in outcome_cards[:3] for claim in card.get("claim_ids", [])}
-    title_sources = [item for item in items if set(item.get("claim_ids", [])) & title_claims] or [item for item in items if set(item.get("claim_ids", [])) & set(c for node in overview[:3] for c in node.get("claim_ids", []))] or list(items[:1])
+    title_sources = title_sources or [item for item in items if set(item.get("claim_ids", [])) & set(c for node in overview[:3] for c in node.get("claim_ids", []))] or list(items[:1])
     title = shorten_text(title, 110).rstrip(".…")
 
     chapters = []
@@ -2645,7 +2700,13 @@ def render_public_document(document):
                         rendered_fields.append(f"**{field_labels[name]}:** {terminate_sentence(_public_text({'text': field['value']}))}")
             if rendered_fields:
                 lines.extend(rendered_fields)
-            else:
+            covered = {claim for value in card.get("fields", {}).values()
+                       for field in (value if isinstance(value, list) else [value] if value else [])
+                       for claim in field.get("claim_ids", [])}
+            context_items = [item for item in chapter["items"] if not set(item.get("claim_ids", [])) <= covered]
+            if context_items:
+                lines.extend(f"**Контекст:** {terminate_sentence(_public_text(item))}" for item in context_items)
+            elif not rendered_fields:
                 lines.append(" ".join(terminate_sentence(_public_text(item)) for item in chapter["items"]))
             lines.append("")
     return "\n".join(lines).strip() + "\n"

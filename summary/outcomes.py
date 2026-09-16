@@ -59,7 +59,10 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
                 if text:
                     remaining.append({
                         "value": text, "claim_ids": [claim["claim_id"]],
-                        "evidence_ids": _dedupe(claim.get("evidence_ids", []) + question.get("answer_evidence_ids", [])),
+                        # The residual field is grounded by the question event.
+                        # Answer evidence belongs to its own claim and must not
+                        # be smuggled into this field's evidence closure.
+                        "evidence_ids": _dedupe(claim.get("evidence_ids", [])),
                     })
         fields = {
             "current_state": _field(state), "constraint": _field(constraint),
@@ -72,7 +75,9 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
             fallback = max(claims, key=lambda item: len(str(item.get("statement") or "")))
             fields["current_state"] = _field(fallback)
             populated = [fields["current_state"]]
-        raw = "|".join(sorted(value for field in populated for value in field.get("claim_ids", [])))
+        all_claim_ids = _dedupe(item.get("claim_id") for item in claims)
+        all_evidence_ids = _dedupe(value for item in claims for value in item.get("evidence_ids", []))
+        raw = "|".join([str(bundle.get("bundle_id") or "")] + sorted(all_claim_ids))
         topic = str(bundle.get("topic") or "Тема встречи").strip()
         if re.search(r"(?iu)^участник\s+спрашивает", topic):
             topic = "Результат обсуждения"
@@ -80,8 +85,10 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
             "outcome_id": "OC" + hashlib.sha256(raw.encode()).hexdigest()[:12],
             "bundle_id": bundle.get("bundle_id"), "topic": topic,
             "ranges": list(bundle.get("ranges", [])), "fields": fields,
-            "claim_ids": _dedupe(value for field in populated for value in field.get("claim_ids", [])),
-            "evidence_ids": _dedupe(value for field in populated for value in field.get("evidence_ids", [])),
+            # A card represents the full verified bundle, while each field
+            # retains its narrower claim/evidence binding.
+            "claim_ids": all_claim_ids,
+            "evidence_ids": all_evidence_ids,
             "status": "verified_input", "verification": {"status": "pending", "errors": []},
         })
     return cards

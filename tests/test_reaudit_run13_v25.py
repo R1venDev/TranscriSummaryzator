@@ -11,6 +11,7 @@ from scripts.summary_worker import build_public_document, deterministic_fact_che
 from semantics.entities import EntityRegistry
 from semantics.meeting_graph import build_meeting_graph
 from semantics.propositions import proposition_from_record
+from summary.outcomes import build_outcome_cards
 from summary.planner import plan
 from summary.verifier import build_public_items, verify_generated_items, verify_public_document
 
@@ -141,6 +142,26 @@ class Run13PublicationRegressions(unittest.TestCase):
         plan = self.sentence_plan("C1", allowed_speakers=["@Yachoy"], allowed_assignees=["@Yachoy"])
         result = verify_generated_items([item], [plan], [claim])
         self.assertTrue(result["passed"], result)
+
+    def test_outcome_card_retains_bundle_claims_and_field_evidence_closure(self):
+        graph = {
+            "claims": [
+                {"claim_id": "C1", "proposition_id": "P1", "content_kind": "current_state",
+                 "statement": "Сервис работает", "evidence_ids": ["U1"]},
+                {"claim_id": "C2", "proposition_id": "P2", "content_kind": "action",
+                 "statement": "Проверить задержку", "evidence_ids": ["U2"]},
+            ],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Сервис",
+                                  "claim_ids": ["C1", "C2"], "ranges": [{"start": 1, "end": 2}]}],
+            "question_states": [{"proposition_id": "P1", "status": "partial",
+                                 "remaining_unknown": "Когда исправят задержку?",
+                                 "answer_evidence_ids": ["U9"]}],
+            "task_states": [],
+        }
+        card = build_outcome_cards(graph)[0]
+        self.assertEqual(set(card["claim_ids"]), {"C1", "C2"})
+        self.assertEqual(set(card["evidence_ids"]), {"U1", "U2"})
+        self.assertEqual(card["fields"]["remaining_unknown"][0]["evidence_ids"], ["U1"])
 
 
 if __name__ == "__main__":

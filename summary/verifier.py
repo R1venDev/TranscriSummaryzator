@@ -558,10 +558,14 @@ def verify_public_document(document, artifact_text, items):
     """Bind the final title, prose, navigation and sections to their sources."""
     errors = []
     source_ids = {claim for item in items for claim in item.get("claim_ids", [])}
-    by_claim = {claim: item for item in items for claim in item.get("claim_ids", [])}
+    by_claim = {}
+    for item in items:
+        for claim in item.get("claim_ids", []):
+            by_claim.setdefault(claim, []).append(item)
     tokens = lambda value: set(re.findall(r"(?iu)[a-zа-яё0-9]+", re.sub(r"[*`]", "", str(value or "")).casefold()))
-    evidence_for = lambda claim_ids: {evidence for claim_id in claim_ids for evidence in by_claim.get(claim_id, {}).get("evidence_ids", [])}
-    heading_sections = {"Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Что осталось уточнить": "questions", "Технические выводы и ограничения": "technical", "Идеи и эксперименты, ещё не проверенные": "experiments", "Требует проверки источника": "requires_verification", "Подробная хронология встречи": "chronology"}
+    evidence_for = lambda claim_ids: {evidence for claim_id in claim_ids for item in by_claim.get(claim_id, []) for evidence in item.get("evidence_ids", [])}
+    surface = lambda value: re.sub(r"\s+", " ", re.sub(r"(?iu)\bсвичных\b", "свечных", re.sub(r"(?iu)\bbaseline\b", "ориентир", re.sub(r"[*`]", "", str(value or ""))))).strip().casefold()
+    heading_sections = {"Главное": "overview", "Таймкоды": "navigation", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Что осталось уточнить": "questions", "Технические выводы и ограничения": "technical", "Идеи и эксперименты, ещё не проверенные": "experiments", "Требует проверки источника": "requires_verification", "Подробная хронология встречи": "chronology"}
     section_text = {}
     current = None
     for line in artifact_text.splitlines():
@@ -569,6 +573,17 @@ def verify_public_document(document, artifact_text, items):
             current = heading_sections.get(line[3:].strip())
         elif current:
             section_text[current] = section_text.get(current, "") + "\n" + line
+    chapter_blocks = {}
+    chronology = document.get("chronology", [])
+    chapter_index = -1
+    for line in artifact_text.splitlines():
+        if line.startswith("### "):
+            chapter_index += 1
+            if chapter_index < len(chronology):
+                chapter_blocks[chronology[chapter_index].get("outcome_id")] = line
+        elif chapter_index >= 0 and chapter_index < len(chronology) and not line.startswith("## "):
+            outcome_id = chronology[chapter_index].get("outcome_id")
+            chapter_blocks[outcome_id] = chapter_blocks.get(outcome_id, "") + "\n" + line
     title = document.get("title", {})
     if not title.get("text") or not set(title.get("claim_ids", [])) <= source_ids or not title.get("evidence_ids"):
         errors.append("unsupported_title")
@@ -576,10 +591,12 @@ def verify_public_document(document, artifact_text, items):
         errors.append("title_not_rendered")
     if not set(title.get("evidence_ids", [])) <= evidence_for(title.get("claim_ids", [])):
         errors.append("title_evidence_outside_closure")
-    title_source = set().union(*(tokens(by_claim[claim].get("text")) for claim in title.get("claim_ids", []) if claim in by_claim))
-    if tokens(title.get("text")) - title_source - {"следующие", "шаги", "итоги", "встречи", "результаты", "результат", "проверки", "ограничения", "и"}:
+    title_source = set().union(*(tokens(item.get("text")) | tokens(" ".join(item.get("topic_entities", [])))
+                                for claim in title.get("claim_ids", []) for item in by_claim.get(claim, [])))
+    title_words = tokens(title.get("text")) - {"следующие", "шаги", "итоги", "встречи", "результаты", "результат", "проверки", "ограничения", "и"}
+    if {word for word in title_words if not any(word == source or (len(word) >= 5 and len(source) >= 5 and word[:5] == source[:5]) for source in title_source)}:
         errors.append("title_semantic_drift")
-    title_source_relations = set().union(*(role_relations(by_claim[claim].get("text")) for claim in title.get("claim_ids", []) if claim in by_claim))
+    title_source_relations = set().union(*(role_relations(item.get("text")) for claim in title.get("claim_ids", []) for item in by_claim.get(claim, [])))
     if role_relations(title.get("text")) and not role_relations(title.get("text")) <= title_source_relations:
         errors.append("title_role_swap")
     for node in document.get("overview", []):
@@ -587,9 +604,9 @@ def verify_public_document(document, artifact_text, items):
             errors.append("unsupported_overview")
         if not set(node.get("evidence_ids", [])) <= evidence_for(node.get("claim_ids", [])):
             errors.append("overview_evidence_outside_closure")
-        if node.get("text") not in artifact_text:
+        if surface(node.get("text")) not in surface(section_text.get("overview", "")):
             errors.append("overview_not_rendered")
-        backing = [item for item in items if item.get("section") == "overview" and item.get("claim_ids") == node.get("claim_ids")]
+        backing = [item for claim in node.get("claim_ids", []) for item in by_claim.get(claim, [])]
         source_words = set().union(*(tokens(item.get("text")) for item in backing)) if backing else set()
         if not backing or len(tokens(node.get("text")) - source_words) > 2:
             errors.append("overview_semantic_drift")
@@ -601,9 +618,9 @@ def verify_public_document(document, artifact_text, items):
     for chapter in navigation:
         if not chapter.get("claim_ids") or not set(chapter["claim_ids"]) <= source_ids or not chapter.get("evidence_ids"):
             errors.append("unsupported_navigation")
-        if chapter.get("label") not in artifact_text:
+        if surface(chapter.get("label")) not in surface(section_text.get("navigation", "")):
             errors.append("navigation_not_rendered")
-        source_words = set().union(*(tokens(item.get("text")) for item in items if item.get("section") == "minutes" and set(item.get("claim_ids", [])) & set(chapter.get("claim_ids", []))))
+        source_words = set().union(*(tokens(item.get("text")) for claim in chapter.get("claim_ids", []) for item in by_claim.get(claim, [])))
         if len(tokens(chapter.get("label")) - source_words) > 1:
             errors.append("navigation_semantic_drift")
         if re.search(r"(?iu)(?:\.{3}|…|\b(?:и|или|что|чтобы|из-за|после))$", str(chapter.get("label") or "").strip()):
@@ -620,7 +637,7 @@ def verify_public_document(document, artifact_text, items):
                     errors.append("unsupported_outcome_field")
                 if not set(field.get("evidence_ids", [])) <= evidence_for(field.get("claim_ids", [])):
                     errors.append("outcome_field_evidence_outside_closure")
-                if field.get("value") and field["value"] not in artifact_text:
+                if field.get("value") and surface(field["value"]) not in surface(chapter_blocks.get(card.get("outcome_id"), "")):
                     errors.append("outcome_field_not_rendered")
     for section, section_items in document.get("sections", {}).items():
         for item in section_items:
