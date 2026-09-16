@@ -562,6 +562,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "cross_view_state_conflicts": cross_view_conflicts,
         "readability_lint_failures": readability_lint,
         "task_without_deliverable": sum(x.get("section") == "tasks" and not str(x.get("task_state", {}).get("deliverable") or "").strip() for x in items),
+        "vague_focus_tasks": sum(x.get("section") == "tasks" and bool(re.search(r"(?iu)\b(?:сделать\s+упор|сосредоточиться|ещ[её]\s+над\s+этим\s+посидеть)\b", str(x.get("text") or ""))) for x in items),
         "overview_task_overlap": (len(overview_tokens & task_tokens) / max(1, len(overview_tokens))) if overview_tokens else 0,
         # Overview items are intentionally merged into prose paragraphs rather
         # than rendered one bullet per PublicItem.
@@ -586,7 +587,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
     counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0

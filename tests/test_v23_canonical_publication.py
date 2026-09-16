@@ -77,6 +77,23 @@ class CanonicalStateTests(unittest.TestCase):
         anchors = [claim for claim in graph["claims"] if claim.get("canonical_task_anchor")]
         self.assertTrue(all(claim["verification_status"] == "supported" for claim in anchors))
 
+    def test_resource_commitment_is_recovered_without_model_assignee(self):
+        graph = build_meeting_graph([
+            rec(1, "resource", "@A предложил предоставить данные по Bitcoin за 2021 год", "assert", speaker="@A", assignees=[], commitment_strength="none", dialogue_evidence=[
+                {"id": "U1", "speaker": "@A", "text": "Я Bitcoin 2021 года тебе дам.", "start": 1},
+                {"id": "U2", "speaker": "@B", "text": "Мне хватит месяца.", "start": 2},
+                {"id": "U3", "speaker": "@A", "text": "А, месяца. Ну ладно.", "start": 3},
+            ]),
+            rec(2, "constraint", "Уточнение требования к объему данных: месяц вместо года", "correct", speaker="@B"),
+        ])
+        task = graph["task_states"][0]
+        self.assertEqual((task["status"], task["assignee"], task["current_scope"], task["scope_confidence"]), ("self_committed", "@A", "1 месяц", "accepted"))
+        self.assertEqual(task["deliverable"], "@A предоставит данные по Bitcoin за 2021 год")
+
+    def test_vague_focus_intention_is_not_a_task(self):
+        graph = build_meeting_graph([rec(1, "action", "Меньше условно часть ИИ пилить и сделать упор на это", "commit", assignees=["@A"], commitment_strength="implicit")])
+        self.assertEqual(graph["task_states"], [])
+
     def test_cross_day_rule_closes_question(self):
         graph = build_meeting_graph([
             rec(1, "question", "Может ли сделка закрыться на следующий день?", "ask", requested_slots=["cross_day_closure_feasibility"], answer_record_ids=["F2"]),

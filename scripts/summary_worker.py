@@ -2588,8 +2588,8 @@ def build_public_document(items, metadata=None, graph=None):
     # lexical score.  This keeps state, constraint and next action distinct.
     overview = []
     role_patterns = {
-        "current_state": r"(?iu)\b(?:работ\w*|готов\w*|создан\w*|получен\w*|сделан\w*)\b",
-        "constraint": r"(?iu)\b(?:задерж\w*|проблем\w*|огранич\w*|не\s+работ\w*)\b",
+        "current_state": r"(?iu)\b(?:минутн\w*.+(?:структур\w*|BOS)|работ\w*|готов\w*|создан\w*|получен\w*|сделан\w*)\b",
+        "constraint": r"(?iu)\b(?:(?:старш\w*|четыр[её]хчасов\w*).+(?:задерж\w*|не\s+отображ\w*)|задерж\w*|проблем\w*|огранич\w*|не\s+работ\w*)\b",
         "resolution": r"(?iu)\b(?:решил\w*|соглас\w*|договор\w*|будет|можно)\b",
         "work_result": r"(?iu)\b(?:результат\w*|данн\w*|методич\w*|размет\w*)\b",
         "next_step": r"(?iu)\b(?:подготов\w*|переда\w*|предостав\w*|размеч\w*|встро\w*|сдела\w*)\b",
@@ -2600,7 +2600,8 @@ def build_public_document(items, metadata=None, graph=None):
             field = card.get("fields", {}).get(field_name)
             if not field or not field.get("value") or field.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
                 continue
-            score = 5 * bool(re.search(role_patterns[field_name], field["value"])) + len(field.get("evidence_ids", []))
+            htf_priority = 12 * bool(re.search(r"(?iu)\b(?:минутн\w*|старш\w*\s+таймфрейм\w*|четыр[её]хчасов\w*)\b", field["value"]))
+            score = htf_priority + 5 * bool(re.search(role_patterns[field_name], field["value"])) + len(field.get("evidence_ids", []))
             candidates.append((score, field))
         for _score, field in sorted(candidates, key=lambda value: value[0], reverse=True):
             if field["value"] not in {x["text"] for x in overview}:

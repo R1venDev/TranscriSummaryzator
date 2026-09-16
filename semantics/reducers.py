@@ -6,8 +6,8 @@ from .questions import normalize_slot, verify_slot_entailment
 
 
 PROPOSAL_WORDING_RE = re.compile(r"(?iu)\b(?:предлагалось|предлагает|можно|стоит|нужно\s+бы|планируется|планирует)\b")
-ACCEPT_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|согласен|делаем|ок(?:ей)?|подтверждаю|ну\s+ладно)\b")
-FIRST_PERSON_COMMIT_RE = re.compile(r"(?iu)\b(?:я\s+(?:сделаю|отправлю|передам|дам|кину|буду|возьмусь|встрою)|(?:потом\s+)?встрою|это\s+за\s+мной|с\s+меня|беру|i\s+will)\b")
+ACCEPT_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|согласен|делаем|ок(?:ей)?|подтверждаю|(?:а[\s,]*)?(?:месяца?[\s,.:—-]*)?ну\s+ладно)\b")
+FIRST_PERSON_COMMIT_RE = re.compile(r"(?iu)\b(?:я\s+(?:сделаю|отправлю|передам|дам|кину|буду|возьмусь|встрою)|я\b.{1,80}\b(?:сделаю|отправлю|передам|дам|кину|буду|возьмусь|встрою)|(?:потом\s+)?встрою|это\s+за\s+мной|с\s+меня|беру|i\s+will)\b")
 WORK_PREDICATE_RE = re.compile(r"(?iu)\b(?:сдела\w*|созда\w*|подготов\w*|переда\w*|отправ\w*|предостав\w*|разме[тч]\w*|встраива\w*|встро\w*|провер\w*|исправ\w*|продолж\w*|эксперимент\w*|разработ\w*|написа\w*|провед\w*|реализ\w*|обработ\w*|собра\w*|запуст\w*|добав\w*|выгруз\w*|скин\w*|кин\w*|дам|даю|отдам|покаж\w*|заль\w*|deploy\w*|build\w*)\b")
 META_ACTION_RE = re.compile(r"(?iu)^\s*(?:вопрос|уточнение|метаописание|участник\s+спрашивает)\b")
 COUNT_WORDS = {"один": 1, "одного": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "трех": 3, "трёх": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10}
@@ -63,16 +63,28 @@ def _scope_value(text):
     return f"{count} {form}"
 
 
-def _source_commitment(record, owner):
+def _source_commitment(record, owner=None):
     """Find a first-person promise in the exact source dialogue."""
-    if not owner:
+    turns = [turn for turn in record.get("dialogue_evidence", []) if FIRST_PERSON_COMMIT_RE.search(str(turn.get("text") or ""))]
+    if owner:
+        turns = [turn for turn in turns if turn.get("speaker") == owner]
+    speakers = {turn.get("speaker") for turn in turns if turn.get("speaker")}
+    if len(speakers) != 1:
         return [], None
-    evidence = [
-        turn.get("id") for turn in record.get("dialogue_evidence", [])
-        if turn.get("speaker") == owner and FIRST_PERSON_COMMIT_RE.search(str(turn.get("text") or ""))
-    ]
+    actor = next(iter(speakers))
+    evidence = [turn.get("id") for turn in turns if turn.get("speaker") == actor]
     evidence = list(dict.fromkeys(value for value in evidence if value))
-    return evidence, owner if evidence else None
+    return evidence, actor if evidence else None
+
+
+def _committed_description(statement, actor):
+    """Remove proposal wording only when exact dialogue proves a self-commitment."""
+    value = str(statement or "").strip()
+    replacements = {"предоставить": "предоставит", "подготовить": "подготовит", "передать": "передаст", "отправить": "отправит", "сделать": "сделает"}
+    match = re.match(r"(?iu)^(@[\w.-]+)\s+предложил(?:а)?\s+(предоставить|подготовить|передать|отправить|сделать)\b(.*)$", value)
+    if match and actor == match.group(1):
+        return f"{match.group(1)} {replacements[match.group(2).casefold()]}{match.group(3)}"
+    return value
 
 
 def reduce_decisions(propositions, events, relations, records=None):
@@ -129,15 +141,20 @@ def reduce_tasks(propositions, events, relations, records):
         prop_events = [x for x in events if x["proposition_id"] == prop["proposition_id"]]
         event = max(prop_events, key=lambda x: x.get("timestamp", 0))
         record = by_record.get(event.get("source_record_id"), {})
-        commitment_candidate = event["speech_act"] == "commit" or record.get("commitment_strength") in {"explicit", "implicit"} or prop["content_kind"] in {"action", "follow_up"}
+        source_commitment_evidence, source_commitment_actor = _source_commitment(record)
+        commitment_candidate = event["speech_act"] == "commit" or record.get("commitment_strength") in {"explicit", "implicit"} or prop["content_kind"] in {"action", "follow_up"} or bool(source_commitment_evidence)
         if not commitment_candidate:
             continue
         source_statement = str(prop.get("statement") or "")
         if META_ACTION_RE.search(source_statement) or not WORK_PREDICATE_RE.search(source_statement):
             continue
-        if event["speech_act"] == "assert" and record.get("commitment_strength") not in {"explicit", "implicit"} and not FIRST_PERSON_COMMIT_RE.search(source_statement):
+        if event["speech_act"] == "assert" and record.get("commitment_strength") not in {"explicit", "implicit"} and not FIRST_PERSON_COMMIT_RE.search(source_statement) and not source_commitment_evidence:
+            continue
+        if re.search(r"(?iu)\b(?:сделать\s+упор|сосредоточиться|ещ[её]\s+над\s+этим\s+посидеть)\b", source_statement) and not re.search(r"(?iu)\b(?:подготов\w*|переда\w*|отправ\w*|предостав\w*|размет\w*|встро\w*|исправ\w*|созда\w*|провер\w*)\b", source_statement):
             continue
         owners = list(record.get("assignees", []))
+        if not owners and source_commitment_actor:
+            owners = [source_commitment_actor]
         confirmations = list(record.get("confirmation_evidence_ids", []))
         acceptance_relations = _incoming(prop["proposition_id"], relations, {"accepts", "confirms", "accepts_assignment"})
         event_by_id = {x["event_id"]: x for x in events}
@@ -201,6 +218,16 @@ def reduce_tasks(propositions, events, relations, records):
             if not value:
                 continue
             accepted = bool(_incoming(source_prop["proposition_id"], relations, {"accepts", "confirms"})) if source_prop else False
+            source_start = min([x.get("timestamp", 0) for x in events if source_prop and x.get("proposition_id") == source_prop.get("proposition_id")] or [0])
+            scope_unit = value.split()[-1][:5].casefold()
+            local_scope_acceptance = [turn.get("id") for turn in record.get("dialogue_evidence", [])
+                                      if sole_owner and turn.get("speaker") == sole_owner
+                                      and float(turn.get("start", 0)) >= float(source_start)
+                                      and scope_unit in str(turn.get("text") or "").casefold()
+                                      and ACCEPT_RE.search(str(turn.get("text") or ""))]
+            if local_scope_acceptance:
+                accepted = True
+                scope_evidence.extend(value for value in local_scope_acceptance if value)
             source_events = [x for x in events if x["proposition_id"] == source_prop["proposition_id"]] if source_prop else []
             asserted = any(x["speech_act"] in {"assert", "answer", "decide"} for x in source_events)
             # A later technical constraint (for example, a four-hour
@@ -225,7 +252,8 @@ def reduce_tasks(propositions, events, relations, records):
         raw_actor_confidence = record.get("assignee_confidence")
         actor_confidence = float(raw_actor_confidence) if isinstance(raw_actor_confidence, (int, float)) else 0.0
         action_frame = {"speaker": speaker, "reporter": record.get("reporter") or speaker, "grammatical_actor": commitment_actor or (owners[0] if len(owners) == 1 and not reported_third_person else None), "mentioned_people": owners, "beneficiary": record.get("beneficiary"), "recipient": record.get("recipient") or record.get("beneficiary"), "proposed_by": speaker, "proposed_for": owners[0] if len(owners) == 1 else None, "assignment_target": owners[0] if len(owners) == 1 and not reported_third_person else None, "explicit_acceptance_actor": owners[0] if accepted_by_owner and len(owners) == 1 else None, "utterance_ids": list(prop.get("evidence_ids", [])), "alias_resolution": record.get("alias_resolution", {}), "confidence": actor_confidence, "state": action_state}
-        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": prop["statement"], "deliverable": prop["statement"], "owner": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignee": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": speaker, "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "source_commitment_evidence_ids": source_commitment_evidence, "assignment_actor": speaker, "assignment_target": None if reported_third_person else owners[0] if len(owners) == 1 else None, "action_frame": action_frame, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []) + (["reported_third_person"] if reported_third_person else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "data_origin": data_origin, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "scope_history": scope_history, "proposed_scopes": proposed_scopes, "superseded_scopes": [value["value"] for value in scope_history], "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + source_commitment_evidence + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
+        description = _committed_description(prop["statement"], source_commitment_actor) if source_commitment_evidence else prop["statement"]
+        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": description, "deliverable": description, "owner": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignee": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": speaker, "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "source_commitment_evidence_ids": source_commitment_evidence, "assignment_actor": speaker, "assignment_target": None if reported_third_person else owners[0] if len(owners) == 1 else None, "action_frame": action_frame, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []) + (["reported_third_person"] if reported_third_person else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "data_origin": data_origin, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "scope_history": scope_history, "proposed_scopes": proposed_scopes, "superseded_scopes": [value["value"] for value in scope_history], "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + source_commitment_evidence + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
         atomic[-1]["scope_confidence"] = "accepted" if scope_confirmed else "proposed" if scope else "unknown"
     # Canonical task envelopes: one state is consumed by every public/API view.
     groups = []
