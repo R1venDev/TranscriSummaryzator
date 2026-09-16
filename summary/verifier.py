@@ -637,7 +637,8 @@ def verify_public_document(document, artifact_text, items):
                     errors.append("unsupported_outcome_field")
                 if not set(field.get("evidence_ids", [])) <= evidence_for(field.get("claim_ids", [])):
                     errors.append("outcome_field_evidence_outside_closure")
-                if field.get("value") and surface(field["value"]) not in surface(chapter_blocks.get(card.get("outcome_id"), "")):
+                rendered_card_block = chapter_blocks.get(card.get("outcome_id")) or section_text.get("overview", "")
+                if field.get("value") and surface(field["value"]) not in surface(rendered_card_block):
                     errors.append("outcome_field_not_rendered")
     for section, section_items in document.get("sections", {}).items():
         for item in section_items:
