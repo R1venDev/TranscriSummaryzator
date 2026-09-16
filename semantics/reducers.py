@@ -6,11 +6,13 @@ from .questions import normalize_slot, verify_slot_entailment
 
 
 PROPOSAL_WORDING_RE = re.compile(r"(?iu)\b(?:предлагалось|предлагает|можно|стоит|нужно\s+бы|планируется|планирует)\b")
+ACCEPT_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|согласен|делаем|ок(?:ей)?|подтверждаю|ну\s+ладно)\b")
 FIRST_PERSON_COMMIT_RE = re.compile(r"(?iu)\b(?:я\s+(?:сделаю|отправлю|передам|дам|кину|буду|возьмусь|встрою)|(?:потом\s+)?встрою|это\s+за\s+мной|с\s+меня|беру|i\s+will)\b")
 WORK_PREDICATE_RE = re.compile(r"(?iu)\b(?:сдела\w*|созда\w*|подготов\w*|переда\w*|отправ\w*|предостав\w*|разме[тч]\w*|встраива\w*|встро\w*|провер\w*|исправ\w*|продолж\w*|эксперимент\w*|разработ\w*|написа\w*|провед\w*|реализ\w*|обработ\w*|собра\w*|запуст\w*|добав\w*|выгруз\w*|скин\w*|кин\w*|дам|даю|отдам|покаж\w*|заль\w*|deploy\w*|build\w*)\b")
 META_ACTION_RE = re.compile(r"(?iu)^\s*(?:вопрос|уточнение|метаописание|участник\s+спрашивает)\b")
 COUNT_WORDS = {"один": 1, "одного": 1, "одну": 1, "два": 2, "две": 2, "три": 3, "трех": 3, "трёх": 3, "четыре": 4, "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10}
 SCOPE_VALUE_RE = re.compile(r"(?iu)\b(?P<count>\d+|один|одного|одну|два|две|три|тр[её]х|четыре|пять|шесть|семь|восемь|девять|десять)\s*(?P<unit>месяц(?:а|ев|ем)?|недел(?:я|и|ь|ю)|д(?:ень|ня|ней)|час(?:а|ов)?|минут(?:а|ы)?|год(?:а|ов)?)\b")
+BARE_SCOPE_RE = re.compile(r"(?iu)\b(?P<unit>месяц(?:а|ев|ем)?|недел(?:я|и|ь|ю)|д(?:ень|ня|ней)|час(?:а|ов)?|минут(?:а|ы)?|год(?:а|ов)?)\b")
 YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
 TOKEN_RE = re.compile(r"(?iu)[a-zа-яё0-9]+")
 TASK_STOP = {"говорящий", "предлагает", "планирует", "будут", "параллельно", "надо", "нужно", "чтобы", "участник"}
@@ -39,11 +41,19 @@ def _incoming(target, relations, kinds):
 
 
 def _scope_value(text):
-    match = SCOPE_VALUE_RE.search(str(text or ""))
+    source = str(text or "")
+    match = SCOPE_VALUE_RE.search(source)
     if not match:
-        return None
-    raw = match.group("count").casefold()
-    count = int(raw) if raw.isdigit() else COUNT_WORDS[raw]
+        match = BARE_SCOPE_RE.search(source)
+        if not match:
+            return None
+        prefix = source[max(0, match.start() - 16):match.start()]
+        if re.search(r"(?iu)\b(?:не|вместо)\s*$", prefix):
+            return None
+        count = 1
+    else:
+        raw = match.group("count").casefold()
+        count = int(raw) if raw.isdigit() else COUNT_WORDS[raw]
     unit = match.group("unit").casefold()
     stem = "месяц" if unit.startswith("месяц") else "неделя" if unit.startswith("недел") else "день" if unit.startswith("д") else "час" if unit.startswith("час") else "минута" if unit.startswith("минут") else "год"
     if stem == "год" and count >= 1900:
@@ -53,7 +63,19 @@ def _scope_value(text):
     return f"{count} {form}"
 
 
-def reduce_decisions(propositions, events, relations):
+def _source_commitment(record, owner):
+    """Find a first-person promise in the exact source dialogue."""
+    if not owner:
+        return [], None
+    evidence = [
+        turn.get("id") for turn in record.get("dialogue_evidence", [])
+        if turn.get("speaker") == owner and FIRST_PERSON_COMMIT_RE.search(str(turn.get("text") or ""))
+    ]
+    evidence = list(dict.fromkeys(value for value in evidence if value))
+    return evidence, owner if evidence else None
+
+
+def reduce_decisions(propositions, events, relations, records=None):
     by_prop = {x["proposition_id"]: x for x in propositions}
     result, processed = [], set()
     for event in events:
@@ -70,14 +92,29 @@ def reduce_decisions(propositions, events, relations):
         accepts = _incoming(prop["proposition_id"], relations, {"accepts", "confirms"})
         rejects = _incoming(prop["proposition_id"], relations, {"rejects"})
         supersedes = _incoming(prop["proposition_id"], relations, {"supersedes", "corrects"})
+        event_by_id = {x["event_id"]: x for x in events}
+        event_by_record = {x["source_record_id"]: x for x in events}
         event_by_prop = {x["proposition_id"]: x for x in events}
-        transitions = sorted(accepts + rejects, key=lambda rel: event_by_prop.get(rel.get("source_proposition_id"), {}).get("timestamp", 0))
+        def relation_event(rel):
+            return event_by_id.get(rel.get("source_event_id")) or event_by_record.get(rel.get("source_record_id")) or event_by_prop.get(rel.get("source_proposition_id"), {})
+        transitions = sorted(accepts + rejects, key=lambda rel: relation_event(rel).get("timestamp", 0))
+        local_acceptance = []
+        if records:
+            local_records = [record for record in records if record.get("record_id") in prop.get("source_record_ids", [])]
+            for record in local_records:
+                dialogue = sorted(record.get("dialogue_evidence", []), key=lambda value: float(value.get("start", 0)))
+                for index, turn in enumerate(dialogue):
+                    if not ACCEPT_RE.search(str(turn.get("text") or "")):
+                        continue
+                    if any(prior.get("speaker") and turn.get("speaker") and prior.get("speaker") != turn.get("speaker") for prior in dialogue[:index]):
+                        local_acceptance.extend([value for value in (turn.get("id"),) if value])
         if supersedes: status = "superseded"
         elif transitions: status = "rejected" if transitions[-1]["type"] == "rejects" else "accepted"
+        elif local_acceptance: status = "accepted"
         elif "decide" in acts: status = "accepted"
         elif "defer" in acts: status = "deferred"
         else: status = "candidate"
-        result.append({"decision_id": "D" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_record_id": latest.get("source_record_id"), "status": status, "acceptance_relation_ids": [x["relation_id"] for x in accepts], "decision_evidence_ids": list(dict.fromkeys(prop["evidence_ids"] + [e for x in accepts for e in x.get("evidence_ids", [])])), "acceptance_check": "entailed" if status == "accepted" else "not_entailed", "conditions": prop["conditions"], "evidence_ids": prop["evidence_ids"]})
+        result.append({"decision_id": "D" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_record_id": latest.get("source_record_id"), "status": status, "acceptance_relation_ids": [x["relation_id"] for x in accepts], "decision_evidence_ids": list(dict.fromkeys(prop["evidence_ids"] + local_acceptance + [e for x in accepts for e in x.get("evidence_ids", [])])), "acceptance_check": "entailed" if status == "accepted" else "not_entailed", "conditions": prop["conditions"], "evidence_ids": prop["evidence_ids"]})
     return result
 
 
@@ -103,16 +140,28 @@ def reduce_tasks(propositions, events, relations, records):
         owners = list(record.get("assignees", []))
         confirmations = list(record.get("confirmation_evidence_ids", []))
         acceptance_relations = _incoming(prop["proposition_id"], relations, {"accepts", "confirms", "accepts_assignment"})
+        event_by_id = {x["event_id"]: x for x in events}
+        event_by_record = {x["source_record_id"]: x for x in events}
         event_by_prop = {x["proposition_id"]: x for x in events}
-        accepted_by_owner = [x for x in acceptance_relations if event_by_prop.get(x.get("source_proposition_id"), {}).get("speaker") in owners]
+        accepted_by_owner = [x for x in acceptance_relations if (event_by_id.get(x.get("source_event_id")) or event_by_record.get(x.get("source_record_id")) or event_by_prop.get(x.get("source_proposition_id"), {})).get("speaker") in owners]
         if accepted_by_owner:
             confirmations = list(dict.fromkeys(confirmations + [e for x in accepted_by_owner for e in x.get("evidence_ids", [])]))
         commit_event = next((x for x in reversed(sorted(prop_events, key=lambda x: x.get("timestamp", 0))) if x["speech_act"] == "commit"), None)
         if commit_event and commit_event.get("speaker") and not owners:
             owners = [commit_event["speaker"]]
         statement = str(prop.get("statement") or "")
-        explicit_commitment = bool(record.get("commitment_strength") == "explicit" or FIRST_PERSON_COMMIT_RE.search(statement))
-        commitment_actor = record.get("commitment_actor") or (commit_event.get("speaker") if explicit_commitment and commit_event else None)
+        sole_owner = owners[0] if len(owners) == 1 else None
+        source_commitment_evidence, source_commitment_actor = _source_commitment(record, sole_owner)
+        explicit_commitment = bool(
+            record.get("commitment_strength") == "explicit"
+            or FIRST_PERSON_COMMIT_RE.search(statement)
+            or source_commitment_evidence
+        )
+        commitment_actor = (
+            record.get("commitment_actor")
+            or source_commitment_actor
+            or (commit_event.get("speaker") if explicit_commitment and commit_event else None)
+        )
         speaker = event.get("speaker")
         direct_assignment = bool(re.search(r"(?iu)\b(?:должен|должна|сделай|сделайте|нужно\s+тебе|тебе\s+нужно)\b", statement))
         reported_third_person = bool(owners and speaker and speaker not in owners and not direct_assignment and not record.get("confirmation_evidence_ids"))
@@ -176,7 +225,7 @@ def reduce_tasks(propositions, events, relations, records):
         raw_actor_confidence = record.get("assignee_confidence")
         actor_confidence = float(raw_actor_confidence) if isinstance(raw_actor_confidence, (int, float)) else 0.0
         action_frame = {"speaker": speaker, "reporter": record.get("reporter") or speaker, "grammatical_actor": commitment_actor or (owners[0] if len(owners) == 1 and not reported_third_person else None), "mentioned_people": owners, "beneficiary": record.get("beneficiary"), "recipient": record.get("recipient") or record.get("beneficiary"), "proposed_by": speaker, "proposed_for": owners[0] if len(owners) == 1 else None, "assignment_target": owners[0] if len(owners) == 1 and not reported_third_person else None, "explicit_acceptance_actor": owners[0] if accepted_by_owner and len(owners) == 1 else None, "utterance_ids": list(prop.get("evidence_ids", [])), "alias_resolution": record.get("alias_resolution", {}), "confidence": actor_confidence, "state": action_state}
-        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": prop["statement"], "deliverable": prop["statement"], "owner": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignee": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": speaker, "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "assignment_actor": speaker, "assignment_target": None if reported_third_person else owners[0] if len(owners) == 1 else None, "action_frame": action_frame, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []) + (["reported_third_person"] if reported_third_person else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "data_origin": data_origin, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "scope_history": scope_history, "proposed_scopes": proposed_scopes, "superseded_scopes": [value["value"] for value in scope_history], "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
+        atomic.append({"task_id": "T" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_proposition_ids": [prop["proposition_id"]], "source_record_id": event.get("source_record_id"), "source_record_ids": [event.get("source_record_id")], "description": prop["statement"], "deliverable": prop["statement"], "owner": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignee": None if reported_third_person else owners[0] if len(owners) == 1 else None, "assignees": owners, "assignee_confidence": record.get("assignee_confidence"), "proposed_by": speaker, "commitment_strength": "explicit" if explicit_commitment else "implicit" if commit_event else "none", "commitment_actor": commitment_actor, "source_commitment_evidence_ids": source_commitment_evidence, "assignment_actor": speaker, "assignment_target": None if reported_third_person else owners[0] if len(owners) == 1 else None, "action_frame": action_frame, "acceptance_relation_ids": [x["relation_id"] for x in accepted_by_owner], "acceptance_evidence_ids": confirmations, "scope_relation_ids": scope_relations, "uncertainty_reasons": sorted(set(uncertainty_reasons + (["ambiguous_owner"] if ambiguous_owner else []) + (["reported_third_person"] if reported_third_person else []))), "deadline": record.get("time_expression"), "due": record.get("time_expression"), "conditions": prop["conditions"], "completion_criterion": record.get("completion_criterion"), "status": status, "task_status": status, "current_scope": scope, "data_origin": data_origin, "scope_state": scope_state, "scope_confidence": "high" if scope_relations else "unknown" if not scope else "source", "scope_history": scope_history, "proposed_scopes": proposed_scopes, "superseded_scopes": [value["value"] for value in scope_history], "superseded_by": superseded_by, "automation_eligible": automation, "evidence_ids": list(dict.fromkeys(prop.get("evidence_ids", []) + source_commitment_evidence + scope_evidence)), "source_word_ids": list(dict.fromkeys(list(record.get("source_word_ids", [])) + scope_words)), "start": float(record.get("start", 0))})
         atomic[-1]["scope_confidence"] = "accepted" if scope_confirmed else "proposed" if scope else "unknown"
     # Canonical task envelopes: one state is consumed by every public/API view.
     groups = []
@@ -185,10 +234,11 @@ def reduce_tasks(propositions, events, relations, records):
         match = next((g for g in reversed(groups)
                       if item.get("owner") == g.get("owner")
                       and item["start"] - g["start"] <= 120
-                      and _task_similarity(item["description"], g["description"]) >= .34
-                      and _task_predicates(item["description"]) == _task_predicates(g["description"])
-                      and item_object and _task_object_tokens(g["description"])
-                      and len(item_object & _task_object_tokens(g["description"])) / max(1, len(item_object | _task_object_tokens(g["description"]))) >= .65), None)
+                      and (bool(set(item.get("source_commitment_evidence_ids", [])) & set(g.get("source_commitment_evidence_ids", [])))
+                           or (_task_similarity(item["description"], g["description"]) >= .34
+                               and _task_predicates(item["description"]) == _task_predicates(g["description"])
+                               and item_object and _task_object_tokens(g["description"])
+                               and len(item_object & _task_object_tokens(g["description"])) / max(1, len(item_object | _task_object_tokens(g["description"]))) >= .65))), None)
         if not match:
             groups.append(item)
             continue
@@ -202,9 +252,12 @@ def reduce_tasks(propositions, events, relations, records):
         match["conditions"] += [value for value in item["conditions"] if value not in match["conditions"]]
         if item["status"] in {"cancelled", "superseded", "accepted", "self_committed", "completed"}:
             match["status"] = match["task_status"] = item["status"]
-            for field in ("commitment_actor", "assignment_actor", "assignment_target", "action_frame", "commitment_strength", "assignee", "owner"):
+            for field in ("description", "deliverable", "commitment_actor", "assignment_actor", "assignment_target", "action_frame", "commitment_strength", "assignee", "owner"):
                 if item.get(field) is not None:
                     match[field] = item[field]
+        match["source_commitment_evidence_ids"] = list(dict.fromkeys(
+            match.get("source_commitment_evidence_ids", []) + item.get("source_commitment_evidence_ids", [])
+        ))
         if item.get("current_scope") and item["current_scope"] != match.get("current_scope"):
             if match.get("current_scope"):
                 match["superseded_scopes"].append(match["current_scope"])

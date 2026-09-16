@@ -7,7 +7,7 @@ from summary.policy import TECHNICAL_KINDS
 
 TECHNICAL = set(TECHNICAL_KINDS)
 VIEW_KINDS = {
-    "executive": {"decision", "current_state", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
+    "executive": {"decision", "proposal", "current_state", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
     "technical": TECHNICAL, "tasks": {"action", "follow_up"},
     "experiments": {"hypothesis", "experimental_result", "metric"},
     "questions": {"question", "blocker", "schedule"}, "minutes": set(),
@@ -21,7 +21,7 @@ def _tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(
 
 def _mandatory(claim):
     kind = _kind(claim)
-    if kind == "decision": return claim.get("decision_status") == "accepted"
+    if kind in {"decision", "proposal"}: return claim.get("decision_status") == "accepted"
     if kind in {"action", "follow_up"}: return claim.get("task_status") in {"accepted", "self_committed", "explicit_self_commitment", "in_progress", "blocked", "completed"} and claim.get("canonical_task_anchor", True)
     if kind == "question": return claim.get("question_status") not in {"answered", "rhetorical", "superseded"}
     return kind in {"blocker", "correction", "experimental_result"}
@@ -50,7 +50,7 @@ def _utility(claim, score_fn, view):
 
 
 def _select(claims, score_fn, view, budget):
-    eligible = [x for x in claims if x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view] or (view == "tasks" and x.get("canonical_task_state_id")))]
+    eligible = [x for x in claims if not x.get("dialogue_only") and x.get("lifecycle", "active") == "active" and (view == "minutes" or _kind(x) in VIEW_KINDS[view] or (view == "tasks" and x.get("canonical_task_state_id")))]
     if view == "technical":
         eligible = [x for x in eligible if not re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|называется|определяется)\b", str(x.get("statement") or ""))]
     if view == "tasks":

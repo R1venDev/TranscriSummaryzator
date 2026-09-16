@@ -57,6 +57,41 @@ class CanonicalStateTests(unittest.TestCase):
         self.assertTrue(all(value.startswith("R") for value in task["scope_relation_ids"]))
         self.assertTrue(any(x["type"] == "revises_scope" for x in graph["relations"]))
 
+    def test_bare_month_revision_wins_over_later_four_hour_constraint(self):
+        graph = build_meeting_graph([
+            rec(1, "resource", "@A предоставит данные Bitcoin за 2021 год", "commit", assignees=["@A"]),
+            rec(2, "constraint", "Уточнение требования к объему данных: месяц вместо года", "correct", speaker="@B"),
+            rec(3, "constraint", "Для симуляции достаточно целых минут за период 15–4 часа", "assert", speaker="@B"),
+        ])
+        self.assertEqual(graph["task_states"][0]["current_scope"], "1 месяц")
+
+    def test_exact_dialogue_recovers_personal_commitments_and_merges_same_promise(self):
+        promise = {"id": "U36", "speaker": "@B", "text": "Order Block я буду параллельно размечивать, и параллельно мы их будем встраивать."}
+        graph = build_meeting_graph([
+            rec(1, "action", "Участники договорятся о параллельной разметке Order Block", "commit", speaker="@B", assignees=["@B"], commitment_strength="implicit", verification_status="verification_unavailable", dialogue_evidence=[promise]),
+            rec(2, "action", "Order Block будут размечать параллельно с встраиванием имбалансов", "commit", speaker="@B", assignees=["@B"], commitment_strength="implicit", verification_status="verification_unavailable", dialogue_evidence=[promise]),
+            rec(3, "action", "Варианты имбалансов нужно встроить в методичку", "commit", speaker="@B", assignees=["@B"], commitment_strength="implicit", verification_status="verification_unavailable", dialogue_evidence=[{"id": "U31", "speaker": "@B", "text": "Потом встрою это в методичку."}]),
+        ])
+        self.assertEqual(len(graph["task_states"]), 2)
+        self.assertTrue(all(item["status"] == "self_committed" for item in graph["task_states"]))
+        anchors = [claim for claim in graph["claims"] if claim.get("canonical_task_anchor")]
+        self.assertTrue(all(claim["verification_status"] == "supported" for claim in anchors))
+
+    def test_cross_day_rule_closes_question(self):
+        graph = build_meeting_graph([
+            rec(1, "question", "Может ли сделка закрыться на следующий день?", "ask", requested_slots=["cross_day_closure_feasibility"], answer_record_ids=["F2"]),
+            rec(2, "system_rule", "Если сделка не дошла до Take Profit, она закрывается автоматически после 00:00", "answer", speaker="@B"),
+        ])
+        self.assertEqual(graph["question_states"][0]["status"], "answered")
+
+    def test_proposal_with_local_other_speaker_yes_is_accepted(self):
+        graph = build_meeting_graph([rec(1, "proposal", "@A предложил сделать разметчик для @B", "propose", speaker="@A", dialogue_evidence=[
+            {"id": "U1", "speaker": "@A", "text": "Мне сделать разметчик тебе?", "start": 1},
+            {"id": "U2", "speaker": "@B", "text": "Да-да-да. Дальше этап апробации.", "start": 2},
+        ], evidence_ids=["U1", "U2"])])
+        self.assertEqual(graph["decision_states"][0]["status"], "accepted")
+        self.assertTrue(graph["decision_states"][0]["acceptance_check"] == "entailed")
+
     def test_unrelated_month_does_not_revise_task_scope(self):
         graph = build_meeting_graph([
             rec(1, "resource", "Я передам выгрузку Bitcoin", "commit", assignees=["@A"]),

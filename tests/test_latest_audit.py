@@ -16,6 +16,19 @@ class LatestAuditRegressionTests(unittest.TestCase):
         window = {"text": "Рабочее окно с 16:30 до 18:00", "speech_act": "answer"}
         self.assertTrue(verify_slot_entailment(["диапазон времени"], window, {"text": "Какой рабочий диапазон?"})["passed"])
         self.assertEqual(normalize_slot("result on higher timeframes"), "implementation_status")
+        cross_day = {"text": "Она закрывается автоматически после 00:00.", "speech_act": "answer"}
+        self.assertTrue(verify_slot_entailment(["cross_day_closure_feasibility"], cross_day)["passed"])
+
+    def test_publication_gate_rejects_surface_regressions(self):
+        base = {"section": "minutes", "text": "Order Block размечается.", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"]}
+        report = {"audits": [{"passed": True, "errors": []}]}
+        artifact = "# Итоги\n\n### 00:01:00–00:01:00 — SM (Structure Maker)\nDiscussed potential goal for future work\nassigned_pending\n"
+        audit = publication_audit(report, artifact, [base], {"view_plans": {}})
+        self.assertGreater(audit["rendered_english_prose"], 0)
+        self.assertGreater(audit["invented_acronym_expansions"], 0)
+        self.assertGreater(audit["internal_labels_exposed"], 0)
+        self.assertGreater(audit["zero_duration_chapters"], 0)
+        self.assertFalse(audit["passed"])
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}

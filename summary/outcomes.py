@@ -18,9 +18,10 @@ def _field(claim, text=None):
     if not claim:
         return None
     return {
-        "value": str(text or claim.get("statement") or "").strip(),
+        "value": str(text or claim.get("publication_text") or claim.get("statement") or "").strip(),
         "claim_ids": [claim.get("claim_id")],
         "evidence_ids": list(claim.get("evidence_ids", [])),
+        "verification_status": claim.get("verification_status"),
     }
 
 
@@ -41,15 +42,16 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
             continue
         state = _pick(claims, {"current_state", "experimental_result", "observation"})
         constraint = _pick(claims, {"problem", "blocker", "constraint", "risk", "dependency"})
-        resolution = _pick(claims, {"decision", "design_choice", "correction"}, lambda item: item.get("lifecycle", "active") == "active")
+        resolution = _pick(claims, {"decision", "proposal", "design_choice", "correction"}, lambda item: item.get("lifecycle", "active") == "active" and (item.get("content_kind") != "proposal" or item.get("decision_status") == "accepted"))
         work = _pick(claims, {"resource", "dataset", "definition", "trading_rule", "system_rule"})
         next_claim = _pick(claims, {"action", "follow_up", "proposal"})
         next_field = None
         if next_claim:
             task = task_by_prop.get(next_claim.get("proposition_id"), {})
-            label = str(task.get("deliverable") or next_claim.get("statement") or "").strip()
+            label = str(task.get("deliverable") or next_claim.get("publication_text") or next_claim.get("statement") or "").strip()
             if task.get("status"):
-                label += f" (статус: {task['status']})"
+                labels = {"self_committed": "участник взял на себя", "assigned_pending": "назначение ожидает подтверждения", "assigned": "назначено", "accepted": "согласовано", "completed": "выполнено", "blocked": "заблокировано", "proposed": "предложено, не подтверждено", "idea": "идея, не подтверждена"}
+                label += f" (статус: {labels.get(task['status'], task['status'])})"
             next_field = _field(next_claim, label)
         remaining = []
         for claim in claims:

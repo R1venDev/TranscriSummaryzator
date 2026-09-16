@@ -13,6 +13,8 @@ SLOT_ALIASES = {
     "high_tf_result": "implementation_status", "result on higher timeframes": "implementation_status",
     "definition small imbalance": "threshold_value",
     "reversal zone bos condition": "reason_hypothesis",
+    "cross day closure feasibility": "cross_day_closure",
+    "cross_day_closure_feasibility": "cross_day_closure",
 }
 
 
@@ -71,6 +73,8 @@ def verify_slot_entailment(requested_slots, answer, question=None):
         elif slot == "implementation_status" and relevant and re.search(r"(?iu)\b(?:работа\w*|готов\w*|получил\w*|получен\w*|результат\w*|не\s+сработ\w*|неуспеш\w*|реализ\w*|задерж\w*|не\s+закончен\w*)\b", text):
             entailed[original_slot] = text
         elif slot == "reason_hypothesis" and relevant and re.search(r"(?iu)\b(?:потому|из-за|причин\w*|возможно|гипотез\w*)\b", text):
+            entailed[original_slot] = text
+        elif slot == "cross_day_closure" and re.search(r"(?iu)\b(?:автоматическ\w*\s+)?закрыва\w*\b", text) and re.search(r"(?iu)(?:00\s*:\s*00|полуноч\w*|следующ\w*\s+д(?:ень|ня))", text):
             entailed[original_slot] = text
         elif original_slot == "closing" and relevant and re.search(r"(?iu)\b(?:закрыва\w*|закро\w*)\b", text):
             entailed[original_slot] = text

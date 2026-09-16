@@ -43,7 +43,7 @@ from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_verified_document, project_views
 from summary.outcomes import build_outcome_cards
-from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
+from summary.verifier import audit_realization, build_public_items, diff_public_items, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
@@ -2494,7 +2494,7 @@ def render_public_items_legacy(items, metadata=None):
 
 
 def _public_text(item):
-    text = canonicalize_people(item.get("text") or "")
+    text = canonicalize_people(sanitize_public_surface(item.get("text") or ""))
     text = re.sub(r"(?iu)^\s*говорящий\s+(@[\w.-]+)\s+", r"\1 ", text)
     text = re.sub(r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм", text)
     text = re.sub(r"(?iu)\bbaseline\b", "ориентир", text)
@@ -2523,13 +2523,21 @@ def build_public_document(items, metadata=None, graph=None):
         roles = bool(re.search(r"(?iu)\b(?:работ|готов|огранич|проблем|решил|соглас|провер|следующ|задерж|результат|создал|переда)\w*", text))
         return 3 * roles + 2 * (item.get("section") in {"decisions", "tasks", "technical"}) + bool(item.get("evidence_ids")) - 4 * bool(item.get("verification_status") in {"verification_unavailable", "insufficient_evidence"})
 
-    allowed_claims = {claim for item in items for claim in item.get("claim_ids", [])}
-    outcome_cards = build_outcome_cards(graph, allowed_claims) if graph else []
-    minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
     items_by_claim = {}
     for item in items:
         for claim_id in item.get("claim_ids", []):
             items_by_claim.setdefault(claim_id, []).append(item)
+    allowed_claims = {claim for item in items for claim in item.get("claim_ids", [])}
+    outcome_graph = graph
+    if graph:
+        outcome_graph = dict(graph)
+        outcome_graph["claims"] = []
+        for claim in graph.get("claims", []):
+            public_candidates = items_by_claim.get(claim.get("claim_id"), [])
+            public_text = max(public_candidates, key=lambda item: utility(item)).get("text") if public_candidates else sanitize_public_surface(claim.get("statement"))
+            outcome_graph["claims"].append(dict(claim, publication_text=public_text))
+    outcome_cards = build_outcome_cards(outcome_graph, allowed_claims) if outcome_graph else []
+    minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
     # Episode topics are useful clustering hints, but can be model-authored and
     # are not necessarily supported by the claims selected into a card.  The
     # public label is therefore chosen from a verified PublicItem in that card.
@@ -2579,10 +2587,23 @@ def build_public_document(items, metadata=None, graph=None):
     # Overview roles are selected from different semantic needs, not a global
     # lexical score.  This keeps state, constraint and next action distinct.
     overview = []
+    role_patterns = {
+        "current_state": r"(?iu)\b(?:работ\w*|готов\w*|создан\w*|получен\w*|сделан\w*)\b",
+        "constraint": r"(?iu)\b(?:задерж\w*|проблем\w*|огранич\w*|не\s+работ\w*)\b",
+        "resolution": r"(?iu)\b(?:решил\w*|соглас\w*|договор\w*|будет|можно)\b",
+        "work_result": r"(?iu)\b(?:результат\w*|данн\w*|методич\w*|размет\w*)\b",
+        "next_step": r"(?iu)\b(?:подготов\w*|переда\w*|предостав\w*|размеч\w*|встро\w*|сдела\w*)\b",
+    }
     for field_name in ("current_state", "constraint", "resolution", "work_result", "next_step"):
+        candidates = []
         for card in outcome_cards:
             field = card.get("fields", {}).get(field_name)
-            if field and field.get("value") and field.get("value") not in {x["text"] for x in overview}:
+            if not field or not field.get("value") or field.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
+                continue
+            score = 5 * bool(re.search(role_patterns[field_name], field["value"])) + len(field.get("evidence_ids", []))
+            candidates.append((score, field))
+        for _score, field in sorted(candidates, key=lambda value: value[0], reverse=True):
+            if field["value"] not in {x["text"] for x in overview}:
                 overview.append({"text": field["value"], "claim_ids": field["claim_ids"], "evidence_ids": field["evidence_ids"], "role": field_name})
                 break
         if len(overview) >= 5:
@@ -2627,26 +2648,28 @@ def build_public_document(items, metadata=None, graph=None):
     # Legacy callers may provide only overview items.  Their outcome fields are
     # already rendered in ``## Главное``; emitting an empty chronology would
     # manufacture navigation semantics without a chronological source item.
-    for index, card in enumerate(outcome_cards if minute_items else [], 1):
-        ranges = card.get("ranges") or [{"start": 0, "end": 0}]
+    raw_chapters = []
+    for card in outcome_cards if minute_items else []:
+        matching = [item for item in minute_items if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
+        ranges = [{"start": float(item.get("start", 0)), "end": float(item.get("end", item.get("start", 0))) } for item in matching]
+        ranges = ranges or card.get("ranges") or [{"start": 0, "end": .001}]
         start = min(float(value.get("start", 0)) for value in ranges)
         end = max(float(value.get("end", value.get("start", 0))) for value in ranges)
-        if end <= start:
-            matching = [item for item in minute_items if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
-            end = max([float(item.get("end", item.get("start", 0))) for item in matching] or [start + .001])
-        chapters.append({
-            "chapter_id": f"CH{index:02d}", "label": _chapter_label(card.get("topic") or "Результат темы"),
-            "start": start, "end": end, "ranges": ranges,
-            "claim_ids": card.get("claim_ids", []), "evidence_ids": card.get("evidence_ids", []),
-            "items": [item for item in minute_items if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))],
-            "outcome_id": card["outcome_id"],
-        })
+        end = max(end, start + .001)
+        raw_chapters.append({"label": _chapter_label(card.get("topic") or "Результат темы"), "start": start, "end": end, "ranges": ranges, "claim_ids": card.get("claim_ids", []), "evidence_ids": card.get("evidence_ids", []), "items": matching, "outcome_id": card["outcome_id"], "outcome_ids": [card["outcome_id"]]})
+    raw_chapters.sort(key=lambda value: (value["start"], value["end"]))
+    bucket_count = min(12, len(raw_chapters))
+    for bucket in range(bucket_count):
+        members = [chapter for index, chapter in enumerate(raw_chapters) if index * bucket_count // max(1, len(raw_chapters)) == bucket]
+        if not members:
+            continue
+        chapters.append({"chapter_id": f"CH{len(chapters)+1:02d}", "label": members[0]["label"], "start": min(x["start"] for x in members), "end": max(max(x["end"], x["start"] + .001) for x in members), "ranges": [value for x in members for value in x["ranges"]], "claim_ids": list(dict.fromkeys(value for x in members for value in x["claim_ids"])), "evidence_ids": list(dict.fromkeys(value for x in members for value in x["evidence_ids"])), "items": list({item["public_id"]: item for x in members for item in x["items"]}.values()), "outcome_id": members[0]["outcome_id"], "outcome_ids": [value for x in members for value in x["outcome_ids"]]})
     return {
         "schema": "VerifiedDocument", "schema_version": 4,
         "title": {"text": title, "claim_ids": list(dict.fromkeys(claim for item in title_sources for claim in item.get("claim_ids", []))), "evidence_ids": list(dict.fromkeys(evidence for item in title_sources for evidence in item.get("evidence_ids", [])))},
         "overview": overview,
         "sections": {key: value for key, value in by_section.items() if key not in {"overview", "minutes"}},
-        "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "ranges", "claim_ids", "evidence_ids", "outcome_id")} for chapter in chapters],
+        "navigation": [{key: chapter[key] for key in ("chapter_id", "label", "start", "end", "ranges", "claim_ids", "evidence_ids", "outcome_id", "outcome_ids")} for chapter in chapters],
         "chronology": chapters, "outcome_cards": outcome_cards,
         "metadata": dict(metadata),
     }
@@ -2690,19 +2713,18 @@ def render_public_document(document):
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
             lines.extend([f"### {start}–{end} — {chapter['label']}", ""])
-            card = cards.get(chapter.get("outcome_id"), {})
             rendered_fields = []
-            for name in ("current_state", "constraint", "resolution", "work_result", "next_step", "remaining_unknown"):
-                value = card.get("fields", {}).get(name)
-                values = value if isinstance(value, list) else [value] if value else []
-                for field in values:
-                    if field and field.get("value"):
-                        rendered_fields.append(f"**{field_labels[name]}:** {terminate_sentence(_public_text({'text': field['value']}))}")
+            chapter_cards = [cards[value] for value in chapter.get("outcome_ids", [chapter.get("outcome_id")]) if value in cards]
+            for card in chapter_cards:
+                for name in ("current_state", "constraint", "resolution", "work_result", "next_step", "remaining_unknown"):
+                    value = card.get("fields", {}).get(name)
+                    values = value if isinstance(value, list) else [value] if value else []
+                    for field in values:
+                        if field and field.get("value"):
+                            rendered_fields.append(f"**{field_labels[name]}:** {terminate_sentence(_public_text({'text': field['value']}))}")
             if rendered_fields:
                 lines.extend(rendered_fields)
-            covered = {claim for value in card.get("fields", {}).values()
-                       for field in (value if isinstance(value, list) else [value] if value else [])
-                       for claim in field.get("claim_ids", [])}
+            covered = {claim for card in chapter_cards for value in card.get("fields", {}).values() for field in (value if isinstance(value, list) else [value] if value else []) for claim in field.get("claim_ids", [])}
             context_items = [item for item in chapter["items"] if not set(item.get("claim_ids", [])) <= covered]
             if context_items:
                 lines.extend(f"**Контекст:** {terminate_sentence(_public_text(item))}" for item in context_items)
@@ -4506,12 +4528,15 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "question_metric_stage": "canonical_state_to_public_selection",
     })
     anchor_by_id = {turn["id"]: float(turn.get("start", 0)) for turn in source_turns}
+    anchor_end_by_id = {turn["id"]: float(turn.get("end", turn.get("start", 0))) for turn in source_turns}
     anchor_starts = set(anchor_by_id.values())
     for item in public_items:
         proposed_start = float(item.get("start", 0))
         supporting = [anchor_by_id[value] for value in item.get("evidence_ids", []) if value in anchor_by_id]
         if supporting:
             item["start"] = min(supporting, key=lambda value: abs(value - proposed_start))
+            item["end"] = max([anchor_end_by_id[value] for value in item.get("evidence_ids", []) if value in anchor_end_by_id] or [item["start"] + .001])
+            item["end"] = max(float(item["end"]), float(item["start"]) + .001)
             item["navigation_basis"] = "supporting_utterance"
         elif anchor_starts:
             item["start"] = min(anchor_starts, key=lambda value: abs(value - proposed_start))

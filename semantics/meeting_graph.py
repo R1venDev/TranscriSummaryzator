@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import re
 from .episodes import build_episodes, build_threads
 from .bundles import build_dialogue_bundles
 from .entities import EntityRegistry
@@ -55,7 +56,7 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
     propositions = list(proposition_map.values())
     events = [_event(record, record_to_prop[record.get("record_id")]) for record in records]
     relations = resolve_relations(propositions, events, records)
-    decisions = reduce_decisions(propositions, events, relations)
+    decisions = reduce_decisions(propositions, events, relations, records)
     tasks = reduce_tasks(propositions, events, relations, records)
     questions = reduce_questions(propositions, events, relations, records)
     rules, experiments = reduce_rules_and_experiments(propositions, events, decisions)
@@ -96,12 +97,17 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
         if prop["proposition_id"] in task_by_prop:
             task = task_by_prop[prop["proposition_id"]]
             claim.update(task_status=task["status"], assignee=task.get("assignee"), automation_eligible=task.get("automation_eligible"), scope_state=task.get("scope_state"), time_scope=task.get("current_scope"), canonical_task_state_id=task["task_id"], canonical_task_anchor=prop["proposition_id"] == task["proposition_id"], commitment_strength=task.get("commitment_strength"), commitment_actor=task.get("commitment_actor"))
+            if task.get("status") == "self_committed" and task.get("source_commitment_evidence_ids"):
+                claim["verification_status"] = "supported"
+                claim["evidence_ids"] = list(dict.fromkeys(claim["evidence_ids"] + task["source_commitment_evidence_ids"]))
         if prop["proposition_id"] in question_by_prop:
             question = question_by_prop[prop["proposition_id"]]
             claim.update(question_status=question["status"], question_slots=question.get("missing_slots", []))
+        generic_reply = bool(re.fullmatch(r"(?iu)\s*(?:(?:да[\s,!.—-]*)+|нет|неа|ага|угу|ну\s+ладно)\s*", str(claim.get("statement") or "")))
+        claim["dialogue_only"] = generic_reply and bool(prop_events) and all(x.get("speech_act") in {"accept", "reject"} for x in prop_events)
         claims.append(claim)
     claim_relations = [{**x, "source_claim_id": "C" + x["source_proposition_id"][1:], "target_claim_id": "C" + x["target_proposition_id"][1:]} for x in relations]
-    episodes = build_episodes(claims)
+    episodes = build_episodes([claim for claim in claims if not claim.get("dialogue_only")])
     threads = build_threads(episodes, claims, claim_relations)
     dialogue_bundles = build_dialogue_bundles(episodes, threads, events, claims, claim_relations)
     stable_recording = (provenance or {}).get("recording_id") or (provenance or {}).get("audio_sha256")

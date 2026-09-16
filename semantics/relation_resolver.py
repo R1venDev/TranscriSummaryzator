@@ -22,9 +22,9 @@ def _similarity(left, right):
     return len(a & b) / max(1, len(a | b))
 
 
-def _relation(kind, source, target, evidence, confidence, basis):
-    raw = f"{kind}|{source}|{target}|{'|'.join(evidence)}"
-    return {"relation_id": "R" + hashlib.sha256(raw.encode()).hexdigest()[:16], "type": kind, "source_proposition_id": source, "target_proposition_id": target, "evidence_ids": list(dict.fromkeys(evidence)), "confidence": confidence, "basis": basis}
+def _relation(kind, source, target, evidence, confidence, basis, source_record_id=None, source_event_id=None, target_record_id=None):
+    raw = f"{kind}|{source}|{target}|{source_record_id}|{source_event_id}|{'|'.join(evidence)}"
+    return {"relation_id": "R" + hashlib.sha256(raw.encode()).hexdigest()[:16], "type": kind, "source_proposition_id": source, "target_proposition_id": target, "source_record_id": source_record_id, "source_event_id": source_event_id, "target_record_id": target_record_id, "evidence_ids": list(dict.fromkeys(evidence)), "confidence": confidence, "basis": basis}
 
 
 def _quantity_directions(proposition):
@@ -42,13 +42,13 @@ def resolve_relations(propositions, events, records):
     prop_by_record = {rid: prop for prop in propositions for rid in prop.get("source_record_ids", [])}
     ordered = sorted(events, key=lambda x: (x.get("timestamp", 0), x.get("event_id")))
     relations, seen = [], set()
-    def add(kind, source, target, evidence, confidence=.9, basis="deterministic"):
+    def add(kind, source, target, evidence, confidence=.9, basis="deterministic", source_record_id=None, source_event_id=None, target_record_id=None):
         if not source or not target or source == target or not evidence:
             return
-        key = (kind, source, target)
+        key = (kind, source, target, source_record_id, source_event_id)
         if key in seen:
             return
-        seen.add(key); relations.append(_relation(kind, source, target, evidence, confidence, basis))
+        seen.add(key); relations.append(_relation(kind, source, target, evidence, confidence, basis, source_record_id, source_event_id, target_record_id))
     for record in records:
         source = prop_by_record.get(record.get("record_id"))
         if not source:
@@ -58,16 +58,17 @@ def resolve_relations(propositions, events, records):
             if answer:
                 slot_check = verify_slot_entailment(record.get("requested_slots", []), by_record.get(answer_id, {}), record)
                 kind = "answers" if slot_check["passed"] else "partially_answers"
-                add(kind, answer["proposition_id"], source["proposition_id"], answer["evidence_ids"] + source["evidence_ids"], .98 if slot_check["passed"] else .75, "explicit_slot_entailment")
+                local_evidence = list(record.get("evidence_ids", [])) + list(by_record.get(answer_id, {}).get("evidence_ids", []))
+                add(kind, answer["proposition_id"], source["proposition_id"], local_evidence, .98 if slot_check["passed"] else .75, "explicit_slot_entailment", answer_id, target_record_id=record.get("record_id"))
         for target_id in record.get("corrects_record_ids", []):
             target = prop_by_record.get(target_id)
-            if target: add("corrects", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "explicit_revision")
+            if target: add("corrects", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "explicit_revision", record.get("record_id"), target_record_id=target_id)
         for target_id in record.get("supersedes_record_ids", []) + record.get("revises_record_ids", []):
             target = prop_by_record.get(target_id)
-            if target: add("supersedes", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "explicit_revision")
+            if target: add("supersedes", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "explicit_revision", record.get("record_id"), target_record_id=target_id)
         for target_id in record.get("accepts_record_ids", []):
             target = prop_by_record.get(target_id)
-            if target: add("accepts", source["proposition_id"], target["proposition_id"], source["evidence_ids"] + target["evidence_ids"], .99, "source_grounded_short_reply")
+            if target: add("accepts", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "source_grounded_short_reply", record.get("record_id"), target_record_id=target_id)
     for index, event in enumerate(ordered):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]
@@ -94,7 +95,7 @@ def resolve_relations(propositions, events, records):
             is_rejection = event["speech_act"] == "reject" or bool(REJECT_RE.search(text))
             if target_event and (is_rejection or not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
                 kind = "rejects" if is_rejection else "accepts"
-                add(kind, source["proposition_id"], target_event["proposition_id"], source["evidence_ids"], .96, "coreference_short_reply")
+                add(kind, source["proposition_id"], target_event["proposition_id"], event.get("evidence_ids", []), .96, "coreference_short_reply", event.get("source_record_id"), event.get("event_id"), target_event.get("source_record_id"))
         for prior in reversed(prior_events):
             target = next(x for x in propositions if x["proposition_id"] == prior["proposition_id"])
             similarity = _similarity(text, target["statement"])
