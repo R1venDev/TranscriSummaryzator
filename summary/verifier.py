@@ -422,18 +422,27 @@ def verify_generated_items(items, sentence_plans, claims):
         # Previously these fields were appended after audit_realization(), so
         # verbatim source negation and source numbers could be rejected as new.
         exact_source_surfaces = []
+        semantic_source_surfaces = []
+        exact_evidence_surfaces = []
         for source in cited:
             exact_ids = set(source.get("evidence_ids", []))
             exact_turns = [
                 str(turn.get("text") or "") for turn in source.get("dialogue_evidence", [])
                 if turn.get("id") in exact_ids
             ]
-            exact_source_surfaces.append(" ".join([
-                str(source.get("statement") or ""), public_surface_text(source), *exact_turns,
-            ]))
+            semantic_surface = " ".join([str(source.get("statement") or ""), public_surface_text(source)])
+            semantic_source_surfaces.append(semantic_surface)
+            exact_evidence_surfaces.extend(exact_turns)
+            exact_source_surfaces.append(" ".join([semantic_surface, *exact_turns]))
         merged["allowed_numbers"].extend(NUMBER_RE.findall(" ".join(exact_source_surfaces)))
         merged["allowed_speakers"].extend(s for x in cited for s in x.get("speaker_refs", []))
-        source_has_negation = any(NEGATION_RE.search(value) for value in exact_source_surfaces)
+        # A long evidence turn can contain a different, unrelated negated
+        # clause. It may license negation actually rendered from that exact
+        # turn, but it must not force every shorter realization to be negative.
+        source_has_negation = (
+            any(NEGATION_RE.search(value) for value in semantic_source_surfaces)
+            or bool(NEGATION_RE.search(text) and any(NEGATION_RE.search(value) for value in exact_evidence_surfaces))
+        )
         if item.get("section") == "questions":
             # A residual question is not an assertion of its cited answer or
             # schedule state. Keep its source-backed wording and provenance
