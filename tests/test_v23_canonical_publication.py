@@ -150,11 +150,14 @@ class CanonicalStateTests(unittest.TestCase):
 
     def test_structure_status_answer_closes_question_and_minutes(self):
         graph = build_meeting_graph([
+            rec(0, "question", "Участник задаёт вопрос адресованный @A / @B.", "ask", speaker="@C", requested_slots=["ответ_от_участников"], answer_record_ids=["F1", "F2", "F3"]),
             rec(1, "question", "Со структурами полностью закончили?", "ask", speaker="@A", requested_slots=["статус работы со структурами"], answer_record_ids=["F2", "F3"], question_status="answered"),
             rec(2, "problem", "На старших таймфреймах остаётся задержка", "answer", speaker="@B"),
             rec(3, "observation", "На минутном таймфрейме алгоритм работал корректно", "answer", speaker="@B"),
         ])
-        question = graph["question_states"][0]
+        wrapper, question = graph["question_states"][:2]
+        self.assertEqual(wrapper["status"], "superseded")
+        self.assertEqual(wrapper["superseded_by_question_id"], question["question_id"])
         self.assertEqual(question["status"], "answered")
         planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
         items = build_public_items(graph, planned)

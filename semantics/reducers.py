@@ -131,7 +131,9 @@ def reduce_decisions(propositions, events, relations, records=None):
                 dialogue = sorted(record.get("dialogue_evidence", []), key=lambda value: float(value.get("start", 0)))
                 proposal_start = min((float(value.get("timestamp", 0)) for value in prop_events), default=0)
                 for index, turn in enumerate(dialogue):
-                    if float(turn.get("start", 0)) < proposal_start or not ACCEPT_RE.search(str(turn.get("text") or "")):
+                    if (float(turn.get("start", 0)) < proposal_start
+                            or turn.get("speaker") == latest.get("speaker")
+                            or not ACCEPT_RE.search(str(turn.get("text") or ""))):
                         continue
                     if any(prior.get("speaker") and turn.get("speaker") and prior.get("speaker") != turn.get("speaker") for prior in dialogue[:index]):
                         local_acceptance.extend([value for value in (turn.get("id"),) if value])
@@ -391,6 +393,28 @@ def reduce_questions(propositions, events, relations, records):
             "remaining_unknown": result[-1]["remaining_question"],
             "resolution_basis": "direct_answer" if status == "answered" else "partial_answer" if status == "partially_answered" else "no_entailed_answer",
         })
+    # Semantic extraction can emit a generic wrapper immediately before the
+    # actual question (for example, "Участник задаёт вопрос адресованный …").
+    # Once that specific child question is answered, the wrapper is not an
+    # independent open issue and must not leak into either questions or minutes.
+    by_source_question = {item.get("source_record_id"): item for item in result}
+    generic_wrapper = re.compile(r"(?iu)^\s*участник\s+зада[её]т\s+вопрос(?:\s+адресованн\w*\s+(?:@[\w.-]+(?:\s*/\s*@[\w.-]+)*))?[.!?]*\s*$")
+    for item in result:
+        if item.get("status") != "unanswered" or not generic_wrapper.fullmatch(str(item.get("original_question") or "")):
+            continue
+        answered_child = next((
+            by_source_question.get(record_id) for record_id in item.get("answer_record_ids", [])
+            if by_source_question.get(record_id, {}).get("status") in {"answered", "rhetorical", "superseded"}
+        ), None)
+        if answered_child:
+            item.update(
+                status="superseded",
+                remaining_question=None,
+                residual_question_text=None,
+                remaining_unknown=None,
+                resolution_basis="superseded_by_answered_specific_question",
+                superseded_by_question_id=answered_child.get("question_id"),
+            )
     return result
 
 
