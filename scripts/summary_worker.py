@@ -4286,6 +4286,24 @@ def build_semantic_registry(client, model, facts, run_dir):
 
     processed_ids = set()
 
+    def retain_with_unavailable_structure(fact, failure):
+        """Keep source-backed content when optional structuring cannot finish."""
+        record = normalize_semantic_record({}, fact)
+        record["semantic_structure_status"] = "verification_unavailable"
+        record["semantic_structure_failure"] = failure
+        uncertainty = dict(record.get("uncertainty", {}))
+        uncertainty["needs_review"] = True
+        uncertainty["reasons"] = sorted(set(uncertainty.get("reasons", [])) | {"semantic_structure_unavailable"})
+        record["uncertainty"] = uncertainty
+        record["semantic_risks"] = sorted(set(record.get("semantic_risks", [])) | {"semantic_structure_unavailable"})
+        records.append(record)
+        processed_ids.add(fact["fact_id"])
+        diagnostic_event(
+            "semantic_structure", category="decision", outcome="retained_unavailable",
+            severity="WARN", reasons=[failure],
+            refs={"fact_id": fact.get("fact_id"), "evidence_ids": fact.get("evidence_ids", [])},
+        )
+
     def structure_batch(batch, offset):
         if token_aware_split_required(batch, 4200):
             middle = len(batch) // 2
@@ -4302,7 +4320,18 @@ def build_semantic_registry(client, model, facts, run_dir):
                 attempts=2, num_predict=4200, contract="semantic_records",
             )
         except RuntimeError as exc:
-            if len(batch) <= 1 or not output_limit_error(exc):
+            if len(batch) <= 1:
+                retain_with_unavailable_structure(
+                    batch[0],
+                    "output_limit" if output_limit_error(exc) else "model_or_contract_failure",
+                )
+                emit(
+                    73 + 6 * len(processed_ids) / max(1, len(facts)),
+                    "summary_structure",
+                    f"Структурированы задачи и условия: {len(processed_ids)} из {len(facts)} тезисов",
+                )
+                return
+            if not output_limit_error(exc):
                 raise
             middle = len(batch) // 2
             structure_batch(batch[:middle], offset)
@@ -4317,11 +4346,11 @@ def build_semantic_registry(client, model, facts, run_dir):
         missing = [fact for fact in batch if fact["fact_id"] not in by_id]
         if missing:
             if len(missing) == len(batch) and len(batch) <= 2:
-                # Safe deterministic record: the original fact remains the
-                # authority, while optional semantic fields stay empty.
+                # The original fact remains authoritative; absence of model
+                # structure is explicit rather than silently treated as a
+                # successful semantic review.
                 for fact in missing:
-                    records.append(normalize_semantic_record({}, fact))
-                    processed_ids.add(fact["fact_id"])
+                    retain_with_unavailable_structure(fact, "incomplete_response")
             elif len(missing) == len(batch):
                 middle = len(batch) // 2
                 structure_batch(batch[:middle], offset)

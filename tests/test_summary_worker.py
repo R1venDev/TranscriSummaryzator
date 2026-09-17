@@ -1221,6 +1221,20 @@ class SummaryWorkerTests(unittest.TestCase):
             self.assertEqual(kept[0]["verification_status"], "verification_unavailable")
             self.assertEqual(kept[0]["verification_failure_stage"], "editorial_review")
 
+    def test_semantic_structure_retains_single_fact_after_output_limit(self):
+        class Client:
+            def chat(self, *_args, **_kwargs):
+                raise RuntimeError("ответ оборван или достигнут лимит вывода")
+
+        source = fact(kind="definition", statement="Термин означает исходное состояние")
+        with tempfile.TemporaryDirectory() as directory:
+            registry = summary.build_semantic_registry(Client(), "model", [source], Path(directory))
+        self.assertEqual(len(registry["records"]), 1)
+        record = registry["records"][0]
+        self.assertEqual(record["statement"], source["statement"])
+        self.assertEqual(record["semantic_structure_status"], "verification_unavailable")
+        self.assertIn("semantic_structure_unavailable", record["uncertainty"]["reasons"])
+
     def test_final_audit_splits_when_model_omits_reviews(self):
         facts = [
             fact(statement="Первый тезис"),
