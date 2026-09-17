@@ -29,6 +29,9 @@ def sanitize_public_surface(text):
     value = re.sub(r"(?iu)^Discussed\s+potential\s+goal:\s*creating\s+a\s+baseline\s+solution\s+with\s+winrate\s+around\s+30\s*[–—-]\s*40%\.?$", "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.", value)
     value = re.sub(r"(?iu)^(@[\w.-]+)\s+asks\s+for\s+clarification\s+on\s+what\s+constitutes\s+a\s+['\"]?small['\"]?\s+imbalance\s+in\s+context\.?$", r"\1 уточняет, что считать малым имбалансом.", value)
     value = re.sub(r"(?iu)^(@[\w.-]+)\s+suggests\s+returning\s+to\s+algorithmic\s+thinking\s+and\s+potentially\s+incorporating\s+higher\s+timeframes\s+if\s+the\s+current\s+approach\s+does\s+not\s+yield\s+results\.?$", r"Если текущий подход не даст результата, \1 предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы.", value)
+    value = re.sub(r"(?iu)^(@[\w.-]+)\s+proposes\s+using\s+a\s+neural\s+network\s+to\s+determine\s+barriers\s+based\s+on\s+detected\s+swings\s+and\s+historical\s+data,\s+given\s+that\s+the\s+mathematical\s+expectation\s+was\s+negative\s+for\s+predefined\s+SL/TP\.?$", r"После отрицательного матожидания при фиксированных SL/TP \1 предложил определять ценовой барьер нейросетью по истории и обнаруженным свингам.", value)
+    value = re.sub(r"(?iu)^Обсуждалась\s+возможность\s+инструмент\s+улучшения\s*\(связывание\s+объемов\s+и\s+принтов\)\s+планировалось\s+внедрить\.?$", "Связывание объёмов и принтов рассматривалось как возможное улучшение.", value)
+    value = re.sub(r"(?iu)^@[\w.-]+\s*/\s*@[\w.-]+\s+должен\s+разметить\s+какой-нибудь\s+параметр\s+порога,\s+который\s+скажет\s+размер\s+какого\s+имбаланса\s+нужно\s+учитывать\.?$", "Нужно разметить порог размера имбаланса, чтобы определить, какие имбалансы учитывать.", value)
     value = re.sub(r"(?iu)\bBOS\s*\(\s*Break\s+of\s+Structure\s*\)", "BOS (слом структуры)", value)
     value = re.sub(r"(?iu)\bSM\s*\(\s*Structure\s+Maker\s*\)", "SM", value)
     value = re.sub(r"(?iu)\bbaseline\b", "ориентир", value)
@@ -656,6 +659,12 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
             bool(context.get("text")) and len(tokens(context.get("text")) & tokens(item.get("text"))) / max(1, min(len(tokens(context.get("text"))), len(tokens(item.get("text"))))) >= .72
             for item in contextual_items for context in item.get("context", [])
         )
+        counters["section_context_low_relevance"] = sum(
+            not ({value[:5] if len(value) >= 5 else value for value in tokens(item.get("text"))}
+                 & {value[:5] if len(value) >= 5 else value for value in tokens(context.get("text"))})
+            and abs(float(context.get("start", item.get("start", 0))) - float(item.get("start", 0))) > 75
+            for item in contextual_items for context in item.get("context", [])
+        )
         counters["goal_only_experiments"] = sum(
             bool(re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", str(item.get("text") or "")))
             for item in document.get("sections", {}).get("experiments", [])
@@ -671,7 +680,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
                 )
         counters["chronology_duplicate_fields"] = chronology_duplicates
     else:
-        counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})
+        counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "section_context_low_relevance": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})
     counters["section_counts"] = item_counts
     counters["rendered_section_counts"] = rendered_counts
     counters["planner_overflow"] = {name: value.get("overflow_count", 0) for name, value in summary_plan.get("view_plans", {}).items()}
@@ -683,7 +692,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
     counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_items_missing_context", "section_context_repetitions", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_items_missing_context", "section_context_repetitions", "section_context_low_relevance", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0
@@ -696,16 +705,25 @@ def runtime_quality_gates(report, artifact_text, verified_hash=None, items=None,
     return publication_audit(report, artifact_text, items, summary_plan, verified_hash, document)
 
 
-def verify_public_document(document, artifact_text, items):
+def verify_public_document(document, artifact_text, items, graph=None):
     """Bind the final title, prose, navigation and sections to their sources."""
     errors = []
     source_ids = {claim for item in items for claim in item.get("claim_ids", [])}
+    graph_claims = {
+        claim.get("claim_id"): claim for claim in (graph or {}).get("claims", [])
+        if claim.get("claim_id") and claim.get("lifecycle", "active") == "active"
+        and claim.get("verification_status") not in {"verification_unavailable", "insufficient_evidence"}
+    }
+    context_source_ids = source_ids | set(graph_claims)
     by_claim = {}
     for item in items:
         for claim in item.get("claim_ids", []):
             by_claim.setdefault(claim, []).append(item)
     tokens = lambda value: set(re.findall(r"(?iu)[a-zа-яё0-9]+", re.sub(r"[*`]", "", str(value or "")).casefold()))
     evidence_for = lambda claim_ids: {evidence for claim_id in claim_ids for item in by_claim.get(claim_id, []) for evidence in item.get("evidence_ids", [])}
+    context_evidence_for = lambda claim_ids: evidence_for(claim_ids) | {
+        evidence for claim_id in claim_ids for evidence in graph_claims.get(claim_id, {}).get("evidence_ids", [])
+    }
     surface = lambda value: re.sub(r"\s+", " ", re.sub(r"(?iu)\bсвичных\b", "свечных", re.sub(r"(?iu)\bbaseline\b", "ориентир", re.sub(r"[*`]", "", str(value or ""))))).strip().casefold()
     heading_sections = {"Главное": "overview", "Таймкоды": "navigation", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Что осталось уточнить": "questions", "Технические выводы и ограничения": "technical", "Идеи и эксперименты, ещё не проверенные": "experiments", "Требует проверки источника": "requires_verification", "Подробная хронология встречи": "chronology"}
     section_text = {}
@@ -808,9 +826,9 @@ def verify_public_document(document, artifact_text, items):
             if not original or original.get("text") != item.get("text") or len(tokens(item.get("text")) - target_words) > 2:
                 errors.append("section_not_rendered_from_verified_items")
             for context in item.get("context", []):
-                if not context.get("claim_ids") or not set(context["claim_ids"]) <= source_ids or not context.get("evidence_ids"):
+                if not context.get("claim_ids") or not set(context["claim_ids"]) <= context_source_ids or not context.get("evidence_ids"):
                     errors.append("unsupported_section_context")
-                if not set(context.get("evidence_ids", [])) <= evidence_for(context.get("claim_ids", [])):
+                if not set(context.get("evidence_ids", [])) <= context_evidence_for(context.get("claim_ids", [])):
                     errors.append("section_context_evidence_outside_closure")
                 if surface(context.get("text")) not in surface(section_text.get(section, "")):
                     errors.append("section_context_not_rendered")

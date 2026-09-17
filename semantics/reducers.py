@@ -362,13 +362,30 @@ def reduce_questions(propositions, events, relations, records):
         )
         answer_ids = list(dict.fromkeys(answer_ids))
         checks = [verify_slot_entailment(requested, by_record.get(answer_id, {}), record) for answer_id in answer_ids]
-        inferred = {slot for check in checks for slot in check["entailed_slots"]} if checks else set()
+        # The semantic extractor may preserve an immediate spoken answer only
+        # in the question's dialogue window. Verify those nearby turns with
+        # the same typed-slot rules instead of reopening the question merely
+        # because no standalone answer record was emitted.
+        question_start = float(record.get("start", event.get("timestamp", 0)))
+        question_evidence = set(record.get("evidence_ids", []))
+        direct_turns = [
+            dict(turn, statement=turn.get("text"), speech_act="answer")
+            for turn in record.get("dialogue_evidence", [])
+            if turn.get("id") not in question_evidence
+            and question_start < float(turn.get("start", 0)) <= question_start + 60
+        ]
+        direct_checks = [verify_slot_entailment(requested, turn, record) for turn in direct_turns]
+        inferred = {slot for check in checks + direct_checks for slot in check["entailed_slots"]} if checks or direct_checks else set()
         entailed = [x for x in requested if x in explicit_answered or x in inferred]
         missing = [x for x in requested if x not in entailed]
         upstream = str(record.get("question_status") or "").casefold()
+        direct_answer_evidence = [
+            turn.get("id") for turn, check in zip(direct_turns, direct_checks)
+            if check["entailed_slots"] and turn.get("id")
+        ]
         answer_evidence = list(dict.fromkeys(list(record.get("answer_evidence_ids", [])) + [
             value for relation in answer_relations for value in relation.get("evidence_ids", [])
-        ]))
+        ] + direct_answer_evidence))
         has_answer_support = bool(answer_relations or answer_ids or answer_evidence)
         if upstream in {"answered", "resolved"} and ((requested and not missing and has_answer_support) or (not requested and has_answer_support)):
             status, entailed, missing = "answered", requested or explicit_answered, []
@@ -381,6 +398,11 @@ def reduce_questions(propositions, events, relations, records):
         else: status = "unanswered"
         display = {"additional_tools": "решить, нужен ли дополнительный фильтр", "implementation_status": "проверить статус конкретной реализации", "time_range": "подтвердить точный диапазон времени", "day": "подтвердить день", "actor_commitment": "подтвердить действие и исполнителя", "threshold_value": "определить проверяемый порог", "reason_hypothesis": "проверить причинную гипотезу", "yes_no": "подтвердить решение"}
         known_parts = [str(by_record.get(answer_id, {}).get("statement") or "").strip() for answer_id in answer_ids]
+        known_parts.extend(
+            str(turn.get("text") or "").strip()
+            for turn, check in zip(direct_turns, direct_checks)
+            if check["entailed_slots"]
+        )
         known_parts = [value for value in known_parts if value]
         typed_missing = [normalize_slot(x) for x in missing]
         remaining = "; ".join(dict.fromkeys(display.get(x, "уточнить недостающий результат") for x in typed_missing))

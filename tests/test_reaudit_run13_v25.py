@@ -54,6 +54,19 @@ class Run13SemanticRegressions(unittest.TestCase):
         self.assertEqual(len(graph["question_states"]), 1)
         self.assertEqual(graph["question_states"][0]["status"], "unanswered")
 
+    def test_immediate_explicit_recommendation_closes_yes_no_question(self):
+        question = rec(
+            1, "question", "Существует ли дневное тренд-направление на индексах?", "ask",
+            requested_slots=["index_trend_daily"], question_status="answered",
+            dialogue_evidence=[
+                {"id": "U1", "start": 1, "text": "Существует ли дневное тренд-направление на индексах?"},
+                {"id": "U2", "start": 10, "text": "Не следует смотреть: между минутным и дневным слишком большая разница."},
+            ],
+        )
+        graph = build_meeting_graph([question])
+        self.assertEqual(graph["question_states"][0]["status"], "answered")
+        self.assertIn("U2", graph["question_states"][0]["answer_evidence_ids"])
+
     def test_semantic_revision_changes_generation_id(self):
         first = build_meeting_graph([rec(1, "observation", "Сервис работает", verification_status="supported")], provenance={"recording_id": "R"})
         second = build_meeting_graph([rec(1, "observation", "Сервис работает", modality="tentative", verification_status="insufficient_evidence")], provenance={"recording_id": "R"})
@@ -109,6 +122,22 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertIn("  - **Контекст:**", artifact)
         self.assertIn("  - **Контекст гипотезы:**", artifact)
         self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
+
+    def test_context_prefers_near_topic_claim_and_verifies_graph_provenance(self):
+        graph = build_meeting_graph([
+            rec(1, "observation", "Предлагается использовать старший таймфрейм для сопротивления"),
+            rec(80, "observation", "Создана задача на разметчик трёх свечных паттернов"),
+            rec(100, "constraint", "Для разметки трёх свечных паттернов используется тот же свинг-маркер"),
+        ])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
+        items = build_public_items(graph, planned)
+        document = build_public_document(items, graph=graph)
+        target = next(item for item in document["sections"]["technical"] if "тот же свинг-маркер" in item["text"])
+        self.assertIn("задача на разметчик трёх свечных паттернов", target["context"][0]["text"])
+        artifact = render_public_document(document)
+        errors = verify_public_document(document, artifact, items, graph)["errors"]
+        self.assertNotIn("unsupported_section_context", errors)
+        self.assertNotIn("section_context_evidence_outside_closure", errors)
 
     def test_goal_only_claim_is_not_labeled_as_experiment(self):
         graph = build_meeting_graph([rec(1, "hypothesis", "Discussed potential goal: creating a baseline solution with winrate around 30–40%.")])

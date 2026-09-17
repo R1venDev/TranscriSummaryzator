@@ -2606,18 +2606,29 @@ def build_public_document(items, metadata=None, graph=None):
     contextual_sections = {"tasks", "questions", "technical", "experiments"}
 
     def context_tokens(value):
-        return {token for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(token) > 2}
+        return {
+            token[:5] if len(token) >= 5 else token
+            for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold())
+            if len(token) > 2
+        }
 
     def context_duplicate(left, right, threshold=.72):
         a, b = context_tokens(left), context_tokens(right)
         return bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= threshold)
 
-    def context_node(text, claim_ids, evidence_ids, score):
+    def context_node(text, claim_ids, evidence_ids, score, start=None):
         value = sanitize_public_surface(text)
         if not value or has_english_prose(value):
             return None
         return {"text": value, "claim_ids": list(dict.fromkeys(claim_ids)),
-                "evidence_ids": list(dict.fromkeys(evidence_ids)), "_score": score}
+                "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                "start": float(start or 0), "_score": score}
+
+    def context_score(item, text, start, base=0, linked=False):
+        target, candidate = context_tokens(_public_text(item)), context_tokens(text)
+        similarity = len(target & candidate) / max(1, min(len(target), len(candidate)))
+        distance = abs(float(item.get("start", 0)) - float(start or 0))
+        return base + 100 * similarity + max(0, 40 - distance / 3) + (35 if linked else 0)
 
     def item_context(item):
         if item.get("section") not in contextual_sections:
@@ -2627,22 +2638,62 @@ def build_public_document(items, metadata=None, graph=None):
         for index, record_id in enumerate(question.get("answer_record_ids", [])):
             claim = graph_by_source.get(record_id)
             if claim:
-                node = context_node(public_surface_text(claim), [claim.get("claim_id")], claim.get("evidence_ids", []), 120 - index)
+                text = public_surface_text(claim)
+                node = context_node(
+                    text, [claim.get("claim_id")], claim.get("evidence_ids", []),
+                    context_score(item, text, claim.get("start"), 65 - index), claim.get("start"),
+                )
                 if node: candidates.append(node)
         related_cards = [card for card in outcome_cards if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
         for card in related_cards:
             for raw in card.get("fields", {}).values():
                 for field in raw if isinstance(raw, list) else [raw] if raw else []:
-                    node = context_node(field.get("value"), field.get("claim_ids", []), field.get("evidence_ids", []), 80)
+                    start = min([
+                        float(x.get("start", item.get("start", 0))) for x in items
+                        if set(x.get("claim_ids", [])) & set(field.get("claim_ids", []))
+                    ] or [item.get("start", 0)])
+                    node = context_node(
+                        field.get("value"), field.get("claim_ids", []), field.get("evidence_ids", []),
+                        context_score(item, field.get("value"), start, 55,
+                                      bool(set(field.get("claim_ids", [])) & set(item.get("claim_ids", [])))),
+                        start,
+                    )
                     if node: candidates.append(node)
             for claim_id in card.get("claim_ids", []):
                 for related in items_by_claim.get(claim_id, []):
-                    node = context_node(_public_text(related), related.get("claim_ids", []), related.get("evidence_ids", []), 70 + utility(related))
+                    text = _public_text(related)
+                    node = context_node(
+                        text, related.get("claim_ids", []), related.get("evidence_ids", []),
+                        context_score(item, text, related.get("start"), 50 + utility(related),
+                                      bool(set(related.get("claim_ids", [])) & set(item.get("claim_ids", [])))),
+                        related.get("start"),
+                    )
                     if node: candidates.append(node)
         for related in items:
             if related.get("public_id") == item.get("public_id") or related.get("episode_id") != item.get("episode_id"):
                 continue
-            node = context_node(_public_text(related), related.get("claim_ids", []), related.get("evidence_ids", []), 40 + utility(related))
+            text = _public_text(related)
+            node = context_node(
+                text, related.get("claim_ids", []), related.get("evidence_ids", []),
+                context_score(item, text, related.get("start"), 35 + utility(related)), related.get("start"),
+            )
+            if node: candidates.append(node)
+        # Public views deliberately stay compact, so the strongest explanatory
+        # claim can be absent as a top-level bullet. Context may use any
+        # supported active claim in the same episode; the document verifier
+        # validates its claim/evidence closure against MeetingGraph.
+        for claim in graph_claims:
+            if claim.get("episode_id") != item.get("episode_id") or claim.get("lifecycle", "active") != "active":
+                continue
+            if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
+                continue
+            text = public_surface_text(claim)
+            node = context_node(
+                text, [claim.get("claim_id")], claim.get("evidence_ids", []),
+                context_score(item, text, claim.get("start"), 45,
+                              claim.get("claim_id") in set(item.get("claim_ids", []))),
+                claim.get("start"),
+            )
             if node: candidates.append(node)
         valid = [node for node in candidates
                  if node.get("claim_ids") and node.get("evidence_ids")
@@ -4651,7 +4702,7 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
     if any(float(chapter["start"]) not in anchor_starts for chapter in final_document.get("navigation", [])):
         raise RuntimeError("Navigation target does not exist in the transcript")
     markdown = render_public_document(final_document)
-    document_verification = verify_public_document(final_document, markdown, public_items)
+    document_verification = verify_public_document(final_document, markdown, public_items, state_v2)
     if not document_verification["passed"]:
         atomic_json(run_dir / "public_document_verification.json", document_verification)
         persist_publication_failure("public_document_verification", document_verification)

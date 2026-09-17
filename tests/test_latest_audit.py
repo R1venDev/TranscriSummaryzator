@@ -33,6 +33,14 @@ class LatestAuditRegressionTests(unittest.TestCase):
     def test_handles_are_not_mistaken_for_english_prose(self):
         self.assertFalse(has_english_prose("@Yachoy подготовит TradingView — исполнитель: @Yachoy"))
         self.assertEqual(sanitize_public_surface("Discussed potential goal: creating a baseline solution with winrate around 30–40%."), "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.")
+        self.assertEqual(
+            sanitize_public_surface("Обсуждалась возможность инструмент улучшения (связывание объемов и принтов) планировалось внедрить."),
+            "Связывание объёмов и принтов рассматривалось как возможное улучшение.",
+        )
+        self.assertEqual(
+            sanitize_public_surface("@Yachoy / @HoTTaBbicH должен разметить какой-нибудь параметр порога, который скажет размер какого имбаланса нужно учитывать."),
+            "Нужно разметить порог размера имбаланса, чтобы определить, какие имбалансы учитывать.",
+        )
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}
