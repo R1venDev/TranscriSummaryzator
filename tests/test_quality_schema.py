@@ -147,6 +147,7 @@ class QualitySchemaTests(unittest.TestCase):
         self.assertEqual(task["task_id"], "T00007")
         self.assertEqual(task["assignees"], ["B"])
         self.assertTrue(task["automation_eligible"])
+        self.assertEqual(task["automation_status"], "eligible")
 
     def test_tasks_are_sorted_by_source_time(self):
         def record(record_id, start):
@@ -170,6 +171,7 @@ class QualitySchemaTests(unittest.TestCase):
         }
         task = quality.task_records([record])[0]
         self.assertFalse(task["automation_eligible"])
+        self.assertEqual(task["automation_status"], "unknown")
 
     def test_question_status_requires_grounded_answer(self):
         fact = {

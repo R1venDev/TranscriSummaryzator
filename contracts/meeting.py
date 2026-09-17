@@ -41,6 +41,10 @@ class Quantity(StrictModel):
     raw_text: str
     normalized: NormalizedQuantity
     entity: Optional[str] = None
+    dimension: Optional[Literal["calendar_year", "duration", "timeframe", "clock_time", "count", "ratio", "percentage", "index_offset", "unknown"]] = None
+    object_binding: Optional[str] = None
+    source_span: Optional[str] = None
+    metric_status: Literal["defined", "approximate", "unknown"] = "defined"
     evidence_ids: list[str] = Field(min_length=1)
     status: Literal["accepted", "disputed", "unknown"] = "accepted"
 
@@ -154,7 +158,7 @@ class ActionFrame(StrictModel):
     utterance_ids: list[str] = Field(min_length=1)
     alias_resolution: dict[str, str] = Field(default_factory=dict)
     confidence: float = Field(0, ge=0, le=1)
-    state: Literal["reported_plan", "proposal", "assigned_pending", "self_intention", "commitment", "accepted", "rejected"]
+    state: Literal["reported_plan", "proposal", "assigned_pending", "self_intention", "intent_to_attempt", "in_progress", "past_attempt", "completed", "commitment", "accepted", "rejected"]
 
 
 class OutcomeCard(StrictModel):
@@ -202,6 +206,15 @@ class PublicItemContract(StrictModel):
     content_kind: str
     social_state: str
     lifecycle: ClaimLifecycle = ClaimLifecycle.ACTIVE
+    polarity: Literal["positive", "negative"] = "positive"
+    modality: str = "unknown"
+    temporal_state: str = "unknown"
+    commitment_state: str = "unknown"
+    decision_status: Optional[str] = None
+    task_status: Optional[str] = None
+    quantities: list[dict[str, Any]] = Field(default_factory=list)
+    conditions: list[dict[str, Any]] = Field(default_factory=list)
+    origin_ids: list[str] = Field(default_factory=list)
     relation_ids: list[str] = Field(default_factory=list)
     start: float = Field(0, ge=0)
     end: Optional[float] = Field(None, ge=0)

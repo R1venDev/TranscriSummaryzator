@@ -32,6 +32,22 @@ class ExtractionResponse(StrictModel):
     coverage_note: str = ""
 
 
+class ActionFrameResponse(StrictModel):
+    """One predicate with its own roles and field-level source closure."""
+    action_id: str
+    actor: Optional[str] = None
+    predicate: str = Field(min_length=1)
+    object: Optional[str] = None
+    recipient: Optional[str] = None
+    temporal_state: Literal["planned", "in_progress", "past_attempt", "completed", "unknown"] = "unknown"
+    commitment_state: Literal["none", "intent_to_attempt", "explicit_commitment", "accepted_assignment", "unknown"] = "unknown"
+    evidence_ids: list[str] = Field(min_length=1)
+    actor_evidence_ids: list[str] = Field(default_factory=list)
+    predicate_evidence_ids: list[str] = Field(default_factory=list)
+    object_evidence_ids: list[str] = Field(default_factory=list)
+    recipient_evidence_ids: list[str] = Field(default_factory=list)
+
+
 class SemanticRecordResponse(StrictModel):
     record_id: str
     subject: Optional[str] = None
@@ -56,15 +72,41 @@ class SemanticRecordResponse(StrictModel):
     answer_record_ids: list[str] = Field(default_factory=list)
     requested_slots: list[str] = Field(default_factory=list)
     answered_slots: list[str] = Field(default_factory=list)
+    actions: list[ActionFrameResponse] = Field(default_factory=list)
 
 
 class SemanticBatchResponse(StrictModel):
     records: list[SemanticRecordResponse]
 
 
+class FinalDocumentNodeReview(StrictModel):
+    node_id: str
+    verdict: Literal["supported", "contradicted", "insufficient_evidence"]
+    relation_supported: Optional[bool] = None
+    actor_supported: Optional[bool] = None
+    modality_supported: Optional[bool] = None
+    reason: str = ""
+
+
+class FinalDocumentAuditResponse(StrictModel):
+    reviews: list[FinalDocumentNodeReview]
+
+
+class BoundedTextNode(StrictModel):
+    text: str = Field(min_length=1)
+    claim_ids: list[str] = Field(min_length=1)
+
+
+class BoundedDocumentEditResponse(StrictModel):
+    title: BoundedTextNode
+    overview: list[BoundedTextNode] = Field(min_length=1, max_length=4)
+
+
 CONTRACTS = {
     "extraction": ExtractionResponse,
     "semantic_records": SemanticBatchResponse,
+    "final_document_audit": FinalDocumentAuditResponse,
+    "bounded_document_edit": BoundedDocumentEditResponse,
 }
 
 

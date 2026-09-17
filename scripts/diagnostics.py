@@ -32,7 +32,13 @@ _job_id = os.environ.get("TRANSCRISUMMARY_JOB_ID")
 _lock = threading.Lock()
 _SENSITIVE = ("password", "passwd", "secret", "token", "authorization", "cookie", "api_key",
               "statement", "utterance", "prompt", "transcript", "raw_text", "source_text", "dialogue_evidence")
-_SAFE_TELEMETRY_KEYS = {"utterances", "utterance_count", "transcript_sha256", "audio_sha256", "worker_sha256", "config_sha256"}
+_SAFE_TELEMETRY_KEYS = {
+    "utterances", "utterance_count", "transcript_sha256", "audio_sha256",
+    "worker_sha256", "config_sha256", "prompt_sha256", "system_sha256",
+    "request_key", "prompt_eval_duration", "eval_duration", "load_duration",
+    "total_duration", "prompt_eval_count", "eval_count", "prompt_tokens",
+    "output_tokens", "system_chars", "prompt_chars",
+}
 
 
 def configure(path=None, *, component=None, run_id=None, job_id=None, trace_path=None):

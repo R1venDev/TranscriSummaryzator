@@ -79,7 +79,7 @@ class Run13SemanticRegressions(unittest.TestCase):
         answer = rec(2, "current_state", "Задержку можно снять до одной свечи, но качество просядет.", "answer")
         graph = build_meeting_graph([question, answer])
         state = next(item for item in graph["question_states"] if "задерж" in item["original_question"].casefold())
-        self.assertEqual(state["requested_slots"], ["implementation_status"])
+        self.assertEqual(state["requested_slots"], ["implementation_state"])
         self.assertEqual(state["status"], "answered")
         self.assertIsNone(state["remaining_unknown"])
 
@@ -128,15 +128,15 @@ class Run13PublicationRegressions(unittest.TestCase):
         document["outcome_cards"][0]["fields"]["current_state"]["value"] = "Выдуманное состояние"
         self.assertFalse(verify_public_document(document, artifact, [item])["passed"])
 
-    def test_contextual_sections_render_evidence_bound_explanations(self):
+    def test_contextual_sections_do_not_invent_relations_from_proximity(self):
         task = {"public_id": "PI1", "section": "tasks", "text": "@A подготовит демонстрацию", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "action", "social_state": "self_committed", "start": 10, "end": 11, "episode_id": "E1"}
         hypothesis = {"public_id": "PI2", "section": "experiments", "text": "Демонстрация нужна для проверки точки входа", "claim_ids": ["C2"], "evidence_ids": ["U2"], "source_word_ids": ["W2"], "content_kind": "hypothesis", "social_state": "candidate", "start": 9, "end": 10, "episode_id": "E1"}
         document = build_public_document([task, hypothesis])
-        self.assertEqual(document["sections"]["tasks"][0]["context"][0]["text"], hypothesis["text"])
-        self.assertEqual(document["sections"]["experiments"][0]["context"][0]["text"], task["text"])
+        self.assertEqual(document["sections"]["tasks"][0]["context"], [])
+        self.assertEqual(document["sections"]["experiments"][0]["context"], [])
         artifact = render_public_document(document)
-        self.assertIn("  - **Зачем это нужно:**", artifact)
-        self.assertIn("  - **Что именно проверяют:**", artifact)
+        self.assertNotIn("  - **Зачем это нужно:**", artifact)
+        self.assertNotIn("  - **Что именно проверяют:**", artifact)
         self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
 
     def test_context_prefers_near_topic_claim_and_verifies_graph_provenance(self):
@@ -147,6 +147,14 @@ class Run13PublicationRegressions(unittest.TestCase):
         ])
         planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
         items = build_public_items(graph, planned)
+        marker = next(claim for claim in graph["claims"] if "тот же свинг-маркер" in claim["statement"])
+        task_claim = next(claim for claim in graph["claims"] if "задача на разметчик" in claim["statement"])
+        graph["relations"].append({
+            "relation_id": "R-explicit", "type": "explains",
+            "source_claim_id": task_claim["claim_id"], "target_claim_id": marker["claim_id"],
+            "evidence_ids": list(dict.fromkeys(task_claim["evidence_ids"] + marker["evidence_ids"])),
+            "confidence": 1.0,
+        })
         document = build_public_document(items, graph=graph)
         target = next(item for item in document["sections"]["technical"] if "тот же свинг-маркер" in item["text"])
         self.assertIn("задача на разметчик трёх свечных паттернов", target["context"][0]["text"])
@@ -155,7 +163,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertNotIn("unsupported_section_context", errors)
         self.assertNotIn("section_context_evidence_outside_closure", errors)
 
-    def test_technical_context_prefers_explanatory_constraint_over_nearby_topic(self):
+    def test_technical_context_requires_explicit_relation(self):
         graph = build_meeting_graph([
             rec(1, "constraint", "Всё упирается в зону интереса старшего таймфрейма, которую не видно."),
             rec(2, "definition", "Зоны интереса — это имбалансы, блоки, Breaker и зона OTE."),
@@ -165,8 +173,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         items = build_public_items(graph, planned)
         document = build_public_document(items, graph=graph)
         target = next(item for item in document["sections"]["technical"] if "Зоны интереса" in item["text"])
-        self.assertIn("старшего таймфрейма", target["context"][0]["text"])
-        self.assertEqual(target["context"][0]["role"], "importance")
+        self.assertEqual(target["context"], [])
 
     def test_chapter_label_never_hides_mid_sentence_truncation(self):
         first = "Предлагается провести дополнительный бэктест для анализа тех. причин проигрышных сделок и исключения их из массива"
@@ -297,13 +304,13 @@ class Run13PublicationRegressions(unittest.TestCase):
         result = verify_generated_items([concise], [self.sentence_plan("C1")], [claim])
         self.assertTrue(result["passed"], result)
 
-    def test_sanitized_translation_preserves_source_negation(self):
+    def test_free_translation_is_not_treated_as_deterministic_sanitization(self):
         source = "@Yachoy suggests returning to algorithmic thinking and potentially incorporating higher timeframes if the current approach does not yield results."
         text = "Если текущий подход не даст результата, @Yachoy предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы."
         item = {"section": "minutes", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"]}
         claim = {"claim_id": "C1", "statement": source, "evidence_ids": ["U1"], "lifecycle": "active", "speaker_refs": ["@Yachoy"]}
         result = verify_generated_items([item], [self.sentence_plan("C1", allowed_speakers=["@Yachoy"])], [claim])
-        self.assertTrue(result["passed"], result)
+        self.assertFalse(result["passed"], result)
 
     def test_repeated_task_actor_metadata_is_not_a_role_swap(self):
         text = "@Yachoy подготовит TradingView. — исполнитель: @Yachoy — статус: участник взял на себя"

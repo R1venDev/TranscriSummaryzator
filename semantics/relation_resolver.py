@@ -68,7 +68,9 @@ def resolve_relations(propositions, events, records):
             if target: add("supersedes", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "explicit_revision", record.get("record_id"), target_record_id=target_id)
         for target_id in record.get("accepts_record_ids", []):
             target = prop_by_record.get(target_id)
-            if target: add("accepts", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "source_grounded_short_reply", record.get("record_id"), target_record_id=target_id)
+            if target:
+                relation_kind = "answers" if target.get("content_kind") == "question" else "accepts"
+                add(relation_kind, source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "source_grounded_short_reply", record.get("record_id"), target_record_id=target_id)
     for index, event in enumerate(ordered):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]
@@ -81,20 +83,20 @@ def resolve_relations(propositions, events, records):
             candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask", "commit"}]
             same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
             candidates = same_thread or candidates
-            # Resolve a short reply to the nearest compatible exchange.  A
-            # second, almost equally recent candidate is genuine ambiguity and
-            # must not be guessed.
+            # A short reply belongs to the immediately preceding compatible
+            # dialogue move.  In particular, a screen-check question between a
+            # proposal and "да" blocks acceptance of that older proposal.
             candidates = sorted(candidates, key=lambda value: value.get("timestamp", 0), reverse=True)
-            target_event = candidates[0] if candidates and (
-                len(candidates) == 1 or
-                candidates[0].get("timestamp", 0) - candidates[1].get("timestamp", 0) >= 8 or
-                candidates[0].get("thread_hint") and candidates[0].get("thread_hint") == event.get("thread_hint")
-            ) else None
+            target_event = candidates[0] if candidates and event.get("timestamp", 0) - candidates[0].get("timestamp", 0) <= 45 else None
+            if (target_event and target_event.get("speech_act") != "ask" and len(candidates) > 1
+                    and candidates[1].get("speech_act") == target_event.get("speech_act")
+                    and abs(candidates[0].get("timestamp", 0) - candidates[1].get("timestamp", 0)) < 8):
+                target_event = None
             # A speaker's own acknowledgement is not evidence that another
             # participant accepted the proposition.
             is_rejection = event["speech_act"] == "reject" or bool(REJECT_RE.search(text))
             if target_event and (is_rejection or not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
-                kind = "rejects" if is_rejection else "accepts"
+                kind = "rejects" if is_rejection else "answers" if target_event.get("speech_act") == "ask" else "accepts"
                 add(kind, source["proposition_id"], target_event["proposition_id"], event.get("evidence_ids", []), .96, "coreference_short_reply", event.get("source_record_id"), event.get("event_id"), target_event.get("source_record_id"))
         for prior in reversed(prior_events):
             target = next(x for x in propositions if x["proposition_id"] == prior["proposition_id"])

@@ -250,7 +250,7 @@ class PublicationDocumentGateTests(unittest.TestCase):
         audit = verify_generated_items(items, result["public_sentence_plans"], graph["claims"])
         self.assertTrue(audit["passed"], audit)
 
-    def test_overview_must_expose_readiness_constraint_and_next_step(self):
+    def test_overview_gate_is_domain_neutral_but_tracks_next_step(self):
         report = {"audits": [{"passed": True, "errors": []}]}
         base = {"claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "start": 1}
         items = [
@@ -259,12 +259,10 @@ class PublicationDocumentGateTests(unittest.TestCase):
             {**base, "public_id": "PI3", "section": "tasks", "text": "@A подготовит демонстрацию в TradingView", "content_kind": "action", "social_state": "self_committed", "task_state_id": "T1", "task_state": {"status": "self_committed", "deliverable": "демонстрация в TradingView", "commitment_strength": "explicit"}},
         ]
         incomplete = publication_audit(report, "# Встреча — Структуры\n\n## Главное\n- Обсудили структуры.\n\n## Задачи и следующие шаги\n- @A подготовит демонстрацию в TradingView", items, {})
-        self.assertEqual(incomplete["overview_missing_htf_readiness"], 1)
-        self.assertEqual(incomplete["overview_missing_htf_constraint"], 1)
+        self.assertNotIn("overview_missing_htf_readiness", incomplete)
+        self.assertNotIn("overview_missing_htf_constraint", incomplete)
         self.assertEqual(incomplete["overview_missing_committed_next_step"], 1)
         complete = publication_audit(report, "# Встреча — Структуры\n\n## Главное\n- На минутном таймфрейме алгоритм работал корректно.\n- На старших таймфреймах остаётся задержка.\n- @A подготовит демонстрацию в TradingView.\n\n## Задачи и следующие шаги\n- @A подготовит демонстрацию в TradingView", items, {})
-        self.assertEqual(complete["overview_missing_htf_readiness"], 0)
-        self.assertEqual(complete["overview_missing_htf_constraint"], 0)
         self.assertEqual(complete["overview_missing_committed_next_step"], 0)
 
 

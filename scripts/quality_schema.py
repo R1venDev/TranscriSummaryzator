@@ -196,7 +196,8 @@ def normalize_semantic_record(raw, fact):
         cited_numbers = [float(token.replace(",", ".")) for token in re.findall(r"(?<!\d)\d+(?:[.,]\d+)?(?!\d)", cited_text)]
         supported = any(
             any(abs(float(digit.replace(",", ".")) - cited) < 1e-9 for cited in cited_numbers)
-            or any(word in cited_text.split() for word in NUMBER_WORDS.get(str(float(digit.replace(",", "."))).rstrip("0").rstrip("."), set()))
+            or any(re.search(rf"(?iu)\b{re.escape(word)}(?:часов\w*|дневн\w*|месячн\w*|летн\w*)?\b", cited_text)
+                   for word in NUMBER_WORDS.get(str(float(digit.replace(",", "."))).rstrip("0").rstrip("."), set()))
             for digit in digits
         )
         if amount and ids and digits and supported:
@@ -212,7 +213,21 @@ def normalize_semantic_record(raw, fact):
                 entity, role = entity or "window_index", role or "index_offset"
                 if unit and re.search(r"(?iu)таймфрейм|time\s*frame", unit):
                     unit = None
-            quantities.append({"quantity_id": value.get("quantity_id") or f"N{len(quantities)+1:03d}", "raw_text": value.get("raw_text") or source_span or amount, "normalized": {"value": float(amount.replace(",", ".")), "unit": unit, "operator": normalized.get("operator", "exact"), "direction": normalized.get("direction")}, "entity": entity, "evidence_ids": ids, "status": value.get("status", "accepted"), "value": amount, "unit": unit, "role": role, "source_span": source_span or None})
+            dimension = value.get("dimension")
+            numeric = float(amount.replace(",", "."))
+            if not dimension:
+                if numeric.is_integer() and 1900 <= numeric <= 2100 and re.search(r"(?iu)\b(?:год|года|году|данн\w*|истори\w*)\b", cited_text):
+                    dimension = "calendar_year"
+                elif re.search(r"(?iu)\b(?:таймфрейм|свеч\w*|h\d+|m\d+|часов\w*)\b", cited_text):
+                    dimension = "timeframe"
+                elif re.search(r"(?iu)\b(?:месяц|недел|д(?:ень|ня|ней)|длительн|отрезок)\b", cited_text):
+                    dimension = "duration"
+                elif re.search(r"(?iu)\bпроцент|%", cited_text):
+                    dimension = "percentage"
+                else:
+                    dimension = "count"
+            metric_status = value.get("metric_status") or ("approximate" if re.search(r"(?iu)\b(?:примерно|около|где-то|порядка)\b", cited_text) else "defined")
+            quantities.append({"quantity_id": value.get("quantity_id") or f"N{len(quantities)+1:03d}", "raw_text": value.get("raw_text") or source_span or amount, "normalized": {"value": numeric, "unit": unit, "operator": normalized.get("operator", "exact"), "direction": normalized.get("direction")}, "entity": entity, "object_binding": value.get("object_binding") or entity, "dimension": dimension, "metric_status": metric_status, "evidence_ids": ids, "status": value.get("status", "accepted"), "value": amount, "unit": unit, "role": role, "source_span": source_span or None})
     confirmations = [
         {
             "evidence_id": evidence_id,
@@ -266,6 +281,81 @@ def normalize_semantic_record(raw, fact):
         detected_act = raw_act if detected_act == "assert" else detected_act
     legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
     explicit_commitment = bool(COMMITMENT_RE.search(action_text)) and len(owners) == 1
+    raw_time_expression = (
+        str(raw.get("time_expression", {}).get("raw_text") or raw.get("time_expression", {}).get("text") or "").strip()
+        if isinstance(raw.get("time_expression"), dict)
+        else str(raw.get("time_expression") or "").strip()
+    ) or None
+    ambiguous_clock = bool(raw_time_expression and re.search(r"(?iu)\bпосле\s+0{1,2}(?::0{2})?\b", raw_time_expression)
+                           and not (isinstance(raw.get("time_expression"), dict) and raw["time_expression"].get("timezone")))
+    known_term_text = " ".join(str(value or "") for value in (
+        fact.get("topic"),
+        *fact.get("topic_entities", []),
+        *fact.get("entities", []),
+    )).casefold()
+    unresolved_terms = sorted(set(
+        token for token in re.findall(r"(?u)\b[A-Z][A-Za-z-]{2,}(?:\s+[A-Z][A-Za-z-]{1,})+\b", action_text)
+        if token.casefold() not in known_term_text
+    ))
+    semantic_verification = fact.get("verification_status", "supported")
+    if semantic_verification == "supported" and (
+        ambiguous_clock and fact.get("type") in {"action", "schedule", "system_rule", "trading_rule"}
+        or unresolved_terms and fact.get("type") in {"decision", "proposal", "design_choice", "system_rule", "trading_rule"}
+    ):
+        semantic_verification = "insufficient_evidence"
+    actions = []
+    for index, value in enumerate(raw.get("actions", []), 1):
+        if not isinstance(value, dict):
+            continue
+        ids = [item for item in value.get("evidence_ids", []) if item in evidence_set]
+        predicate = str(value.get("predicate") or "").strip()
+        if not predicate or not ids:
+            continue
+        cited = [evidence_by_id[item] for item in ids if item in evidence_by_id]
+        cited_text = " ".join(str(item.get("text") or "") for item in cited)
+        cited_speakers = {item.get("speaker") for item in cited if item.get("speaker")}
+        actor = str(value.get("actor") or "").strip() or None
+        object_value = str(value.get("object") or "").strip() or None
+        recipient = str(value.get("recipient") or "").strip() or None
+        # A role must be bound by a speaker-attributed first-person span or be
+        # mentioned literally.  Seeing two names somewhere in a broad evidence
+        # window is not field-level support.
+        if actor and actor not in cited_speakers and actor not in cited_text:
+            actor = None
+        if recipient and recipient not in cited_text:
+            recipient = None
+        if object_value:
+            object_tokens = {token[:5] for token in re.findall(r"(?iu)[a-zа-яё0-9]+", object_value) if len(token) > 2}
+            cited_tokens = {token[:5] for token in re.findall(r"(?iu)[a-zа-яё0-9]+", cited_text) if len(token) > 2}
+            if object_tokens and len(object_tokens & cited_tokens) / len(object_tokens) < .8:
+                object_value = None
+        field_ids = lambda key: [item for item in value.get(key, []) if item in ids]
+        temporal_state = value.get("temporal_state") if value.get("temporal_state") in {"planned", "in_progress", "past_attempt", "completed", "unknown"} else "unknown"
+        commitment_state = value.get("commitment_state") if value.get("commitment_state") in {"none", "intent_to_attempt", "explicit_commitment", "accepted_assignment", "unknown"} else "unknown"
+        actions.append({
+            "action_id": f"A{index:02d}", "model_action_id": str(value.get("action_id") or "") or None,
+            "actor": actor, "predicate": predicate,
+            "object": object_value,
+            "recipient": recipient, "temporal_state": temporal_state,
+            "commitment_state": commitment_state, "evidence_ids": ids,
+            "field_evidence": {
+                "actor": field_ids("actor_evidence_ids") or (ids if actor else []),
+                "predicate": field_ids("predicate_evidence_ids") or ids,
+                "object": field_ids("object_evidence_ids") or (ids if object_value else []),
+                "recipient": field_ids("recipient_evidence_ids") or (ids if recipient else []),
+            },
+        })
+    if not actions and (fact.get("type") == "action" or commitment_like):
+        actions.append({
+            "action_id": "A01", "actor": owners[0] if len(owners) == 1 else None,
+            "predicate": str(raw.get("predicate") or action_text).strip(),
+            "object": str(raw.get("object") or "").strip() or None,
+            "recipient": None,
+            "temporal_state": "planned" if detected_act in {"commit", "propose"} else "unknown",
+            "commitment_state": "explicit_commitment" if explicit_commitment else "unknown",
+            "evidence_ids": evidence_ids,
+            "field_evidence": {"actor": source_ids if (source_ids := [item for item in evidence_ids if evidence_by_id.get(item, {}).get("speaker") in owners]) else [], "predicate": evidence_ids, "object": [], "recipient": []},
+        })
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
@@ -285,11 +375,10 @@ def normalize_semantic_record(raw, fact):
         "revision_cue": bool(CORRECTION_CUE_RE.search(evidence_text or str(fact.get("statement") or ""))),
         "conditions": conditions,
         "quantities": quantities,
-        "time_expression": (
-            str(raw.get("time_expression", {}).get("raw_text") or raw.get("time_expression", {}).get("text") or "").strip()
-            if isinstance(raw.get("time_expression"), dict)
-            else str(raw.get("time_expression") or "").strip()
-        ) or None,
+        "time_expression": raw_time_expression,
+        "time_contract": {"raw": raw_time_expression, "timezone": raw.get("time_expression", {}).get("timezone") if isinstance(raw.get("time_expression"), dict) else None, "resolution_status": "ambiguous_clock" if ambiguous_clock else "source_raw" if raw_time_expression else "not_provided", "execution_safe": bool(raw_time_expression and not ambiguous_clock)},
+        "unresolved_terms": unresolved_terms,
+        "term_resolution_status": "requires_clarification" if unresolved_terms else "resolved_or_not_applicable",
         "attributed_speakers": list(fact.get("speaker_refs", [])),
         "proposed_by": proposed_by,
         "assignees": owners,
@@ -307,12 +396,18 @@ def normalize_semantic_record(raw, fact):
         "answer_resolution_basis": answer_resolution_basis,
         "requested_slots": list(dict.fromkeys(str(value) for value in raw.get("requested_slots", []) if str(value).strip())),
         "answered_slots": list(dict.fromkeys(str(value) for value in raw.get("answered_slots", []) if str(value).strip())),
+        "actions": actions,
+        "origin_id": fact.get("origin_id") or fact.get("fact_id"),
+        "revision_id": fact.get("revision_id"),
+        "reported_content_support": fact.get("verification_status", "supported"),
+        "world_truth_status": "not_evaluated",
+        "interpretation_status": "requires_clarification" if semantic_verification == "insufficient_evidence" else "typed",
         "evidence_ids": evidence_ids,
         "dialogue_evidence": list(fact.get("dialogue_evidence", [])),
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),
         "risk_level": fact.get("risk_level", "LOW"),
-        "verification_status": fact.get("verification_status", "supported"),
+        "verification_status": semantic_verification,
         "source_word_ids": list(dict.fromkeys(
             word_id for item in fact.get("evidence", []) for word_id in item.get("source_word_ids", [])
         )),
@@ -330,6 +425,11 @@ def task_records(records):
             record["assignment_status"] == "confirmed"
             and not record.get("uncertainty", {}).get("needs_review")
         )
+        automation_status = (
+            "eligible" if automation_eligible else
+            "unknown" if record.get("uncertainty", {}).get("needs_review") else
+            "human_only"
+        )
         result.append({
             "task_id": "T" + record["record_id"][1:],
             "source_record_id": record["record_id"],
@@ -339,6 +439,7 @@ def task_records(records):
             "assignees": record["assignees"],
             "assignment_status": record["assignment_status"],
             "automation_eligible": automation_eligible,
+            "automation_status": automation_status,
             "conditions": record["conditions"],
             "due": record["time_expression"],
             "evidence_ids": record["evidence_ids"],

@@ -74,15 +74,15 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_rejected_revision_is_terminal_despite_origin_rewrite(self):
         denials = [
-            {"fact": {"fact_id": "F00181", "origin_id": "ORafter",
+            {"fact": {"fact_id": "F00181", "origin_id": "ORafter", "revision_id": "RV-after",
                       "evidence_ids": ["U00302"]}, "reason": "Нет доказательств решения."},
-            {"fact": {"fact_id": "F00181", "origin_id": "ORother",
+            {"fact": {"fact_id": "F00181", "origin_id": "ORother", "revision_id": "RV-other",
                       "evidence_ids": ["U00327"]}, "reason": "Метафора, не факт."},
         ]
         reasons = summary.rejection_reason_by_revision(denials)
-        self.assertEqual(reasons[("F00181", ("U00302",))], "Нет доказательств решения.")
-        self.assertEqual(reasons[("F00181", ("U00327",))], "Метафора, не факт.")
-        self.assertNotIn(("F00180", ("U00302",)), reasons)
+        self.assertEqual(reasons["RV-after"], "Нет доказательств решения.")
+        self.assertEqual(reasons["RV-other"], "Метафора, не факт.")
+        self.assertNotIn("F00181", reasons)
 
     def test_section_and_detailed_views_are_not_limited_to_executive_facts(self):
         core = fact(statement="Основной результат встречи")
@@ -172,7 +172,8 @@ class SummaryWorkerTests(unittest.TestCase):
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
         }
         rendered = summary.render_markdown(document, [item], {"covered_seconds": 100, "total_seconds": 100})
-        self.assertIn("[00:00:10](transcript.html#t-10125)", rendered)
+        self.assertIn("00:00:10", rendered)
+        self.assertNotIn("transcript.html", rendered)
         self.assertNotIn("F00001", rendered)
 
     def test_public_renderer_has_prose_overview_timecode_index_and_detailed_chronology(self):
@@ -184,14 +185,16 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
         ]
         rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
-        self.assertIn("Bitcoin, Order Block: результаты, ограничения и следующие шаги", rendered.splitlines()[0])
+        self.assertIn("Bitcoin", rendered.splitlines()[0])
+        self.assertIn("Order Block", rendered.splitlines()[0])
+        self.assertNotIn("результаты, ограничения и следующие шаги", rendered.splitlines()[0])
         self.assertNotIn("торговой системы", rendered.splitlines()[0])
         overview = rendered.split("## Главное", 1)[1].split("## Таймкоды", 1)[0]
         self.assertNotIn("\n- ", overview)
         self.assertNotIn("/result?", overview)
         self.assertIn("## Таймкоды", rendered)
         self.assertIn("## Подробная хронология встречи", rendered)
-        self.assertIn("transcript.html#t-10000", rendered)
+        self.assertNotIn("transcript.html", rendered)
 
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
         item = fact()
@@ -205,7 +208,7 @@ class SummaryWorkerTests(unittest.TestCase):
             document, [item], {"covered_seconds": 100, "total_seconds": 100},
             metadata={"source": "12.07.2026 — встреча.mp4", "project": "Aurion", "duration_seconds": 100},
         )
-        self.assertTrue(rendered.startswith("# 12.07.2026 | Aurion — проверке BOS"))
+        self.assertTrue(rendered.startswith("# Дата не указана | Aurion — проверке BOS"))
         for heading in ("## Краткое описание", "## Участники", "## Таймкоды", "## Подробное описание встречи"):
             self.assertIn(heading, rendered)
         self.assertNotIn("## Решения", rendered)
@@ -332,20 +335,16 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(summary.clean_publication_statement(imbalance), imbalance["statement"])
         self.assertEqual(summary.clean_publication_statement(action), action["statement"])
 
-    def test_people_are_rendered_as_canonical_bold_handles(self):
-        rendered = summary.canonicalize_people("Николай спросил Мишу, Хоттабыч ответил Максиму и сослался на код Макса")
-        self.assertIn("**@Riven**", rendered)
-        self.assertIn("**@Misha**", rendered)
-        self.assertIn("**@HoTTaBbicH**", rendered)
-        self.assertIn("**@Yachoy / @HoTTaBbicH**", rendered)
+    def test_only_explicit_handles_are_rendered_as_bold_people(self):
+        rendered = summary.canonicalize_people("@A спросил Николая, @B ответил")
+        self.assertIn("**@A**", rendered)
+        self.assertIn("**@B**", rendered)
+        self.assertIn("Николая", rendered)
 
     def test_people_are_canonical_in_structured_text_without_markdown(self):
-        rendered = summary.canonicalize_people_plain(
-            "Николай спросил Мишу, Максим ответил Yachoy"
-        )
-        self.assertEqual(rendered, "@Riven спросил @Misha, @Yachoy / @HoTTaBbicH ответил @Yachoy")
+        rendered = summary.canonicalize_people_plain("Николай спросил Мишу, Максим ответил Yachoy")
+        self.assertEqual(rendered, "Николай спросил Мишу, Максим ответил Yachoy")
         self.assertNotIn("**", rendered)
-        self.assertNotIn("Николай", rendered)
 
     def test_all_unresolved_questions_are_retained_in_human_summary(self):
         facts = []
@@ -521,16 +520,13 @@ class SummaryWorkerTests(unittest.TestCase):
             "Возможность использовать M15 для подтверждения точки входа",
         )
 
-    def test_navigation_label_adds_context_to_session_hours(self):
+    def test_navigation_label_does_not_invent_domain_context_for_hours(self):
         item = fact(
             kind="proposal",
             statement="Первый подход — с 17 до 18, второй подход — с 16:30 до 18.",
         )
         item["topic"] = "сессия AM для индексов"
-        self.assertEqual(
-            summary.navigation_label(item),
-            "Сравнение торговых окон AM-сессии: 17:00–18:00 и 16:30–18:00",
-        )
+        self.assertEqual(summary.navigation_label(item), "")
 
     def test_navigation_rejects_editorial_doubt_and_embedded_question(self):
         doubtful = fact(statement="Факт требует перепроверки из-за контекста разговора")
@@ -659,6 +655,7 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_bare_maxim_is_marked_ambiguous(self):
         item = fact(statement="Макс посмотрел результат", evidence=[utterance(1, 1, 3, speaker="@Yachoy")])
+        item["ambiguous_person_mentions"] = ["Макс"]
         updated = summary.repair_fact_attribution(item)
         self.assertTrue(updated["uncertainty"]["needs_review"])
         self.assertIn("ambiguous_mentioned_person", updated["uncertainty"]["reasons"])
@@ -1350,11 +1347,11 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(fact(statement="В показанном сценарии использовалась модель M1 без задержек."), fact_id="F00002"),
         ]
         result = summary.normalize_main_topic("Обсуждение задержек на M1.", facts)
-        self.assertEqual(result, "Обсуждение задержек алгоритма на разных таймфреймах.")
+        self.assertEqual(result, "Обсуждение задержек на M1.")
 
     def test_chapter_title_does_not_assign_delay_only_to_m1(self):
         result = summary.normalize_topic_title("Анализ задержек на M1 и работа со сломов структуры")
-        self.assertEqual(result, "Задержки на разных таймфреймах и работа со сломами структуры")
+        self.assertEqual(result, "Анализ задержек на M1 и работа со сломами структуры")
 
     def test_primary_validation_splits_incomplete_response(self):
         facts = [fact(), dict(fact(statement="Второй подтверждённый тезис"), fact_id="F00002")]

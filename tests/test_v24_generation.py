@@ -143,7 +143,8 @@ class GenerationTests(unittest.TestCase):
             self.assertLess(time.monotonic() - start, 4)
 
     def test_portable_transcript_link_without_private_server_address(self):
-        self.assertEqual(time_link(10.125, job_id=9), "[00:00:10](transcript.html#t-10125)")
+        self.assertEqual(time_link(10.125, job_id=9), "00:00:10")
+        self.assertEqual(time_link(10.125, job_id=9, base_url="https://example.test"), "[00:00:10](https://example.test/result?id=9#t-10125)")
 
     def test_final_document_mutations_are_rejected(self):
         item = {"public_id": "PI00001", "section": "overview", "text": "Нужно проверить качество сигналов.",

@@ -40,8 +40,8 @@ class V21ArchitectureTests(unittest.TestCase):
     def test_question_slots_do_not_accept_unrelated_answer(self):
         records = [record("F1", "question", "Одна или две сделки?", "ask", requested_slots=["number_of_trades"], answered_slots=[], answer_record_ids=["F2"]), record("F2", "observation", "Стоп за максимумом", "answer")]
         graph = build_meeting_graph(records)
-        self.assertEqual(graph["question_states"][0]["status"], "unanswered")
-        self.assertEqual(graph["question_states"][0]["missing_slots"], ["number_of_trades"])
+        self.assertEqual(graph["question_states"][0]["status"], "answer_not_verified")
+        self.assertEqual(graph["question_states"][0]["missing_slots"], ["quantity"])
 
     def test_entity_registry_and_answer_entailment_are_separate(self):
         registry = EntityRegistry([{"canonical_name": "Bitcoin", "type": "asset", "aliases": ["BTC"]}])
