@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "summary_worker.py"
@@ -26,6 +27,38 @@ def fact(kind="proposal", statement="Предложено проверить BOS
 
 
 class SummaryWorkerTests(unittest.TestCase):
+    def test_optional_global_cache_write_failure_does_not_retry_valid_response(self):
+        class Client:
+            calls = 0
+
+            def model_digest(self, _model):
+                return "digest"
+
+            def chat(self, *_args, **_kwargs):
+                self.calls += 1
+                return json.dumps({"value": "ok"}), {"done": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_cache = root / "run" / "response.json"
+            global_root = root / "global"
+            original_atomic_json = summary.atomic_json
+
+            def selective_atomic_json(path, value):
+                if Path(path).is_relative_to(global_root):
+                    raise PermissionError("read-only shared cache")
+                return original_atomic_json(path, value)
+
+            client = Client()
+            with mock.patch.object(summary, "GLOBAL_LLM_CACHE_ROOT", global_root), \
+                    mock.patch.object(summary, "atomic_json", side_effect=selective_atomic_json):
+                result = summary.call_json_with_retries(
+                    client, "model", "system", "prompt", run_cache, attempts=2,
+                )
+            self.assertEqual(result["response"], {"value": "ok"})
+            self.assertEqual(client.calls, 1)
+            self.assertTrue(run_cache.is_file())
+
     def test_evidence_repair_uses_only_work_tree_for_download_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
