@@ -1256,6 +1256,49 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(report["independently_reviewed_surfaces"], 0)
         self.assertEqual(report["escalated_surfaces"], 0)
 
+    def test_final_document_reconciliation_quarantines_only_bad_context(self):
+        item = {
+            "text": "Сервис работает в тестовом режиме.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+            "section": "technical", "start": 10,
+        }
+        context = {
+            "text": "Это якобы решает другую проблему.",
+            "claim_ids": ["C2"], "evidence_ids": ["U2"],
+            "role": "explanation", "relation_id": "R1",
+        }
+        document = {"sections": {"technical": [{**item, "context": [context]}]}}
+        report = {
+            "status": "failed", "total_nodes": 2, "evaluated_nodes": 2,
+            "counts": {"supported": 1, "insufficient_evidence": 1},
+            "reviews": [
+                {"node_id": "section:technical:1", "verdict": "supported"},
+                {"node_id": "context:technical:1:1", "verdict": "insufficient_evidence"},
+            ],
+        }
+        repaired, reconciled = summary.reconcile_final_document_audit(document, report, [item])
+        self.assertEqual(repaired["sections"]["technical"][0]["context"], [])
+        self.assertEqual(repaired["sections"]["technical"][0]["text"], item["text"])
+        self.assertEqual(reconciled["status"], "passed")
+        self.assertEqual(reconciled["abstention_count"], 1)
+        self.assertEqual(reconciled["unresolved_node_ids"], [])
+
+    def test_final_document_reconciliation_does_not_hide_bad_public_item(self):
+        item = {
+            "text": "Неподтверждённое утверждение.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+            "section": "technical", "start": 10,
+        }
+        document = {"sections": {"technical": [dict(item)]}}
+        report = {
+            "status": "failed", "total_nodes": 1, "evaluated_nodes": 1,
+            "counts": {"contradicted": 1},
+            "reviews": [{"node_id": "section:technical:1", "verdict": "contradicted"}],
+        }
+        _repaired, reconciled = summary.reconcile_final_document_audit(document, report, [])
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertIn("section:technical:1", reconciled["unresolved_node_ids"])
+
     def test_final_audit_splits_when_model_omits_reviews(self):
         facts = [
             fact(statement="Первый тезис"),
