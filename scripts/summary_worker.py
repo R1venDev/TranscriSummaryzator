@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import copy
 import hashlib
 import html
 import json
@@ -4191,6 +4192,196 @@ def audit_final_document(client, model, document, source_turns, run_dir,
     return report
 
 
+def reconcile_final_document_audit(document, audit, public_items):
+    """Remove unsupported derived prose while preserving verified public facts.
+
+    The final document contains two different classes of surfaces: immutable
+    ``PublicItem`` projections and optional editorial structure (overview,
+    labels, context, and outcome-card fields).  A failed optional surface must
+    abstain locally; it must not discard an otherwise verified publication.
+    Every surface retained after reconciliation is either an exact verified
+    ``PublicItem`` or has its own supported review from the independent audit.
+    """
+    if audit.get("status") == "passed":
+        return document, audit
+
+    original_nodes = _document_audit_nodes(document)
+    node_by_id = {node["node_id"]: node for node in original_nodes}
+    review_by_id = {
+        review.get("node_id"): review
+        for review in audit.get("reviews", [])
+        if isinstance(review, dict) and review.get("node_id")
+    }
+    failed_ids = {
+        node_id for node_id, review in review_by_id.items()
+        if review.get("verdict") != "supported"
+    }
+    if not failed_ids:
+        return document, audit
+
+    repaired = copy.deepcopy(document)
+    overview_removals = set()
+    context_removals = {}
+    outcome_removals = {}
+    navigation_repairs = set()
+    title_repair = False
+    unhandled = set()
+
+    for node_id in failed_ids:
+        parts = node_id.split(":")
+        try:
+            if node_id == "title":
+                title_repair = True
+            elif parts[0] == "overview" and len(parts) == 2:
+                overview_removals.add(int(parts[1]) - 1)
+            elif parts[0] == "context" and len(parts) == 4:
+                context_removals.setdefault((parts[1], int(parts[2]) - 1), set()).add(int(parts[3]) - 1)
+            elif parts[0] == "outcome" and len(parts) == 4:
+                outcome_removals.setdefault((int(parts[1]) - 1, parts[2]), set()).add(int(parts[3]) - 1)
+            elif parts[0] == "navigation" and len(parts) == 2:
+                navigation_repairs.add(int(parts[1]) - 1)
+            else:
+                # Section and chronology items are immutable PublicItems.  If
+                # one ever reaches this branch, publication must remain closed.
+                unhandled.add(node_id)
+        except (TypeError, ValueError):
+            unhandled.add(node_id)
+
+    repaired["overview"] = [
+        node for index, node in enumerate(repaired.get("overview", []))
+        if index not in overview_removals
+    ]
+    for (section, item_index), indexes in context_removals.items():
+        values = repaired.get("sections", {}).get(section, [])
+        if not 0 <= item_index < len(values):
+            unhandled.update(f"context:{section}:{item_index + 1}:{index + 1}" for index in indexes)
+            continue
+        values[item_index]["context"] = [
+            node for index, node in enumerate(values[item_index].get("context", []))
+            if index not in indexes
+        ]
+    for (card_index, field_name), indexes in outcome_removals.items():
+        cards = repaired.get("outcome_cards", [])
+        if not 0 <= card_index < len(cards):
+            unhandled.update(f"outcome:{card_index + 1}:{field_name}:{index + 1}" for index in indexes)
+            continue
+        fields = cards[card_index].get("fields", {})
+        raw = fields.get(field_name)
+        if isinstance(raw, list):
+            fields[field_name] = [node for index, node in enumerate(raw) if index not in indexes]
+        elif raw and 0 in indexes:
+            fields[field_name] = None
+        else:
+            unhandled.update(f"outcome:{card_index + 1}:{field_name}:{index + 1}" for index in indexes)
+
+    safe_public_items = [
+        item for item in public_items
+        if normalize_space(item.get("text")) and len(normalize_space(item.get("text"))) <= 110
+    ]
+    safe_public_items.sort(key=lambda item: (len(normalize_space(item.get("text"))), float(item.get("start", 0))))
+
+    def public_projection(item):
+        return {
+            "text": normalize_space(item.get("text")),
+            "claim_ids": list(item.get("claim_ids", [])),
+            "evidence_ids": list(item.get("evidence_ids", [])),
+            **({"relation_id": item.get("relation_id")} if item.get("relation_id") else {}),
+        }
+
+    if title_repair:
+        if safe_public_items:
+            repaired["title"] = public_projection(safe_public_items[0])
+        else:
+            unhandled.add("title")
+
+    navigation = repaired.get("navigation", [])
+    chronology = repaired.get("chronology", [])
+    for index in navigation_repairs:
+        if not 0 <= index < len(navigation):
+            unhandled.add(f"navigation:{index + 1}")
+            continue
+        chapter = chronology[index] if index < len(chronology) else {}
+        candidates = [
+            item for item in chapter.get("items", [])
+            if normalize_space(item.get("text"))
+        ]
+        if not candidates:
+            start, end = float(navigation[index].get("start", 0)), float(navigation[index].get("end", 0))
+            candidates = [
+                item for item in public_items
+                if start <= float(item.get("start", -1)) <= end and normalize_space(item.get("text"))
+            ]
+        if not candidates:
+            unhandled.add(f"navigation:{index + 1}")
+            continue
+        candidate = min(candidates, key=lambda item: (len(normalize_space(item.get("text"))), float(item.get("start", 0))))
+        projection = public_projection(candidate)
+        navigation[index].pop("relation_id", None)
+        navigation[index].update({"label": projection["text"], "claim_ids": projection["claim_ids"], "evidence_ids": projection["evidence_ids"]})
+        if projection.get("relation_id"):
+            navigation[index]["relation_id"] = projection["relation_id"]
+        if index < len(chronology):
+            chronology[index].pop("relation_id", None)
+            chronology[index].update({"label": projection["text"], "claim_ids": projection["claim_ids"], "evidence_ids": projection["evidence_ids"]})
+            if projection.get("relation_id"):
+                chronology[index]["relation_id"] = projection["relation_id"]
+
+    def semantic_key(node):
+        return (
+            normalize_space(node.get("text") or node.get("value") or node.get("label")),
+            tuple(node.get("claim_ids", [])),
+            tuple(node.get("evidence_ids", [])),
+            node.get("relation_id"),
+        )
+
+    public_keys = {semantic_key(item) for item in public_items}
+    supported_by_key = {
+        semantic_key(node): review_by_id[node["node_id"]]
+        for node in original_nodes
+        if review_by_id.get(node["node_id"], {}).get("verdict") == "supported"
+    }
+    retained_reviews = []
+    unresolved = set(unhandled)
+    for node in _document_audit_nodes(repaired):
+        key = semantic_key(node)
+        if key in public_keys:
+            retained_reviews.append({
+                "node_id": node["node_id"], "verdict": "supported",
+                "role": node.get("role"), "relation_id": node.get("relation_id"),
+                "evidence_ids": node.get("evidence_ids", []),
+                "verification_mode": "reconciled_verified_public_item",
+                "reason": "Exact text and provenance passed the PublicItem boundary",
+            })
+        elif key in supported_by_key:
+            retained_reviews.append({
+                **supported_by_key[key], "node_id": node["node_id"],
+                "role": node.get("role"), "relation_id": node.get("relation_id"),
+                "evidence_ids": node.get("evidence_ids", []),
+            })
+        else:
+            unresolved.add(node["node_id"])
+
+    abstentions = [
+        {"node": node_by_id.get(node_id), "review": review_by_id.get(node_id)}
+        for node_id in sorted(failed_ids)
+    ]
+    reconciled = dict(audit)
+    reconciled.update({
+        "status": "passed" if retained_reviews and not unresolved else "failed",
+        "input_total_nodes": audit.get("total_nodes", len(original_nodes)),
+        "total_nodes": len(retained_reviews),
+        "evaluated_nodes": len(retained_reviews),
+        "counts": dict(Counter(review.get("verdict", "verification_unavailable") for review in retained_reviews)),
+        "reviews": retained_reviews,
+        "unknown_semantic_checks": 0,
+        "reconciliation": "optional_derived_surface_abstention",
+        "abstention_count": len(abstentions),
+        "abstentions": abstentions,
+        "unresolved_node_ids": sorted(unresolved),
+    })
+    return repaired, reconciled
+
+
 PUBLIC_SURFACE_AUDIT_SYSTEM = """Ты — независимый финальный арбитр публичного саммари встречи. Проверяй каждый тезис только по приложенным дословным репликам. Отдельно проверяй все определения и уточняющие слова, числа, отрицания, условия, причинность, модальность и автора. Если в тезисе есть деталь, которой нет в реплике, верни corrected с максимально близкой буквальной формулировкой либо reject, если безопасно исправить нельзя. Не отвергай дословно присутствующее число. Вопрос, гипотеза и предложение допустимы, если их модальность сохранена. Не превращай обязательство в вопрос из-за неуверенности распознавания: пометь его для аудиопроверки, сохрани речевой акт, а смену type подкрепи буквальным evidence. Верни компактный JSON без объяснений и без markdown."""
 
 
@@ -5203,8 +5394,32 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         client, settings["public_auditor"], final_document, source_turns, run_dir,
         public_items=public_items, primary_model=settings["high_risk_verifier"],
     )
+    final_document, document_semantic_audit = reconcile_final_document_audit(
+        final_document, document_semantic_audit, public_items,
+    )
     final_document["semantic_audit"] = document_semantic_audit
     atomic_json(run_dir / "final_document_semantic_audit.json", document_semantic_audit)
+    if document_semantic_audit.get("abstention_count"):
+        atomic_json(run_dir / "final_document_abstentions.json", {
+            "schema_version": 1,
+            "status": document_semantic_audit["status"],
+            "input_total_nodes": document_semantic_audit.get("input_total_nodes"),
+            "retained_total_nodes": document_semantic_audit.get("total_nodes"),
+            "abstention_count": document_semantic_audit["abstention_count"],
+            "items": document_semantic_audit.get("abstentions", []),
+            "unresolved_node_ids": document_semantic_audit.get("unresolved_node_ids", []),
+        })
+        diagnostic_event(
+            "final_document_semantic_audit", category="decision",
+            outcome="retained_with_abstentions" if document_semantic_audit["status"] == "passed" else "failed_after_abstentions",
+            severity="WARN",
+            metrics={
+                "input_nodes": document_semantic_audit.get("input_total_nodes"),
+                "retained_nodes": document_semantic_audit.get("total_nodes"),
+                "abstentions": document_semantic_audit.get("abstention_count"),
+            },
+            refs={"artifact": str(run_dir / "final_document_abstentions.json")},
+        )
     writer_details["final_document_auditor_model"] = settings["high_risk_verifier"]
     writer_details["final_document_auditor_escalation_model"] = settings["public_auditor"]
     writer_details["final_document_audit_status"] = document_semantic_audit["status"]
