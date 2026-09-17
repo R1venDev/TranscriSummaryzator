@@ -689,14 +689,16 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
             for item in document.get("sections", {}).get("experiments", [])
         )
         chronology_duplicates = 0
+        chronology_values = []
         for block in re.split(r"(?m)^### ", artifact_text.split("## Подробная хронология встречи", 1)[-1] if "## Подробная хронология встречи" in artifact_text else ""):
             values = [normalize.group(1).casefold() for line in block.splitlines() if (normalize := re.match(r"^\*\*[^*]+:\*\*\s*(.+)$", line.strip()))]
-            for index, value in enumerate(values):
+            for value in values:
                 value_tokens = tokens(value)
                 chronology_duplicates += any(
                     value_tokens and len(value_tokens & tokens(previous)) / max(1, min(len(value_tokens), len(tokens(previous)))) >= .82
-                    for previous in values[:index]
+                    for previous in chronology_values
                 )
+                chronology_values.append(value)
         counters["chronology_duplicate_fields"] = chronology_duplicates
     else:
         counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "section_context_low_relevance": 0, "section_context_missing_role": 0, "question_context_missing_known_answer": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})

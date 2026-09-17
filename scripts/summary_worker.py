@@ -2555,7 +2555,17 @@ def build_public_document(items, metadata=None, graph=None):
         outcome_graph["claims"] = []
         for claim in graph.get("claims", []):
             public_candidates = items_by_claim.get(claim.get("claim_id"), [])
-            public_text = max(public_candidates, key=lambda item: utility(item)).get("text") if public_candidates else sanitize_public_surface(claim.get("statement"))
+            # A residual-question PublicItem may cite both the question and
+            # candidate-answer claims. Its text describes the question and
+            # must never overwrite the answer claim's own publication text in
+            # an OutcomeCard (otherwise an answer appears as "Состояние" or
+            # "Дальше: ... спрашивает"). Prefer a claim-specific projection,
+            # then any non-question projection, and finally the source claim.
+            exact = [item for item in public_candidates if item.get("claim_ids") == [claim.get("claim_id")]]
+            non_question = [item for item in public_candidates if item.get("section") != "questions"]
+            candidate_pool = exact or non_question
+            public_text = (max(candidate_pool, key=lambda item: utility(item)).get("text")
+                           if candidate_pool else sanitize_public_surface(claim.get("statement")))
             outcome_graph["claims"].append(dict(claim, publication_text=public_text))
     outcome_cards = build_outcome_cards(outcome_graph, allowed_claims) if outcome_graph else []
     minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
@@ -2680,6 +2690,7 @@ def build_public_document(items, metadata=None, graph=None):
             return []
         candidates = []
         question = item.get("question_state", {})
+        answer_record_ids = set(question.get("answer_record_ids", []))
         for index, record_id in enumerate(question.get("answer_record_ids", [])):
             claim = graph_by_source.get(record_id)
             if claim:
@@ -2751,8 +2762,9 @@ def build_public_document(items, metadata=None, graph=None):
                 and claim.get("content_kind") in {"problem", "constraint", "proposal", "observation", "current_state", "action"}
             ):
                 continue
-            linked = claim.get("claim_id") in set(item.get("claim_ids", []))
-            role = context_role(item.get("section"), claim.get("content_kind"), text)
+            answer_claim = claim.get("source_record_id") in answer_record_ids
+            linked = claim.get("claim_id") in set(item.get("claim_ids", [])) or answer_claim
+            role = context_role(item.get("section"), claim.get("content_kind"), text, answer=answer_claim)
             node = context_node(
                 text, [claim.get("claim_id")], claim.get("evidence_ids", []),
                 context_score(item, text, claim.get("start"), 45 if same_episode else 15, linked) + role_bonus[role],
@@ -2776,6 +2788,13 @@ def build_public_document(items, metadata=None, graph=None):
             if len(chosen) >= limit:
                 break
         for node in chosen:
+            if item.get("section") == "questions" and any(
+                claim.get("claim_id") in set(node.get("claim_ids", []))
+                and claim.get("source_record_id") in answer_record_ids
+                for claim in graph_claims
+            ):
+                node["role"] = "known_answer"
+                node["directly_linked"] = True
             node.pop("_score", None)
             node.pop("_kind", None)
         return chosen
@@ -2928,6 +2947,7 @@ def render_public_document(document):
         cards = {card.get("outcome_id"): card for card in document.get("outcome_cards", [])}
         field_labels = {"current_state": "Состояние", "constraint": "Ограничение", "resolution": "Решение", "work_result": "Результат", "next_step": "Дальше", "remaining_unknown": "Осталось уточнить"}
         render_tokens = lambda value: {token for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(token) > 2}
+        chronology_values = []
         for chapter in document["chronology"]:
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
@@ -2944,16 +2964,24 @@ def render_public_document(document):
                             field_text = terminate_sentence(_public_text({"text": field["value"]}))
                             normalized = normalize_space(re.sub(r"[*`]", "", field_text)).casefold()
                             normalized_tokens = render_tokens(normalized)
-                            if any(normalized_tokens and len(normalized_tokens & render_tokens(previous)) / max(1, min(len(normalized_tokens), len(render_tokens(previous)))) >= .82 for previous in rendered_values):
+                            if any(normalized_tokens and len(normalized_tokens & render_tokens(previous)) / max(1, min(len(normalized_tokens), len(render_tokens(previous)))) >= .82 for previous in chronology_values):
                                 continue
                             rendered_values.append(normalized)
+                            chronology_values.append(normalized)
                             rendered_fields.append(f"**{field_labels[name]}:** {field_text}")
             if rendered_fields:
                 lines.extend(rendered_fields)
             covered = {claim for card in chapter_cards for value in card.get("fields", {}).values() for field in (value if isinstance(value, list) else [value] if value else []) for claim in field.get("claim_ids", [])}
             context_items = [item for item in chapter["items"] if not set(item.get("claim_ids", [])) <= covered]
             if context_items:
-                lines.extend(f"**Контекст:** {terminate_sentence(_public_text(item))}" for item in context_items)
+                for item in context_items:
+                    context_text = terminate_sentence(_public_text(item))
+                    normalized = normalize_space(re.sub(r"[*`]", "", context_text)).casefold()
+                    normalized_tokens = render_tokens(normalized)
+                    if any(normalized_tokens and len(normalized_tokens & render_tokens(previous)) / max(1, min(len(normalized_tokens), len(render_tokens(previous)))) >= .82 for previous in chronology_values):
+                        continue
+                    chronology_values.append(normalized)
+                    lines.append(f"**Контекст:** {context_text}")
             elif not rendered_fields:
                 lines.append(" ".join(terminate_sentence(_public_text(item)) for item in chapter["items"]))
             lines.append("")

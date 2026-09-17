@@ -189,6 +189,68 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(card["fields"]["resolution"]["value"], "Можно проверить точку входа")
         self.assertIsNone(card["fields"]["next_step"])
 
+    def test_open_question_cannot_fill_state_or_next_step(self):
+        graph = {
+            "claims": [{"claim_id": "C1", "proposition_id": "P1", "content_kind": "observation",
+                        "statement": "Есть ли задержка?", "publication_text": "Есть ли задержка?",
+                        "evidence_ids": ["U1"]}],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Задержка",
+                                  "claim_ids": ["C1"], "ranges": [{"start": 1, "end": 2}]}],
+            "task_states": [],
+            "question_states": [{"proposition_id": "P1", "status": "unanswered",
+                                 "remaining_unknown": "Есть ли задержка?"}],
+        }
+        card = build_outcome_cards(graph)[0]
+        self.assertIsNone(card["fields"]["current_state"])
+        self.assertIsNone(card["fields"]["next_step"])
+        self.assertEqual(card["fields"]["remaining_unknown"][0]["value"], "Есть ли задержка?")
+
+    def test_chronology_deduplicates_fields_across_chapters(self):
+        def card(number):
+            return {"outcome_id": f"OC{number}", "fields": {
+                "current_state": {"value": "Общий подтверждённый факт", "claim_ids": [f"C{number}"], "evidence_ids": [f"U{number}"]},
+                "constraint": None, "resolution": None, "work_result": None,
+                "next_step": None, "remaining_unknown": [],
+            }}
+        document = {
+            "title": {"text": "Итоги", "claim_ids": ["C1"], "evidence_ids": ["U1"]},
+            "overview": [], "sections": {}, "navigation": [], "metadata": {},
+            "outcome_cards": [card(1), card(2)],
+            "chronology": [
+                {"label": "Первая тема", "start": 1, "end": 2, "outcome_ids": ["OC1"], "items": []},
+                {"label": "Вторая тема", "start": 3, "end": 4, "outcome_ids": ["OC2"], "items": []},
+            ],
+        }
+        artifact = render_public_document(document)
+        self.assertEqual(artifact.count("Общий подтверждённый факт."), 1)
+
+    def test_question_projection_does_not_overwrite_answer_claim_in_outcome(self):
+        items = [
+            {"public_id": "PIQ", "section": "questions", "text": "@A спрашивает: нужен ли фильтр?",
+             "claim_ids": ["CQ", "CA"], "evidence_ids": ["UQ", "UA"], "source_word_ids": ["WQ"],
+             "content_kind": "question", "social_state": "unanswered", "start": 1, "end": 2, "episode_id": "E1",
+             "question_state": {"answer_record_ids": ["FA"]}},
+            {"public_id": "PIA", "section": "minutes", "text": "Предложено проверить дополнительный фильтр.",
+             "claim_ids": ["CA"], "evidence_ids": ["UA"], "source_word_ids": ["WA"],
+             "content_kind": "proposal", "social_state": "candidate", "start": 2, "end": 3, "episode_id": "E1"},
+        ]
+        graph = {
+            "claims": [
+                {"claim_id": "CQ", "proposition_id": "PQ", "source_record_id": "FQ", "content_kind": "question",
+                 "statement": "Нужен ли фильтр?", "evidence_ids": ["UQ"], "lifecycle": "active", "verification_status": "supported"},
+                {"claim_id": "CA", "proposition_id": "PA", "source_record_id": "FA", "content_kind": "proposal",
+                 "statement": "Предложено проверить дополнительный фильтр.", "evidence_ids": ["UA"], "lifecycle": "active", "verification_status": "supported"},
+            ],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Фильтр", "claim_ids": ["CQ", "CA"],
+                                  "ranges": [{"start": 1, "end": 3}]}],
+            "task_states": [],
+            "question_states": [{"proposition_id": "PQ", "status": "unanswered", "remaining_unknown": "Нужен ли фильтр?"}],
+        }
+        document = build_public_document(items, graph=graph)
+        card = document["outcome_cards"][0]
+        self.assertEqual(card["fields"]["next_step"]["value"], "Предложено проверить дополнительный фильтр.")
+        self.assertNotIn("спрашивает", card["fields"]["next_step"]["value"])
+
     def test_chapter_uses_episode_end(self):
         item = {"public_id": "PI1", "section": "minutes", "text": "Сервис работает", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "current_state", "social_state": "candidate", "start": 10, "end": 18, "episode_id": "E1"}
         chapter = build_public_document([item])["chronology"][0]

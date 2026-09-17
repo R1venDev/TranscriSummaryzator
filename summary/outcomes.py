@@ -46,11 +46,14 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
                   if value in by_claim and (allowed is None or value in allowed)]
         if not claims:
             continue
-        state = _pick(claims, {"current_state", "experimental_result", "observation"})
-        constraint = _pick(claims, {"problem", "blocker", "constraint", "risk", "dependency"})
-        resolution = _pick(claims, {"decision", "proposal", "design_choice", "correction"}, lambda item: item.get("lifecycle", "active") == "active" and (item.get("content_kind") != "proposal" or item.get("decision_status") == "accepted"))
-        work = _pick(claims, {"resource", "dataset", "definition", "trading_rule", "system_rule"})
-        next_claim = _pick(claims, {"action", "follow_up", "proposal"})
+        def not_open_question(item):
+            question = question_by_prop.get(item.get("proposition_id"))
+            return not question or question.get("status") in {"answered", "rhetorical", "superseded"}
+        state = _pick(claims, {"current_state", "experimental_result", "observation"}, not_open_question)
+        constraint = _pick(claims, {"problem", "blocker", "constraint", "risk", "dependency"}, not_open_question)
+        resolution = _pick(claims, {"decision", "proposal", "design_choice", "correction"}, lambda item: not_open_question(item) and item.get("lifecycle", "active") == "active" and (item.get("content_kind") != "proposal" or item.get("decision_status") == "accepted"))
+        work = _pick(claims, {"resource", "dataset", "definition", "trading_rule", "system_rule"}, not_open_question)
+        next_claim = _pick(claims, {"action", "follow_up", "proposal"}, not_open_question)
         next_field = None
         if next_claim:
             task = task_by_prop.get(next_claim.get("proposition_id"), {})
@@ -83,9 +86,10 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
         populated = [value for key, value in fields.items() if value and key != "remaining_unknown"]
         populated += remaining
         if not populated:
-            fallback = max(claims, key=lambda item: len(str(item.get("statement") or "")))
-            fields["current_state"] = _field(fallback)
-            populated = [fields["current_state"]]
+            fallback = max((item for item in claims if not_open_question(item)), key=lambda item: len(str(item.get("statement") or "")), default=None)
+            if fallback:
+                fields["current_state"] = _field(fallback)
+                populated = [fields["current_state"]]
         all_claim_ids = _dedupe(item.get("claim_id") for item in claims)
         all_evidence_ids = _dedupe(value for item in claims for value in item.get("evidence_ids", []))
         raw = "|".join([str(bundle.get("bundle_id") or "")] + sorted(all_claim_ids))
