@@ -36,7 +36,7 @@ def sanitize_public_surface(text):
 def public_surface_text(claim, preferred=None):
     """Return Russian, source-grounded wording for a public surface."""
     value = sanitize_public_surface(preferred if preferred is not None else claim.get("statement"))
-    if not has_english_prose(value):
+    if not has_english_prose(value) and not INTERNAL_LABEL_RE.search(value):
         return value
     allowed_evidence = set(claim.get("evidence_ids", []))
     candidates = [
@@ -47,6 +47,18 @@ def public_surface_text(claim, preferred=None):
     if candidates:
         return sanitize_public_surface(max(candidates, key=len))
     return ""
+
+
+def substantive_unverified_surface(text):
+    """Keep uncertain source material, but not bare acknowledgements or labels."""
+    value = str(text or "").strip()
+    if not value or INTERNAL_LABEL_RE.search(value) or has_english_prose(value):
+        return False
+    tokens = re.findall(r"(?iu)[a-zа-яё0-9]+", value)
+    return not (
+        len(tokens) <= 5
+        and re.match(r"(?iu)^\s*(?:угу|ага|да|ладно|ок(?:ей)?)(?:\b|[,.!?])", value)
+    )
 
 
 def role_relations(text):
@@ -152,7 +164,8 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in selected("requires_verification"):
         if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence", "contradicted"}:
             text = str(claim.get("statement") or "")
-            if not re.search(r"(?iu)\b(?:шутк|dow\s*jones|s&p|столет|тысячелет)\w*", text):
+            if (substantive_unverified_surface(text)
+                    and not re.search(r"(?iu)\b(?:шутк|dow\s*jones|s&p|столет|тысячелет)\w*", text)):
                 task_state = task_states.get(claim.get("canonical_task_state_id"), {})
                 frame = task_state.get("action_frame", {})
                 if frame.get("state") == "reported_plan" and frame.get("reporter"):
@@ -414,20 +427,56 @@ def audit_realization(text, plan):
 def verify_generated_items(items, sentence_plans, claims):
     """Audit actual generated text against the union contract of cited claims."""
     by_claim = {x.get("claim_id"): x for x in claims}
-    plan_by_claim = {claim_id: plan for plan in sentence_plans for claim_id in plan.get("claim_ids", [])}
+    plans_by_claim = {}
+    for plan in sentence_plans:
+        for claim_id in plan.get("claim_ids", []):
+            plans_by_claim.setdefault(claim_id, []).append(plan)
     audits = []
     for item in items:
         text = str(item.get("text") or item.get("statement") or "")
         requested_claim_ids = list(item.get("claim_ids") or item.get("fact_ids", []))
         unknown_claim_ids = [x for x in requested_claim_ids if x not in by_claim]
         claim_ids = [x for x in requested_claim_ids if x in by_claim]
-        plans = [plan_by_claim[x] for x in claim_ids if x in plan_by_claim]
+        # A claim can occur in an individual sentence plan and later in a
+        # grouped chronology plan.  The last-write-wins map used previously
+        # leaked another claim's quantity/scope into the individual item.
+        plans = [
+            min(plans_by_claim[x], key=lambda value: len(value.get("claim_ids", [])))
+            for x in claim_ids if x in plans_by_claim
+        ]
         if not text or not claim_ids or not plans:
             errors = (["empty_public_text"] if not text else []) + (["orphan_public_item"] if not claim_ids else []) + (["claim_outside_plan"] if claim_ids and not plans else []) + (["unknown_claim"] if unknown_claim_ids else [])
             audits.append({"text": text, "claim_ids": claim_ids, "passed": False, "errors": errors, "atomic_claims": claim_ids, "relations": [], "status": "ABSTAIN", "qa": {"passed": False, "checks": {}}})
             continue
-        source_mentions = {mention for claim_id in claim_ids for mention in re.findall(r"@[\w.-]+", str(by_claim[claim_id].get("statement") or ""))}
-        merged = {"claim_ids": claim_ids, "relation_ids": sorted({r for p in plans for r in p.get("relation_ids", [])}), "allowed_numbers": [n for p in plans for n in p.get("allowed_numbers", [])], "allowed_relation_markers": sorted({r for p in plans for r in p.get("allowed_relation_markers", [])}), "allowed_speakers": sorted({s for p in plans for s in p.get("allowed_speakers", [])} | source_mentions), "allowed_assignees": sorted({s for p in plans for s in p.get("allowed_assignees", [])}), "polarity": [v for p in plans for v in p.get("polarity", [])], "modality": [v for p in plans for v in p.get("modality", [])], "conditions": [v for p in plans for v in p.get("conditions", [])], "time_scope": [v for p in plans for v in p.get("time_scope", [])]}
+        cited = [by_claim[x] for x in claim_ids]
+        single_claim_contracts = bool(plans) and all(len(p.get("claim_ids", [])) == 1 for p in plans)
+        source_mentions = {mention for source in cited for mention in re.findall(r"@[\w.-]+", str(source.get("statement") or ""))}
+        claim_scopes = []
+        claim_conditions = []
+        for source in cited:
+            scope = source.get("time_scope")
+            claim_scopes.extend(scope if isinstance(scope, list) else [scope] if scope else [])
+            claim_conditions.extend(source.get("conditions", []) or [])
+        plan_scopes = [v for p in plans for v in p.get("time_scope", [])]
+        # A multi-claim plan stores a flattened union.  Only claim-bound scope
+        # may constrain an individual realization; a single-claim contract is
+        # still accepted for backwards-compatible callers/tests.
+        bound_scopes = claim_scopes or (plan_scopes if single_claim_contracts else [])
+        claim_polarity = [source.get("polarity") for source in cited if source.get("polarity")]
+        claim_modality = [source.get("modality") for source in cited if source.get("modality")]
+        claim_assignees = [person for source in cited for person in source.get("assignees", [])]
+        merged = {
+            "claim_ids": claim_ids,
+            "relation_ids": list(item.get("relation_ids", [])),
+            "allowed_numbers": [n for p in plans for n in p.get("allowed_numbers", [])] if single_claim_contracts else [],
+            "allowed_relation_markers": sorted({r for p in plans for r in p.get("allowed_relation_markers", [])}) if single_claim_contracts else sorted(set().union(*(relation_markers(source.get("statement")) for source in cited))),
+            "allowed_speakers": sorted(source_mentions | {s for source in cited for s in source.get("speaker_refs", [])} | ({s for p in plans for s in p.get("allowed_speakers", [])} if single_claim_contracts else set())),
+            "allowed_assignees": sorted(set(claim_assignees) | ({s for p in plans for s in p.get("allowed_assignees", [])} if single_claim_contracts else set())),
+            "polarity": claim_polarity or ([v for p in plans for v in p.get("polarity", [])] if single_claim_contracts else []),
+            "modality": claim_modality or ([v for p in plans for v in p.get("modality", [])] if single_claim_contracts else []),
+            "conditions": claim_conditions or ([v for p in plans for v in p.get("conditions", [])] if single_claim_contracts else []),
+            "time_scope": list(dict.fromkeys(bound_scopes)),
+        }
         task_state = item.get("task_state", {}) if item.get("section") == "tasks" else {}
         question_state = item.get("question_state", {}) if item.get("section") == "questions" else {}
         if task_state and item.get("task_state_id") in {by_claim[x].get("canonical_task_state_id") for x in claim_ids}:
@@ -444,7 +493,8 @@ def verify_generated_items(items, sentence_plans, claims):
                                                 ("original_question", "known_answer", "remaining_question"))
             metadata_text += " " + " ".join(map(str, question_state.get("missing_slot_labels", [])))
             merged["polarity"] = []  # Question-state labels are not predicate polarity.
-        cited = [by_claim[x] for x in claim_ids]
+            primary_scope = by_claim[claim_ids[0]].get("time_scope") if claim_ids else None
+            merged["time_scope"] = primary_scope if isinstance(primary_scope, list) else [primary_scope] if primary_scope else []
         # Complete the source-derived contract before auditing the realization.
         # Previously these fields were appended after audit_realization(), so
         # verbatim source negation and source numbers could be rejected as new.
@@ -490,7 +540,11 @@ def verify_generated_items(items, sentence_plans, claims):
             realization["errors"].append("unknown_claim")
         source_tokens = {v for value in exact_source_surfaces for v in re.findall(r"(?iu)[a-zа-яё0-9]+", value.casefold()) if len(v) > 2}
         source_tokens.update(v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", metadata_text.casefold()) if len(v) > 2)
-        text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", text.casefold()) if len(v) > 2}
+        comparison_text = re.sub(
+            r"(?iu)\s*\(статус:\s*(?:проверка недоступна|недостаточно доказательств для интерпретации|источник содержит противоречие)\)\s*$",
+            "", text,
+        )
+        text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", comparison_text.casefold()) if len(v) > 2}
         editorial_tokens = {"спрашивает", "исполнитель", "статус", "объём", "срок", "условие", "участник", "назначение", "ожидает", "подтверждения", "предложен", "подтверждён", "уточнено", "известно", "осталось", "уточнить", "взял", "себя"}
         content_tokens = text_tokens - editorial_tokens
         overlap = len(source_tokens & content_tokens)
@@ -535,6 +589,20 @@ def verify_generated_items(items, sentence_plans, claims):
             realization["status"] = "ABSTAIN"
         audits.append({"text": text, "claim_ids": claim_ids, **realization, "qa": qa})
     return {"passed": all(x["passed"] for x in audits), "audits": audits, "abstentions": [x for x in audits if not x["passed"]]}
+
+
+def partition_verified_public_items(items, report):
+    """Quarantine rejected items while preserving an auditable disposition."""
+    audits = list(report.get("audits", []))
+    if len(items) != len(audits):
+        raise ValueError("PublicItem verification result does not match input length")
+    retained, rejected = [], []
+    for item, audit in zip(items, audits):
+        if audit.get("passed"):
+            retained.append(item)
+        else:
+            rejected.append({"public_item": item, "audit": audit})
+    return retained, rejected
 
 
 def publication_audit(report, artifact_text, items=None, summary_plan=None, verified_hash=None, document=None):

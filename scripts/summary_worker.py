@@ -45,7 +45,7 @@ from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_verified_document, project_views
 from summary.outcomes import build_outcome_cards
-from summary.verifier import audit_realization, build_public_items, diff_public_items, has_english_prose, public_surface_text, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
+from summary.verifier import audit_realization, build_public_items, diff_public_items, has_english_prose, partition_verified_public_items, public_surface_text, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
@@ -5065,11 +5065,50 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
             item["navigation_basis"] = "nearest_utterance_fallback"
     public_items = validate_public_items_contract(public_items)
     atomic_json(run_dir / "summary_plan.json", summary_plan)
+    initial_public_item_count = len(public_items)
+    initial_post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
+    public_abstentions = []
+    if not initial_post_render_audit["passed"]:
+        public_items, public_abstentions = partition_verified_public_items(public_items, initial_post_render_audit)
+        if not public_items:
+            atomic_json(run_dir / "post_render_verification.json", initial_post_render_audit)
+            persist_publication_failure("post_render_verification", initial_post_render_audit)
+            raise RuntimeError("Post-render PublicItem verification rejected every public item")
+        retained_claim_ids = {claim_id for item in public_items for claim_id in item.get("claim_ids", [])}
+        for rejected in public_abstentions:
+            for claim_id in rejected["public_item"].get("claim_ids", []):
+                if claim_id in retained_claim_ids:
+                    continue
+                for view_plan in summary_plan.get("view_plans", {}).values():
+                    if claim_id in view_plan.get("selected_claim_ids", []):
+                        view_plan.setdefault("dispositions", {})[claim_id] = {
+                            "status": "excluded", "reason": "post_render_verification_abstention",
+                        }
+        atomic_json(run_dir / "public_item_abstentions.json", {
+            "schema_version": 1,
+            "input_item_count": initial_public_item_count,
+            "retained_item_count": len(public_items),
+            "abstention_count": len(public_abstentions),
+            "items": public_abstentions,
+        })
+        diagnostic_event(
+            "post_render_verification", category="decision", outcome="retained_with_abstentions",
+            severity="WARN",
+            metrics={"input_items": initial_public_item_count, "retained_items": len(public_items), "abstentions": len(public_abstentions)},
+            reasons=sorted({reason for value in public_abstentions for reason in value["audit"].get("errors", [])}),
+            refs={"artifact": str(run_dir / "public_item_abstentions.json")},
+        )
     post_render_audit = verify_generated_items(public_items, summary_plan["public_sentence_plans"], state_v2["claims"])
+    post_render_audit.update({
+        "input_item_count": initial_public_item_count,
+        "retained_item_count": len(public_items),
+        "abstention_count": len(public_abstentions),
+        "filtered_abstentions": public_abstentions,
+    })
     if not post_render_audit["passed"]:
         atomic_json(run_dir / "post_render_verification.json", post_render_audit)
         persist_publication_failure("post_render_verification", post_render_audit)
-        raise RuntimeError("Post-render PublicItem verification rejected publication")
+        raise RuntimeError("Post-render PublicItem verification rejected retained publication")
     final_document = build_public_document(public_items, metadata={
         "source": transcript_document.get("source"),
         "duration_seconds": transcript_document.get("duration_seconds"),

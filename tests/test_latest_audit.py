@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
-from summary.verifier import has_english_prose, publication_audit, sanitize_public_surface, verify_generated_items
+from summary.verifier import has_english_prose, partition_verified_public_items, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items
 from scripts.diagnostics import _safe, summarize
 
 
@@ -35,6 +35,39 @@ class LatestAuditRegressionTests(unittest.TestCase):
         source = "Discussed potential goal: creating a baseline solution with winrate around 30–40%."
         self.assertEqual(sanitize_public_surface(source), source)
         self.assertTrue(has_english_prose(source))
+
+    def test_internal_labels_and_bare_acknowledgements_are_not_public_surfaces(self):
+        claim = {"statement": "@A link_stop_loss_to_projection_extremes", "evidence_ids": []}
+        self.assertEqual(public_surface_text(claim), "")
+        self.assertFalse(substantive_unverified_surface("Угу."))
+        self.assertFalse(substantive_unverified_surface("Да, на индексах в AM."))
+        self.assertTrue(substantive_unverified_surface("Размер имбаланса в источнике не подтверждён."))
+
+    def test_rejected_public_items_are_quarantined_with_full_audit(self):
+        items = [{"public_id": "PI1"}, {"public_id": "PI2"}]
+        report = {"audits": [
+            {"passed": True, "errors": []},
+            {"passed": False, "errors": ["qa_slot_failure"]},
+        ]}
+        retained, rejected = partition_verified_public_items(items, report)
+        self.assertEqual([item["public_id"] for item in retained], ["PI1"])
+        self.assertEqual(rejected[0]["public_item"]["public_id"], "PI2")
+        self.assertEqual(rejected[0]["audit"]["errors"], ["qa_slot_failure"])
+
+    def test_group_plan_time_scope_does_not_leak_between_claims(self):
+        plan = {
+            "claim_ids": ["C1", "C2"], "relation_ids": [], "allowed_numbers": ["1"],
+            "allowed_relation_markers": [], "allowed_speakers": [], "allowed_assignees": [],
+            "polarity": ["positive", "positive"], "modality": ["certain", "certain"],
+            "conditions": [], "time_scope": ["1 месяц"],
+        }
+        claims = [
+            {"claim_id": "C1", "statement": "Можно проверить спотовую стратегию.", "lifecycle": "active"},
+            {"claim_id": "C2", "statement": "Нужны данные за месяц.", "time_scope": "1 месяц", "lifecycle": "active"},
+        ]
+        item = {"section": "minutes", "text": claims[0]["statement"], "claim_ids": ["C1"]}
+        result = verify_generated_items([item], [plan], claims)
+        self.assertTrue(result["passed"], result)
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}
