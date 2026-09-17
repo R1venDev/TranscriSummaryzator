@@ -1235,6 +1235,27 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(record["semantic_structure_status"], "verification_unavailable")
         self.assertIn("semantic_structure_unavailable", record["uncertainty"]["reasons"])
 
+    def test_final_document_audit_inherits_exact_verified_public_item(self):
+        class Client:
+            def chat(self, *_args, **_kwargs):
+                raise AssertionError("exact verified PublicItem must not be re-audited")
+
+        item = {
+            "text": "Сервис работает в тестовом режиме.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+        }
+        document = {"sections": {"technical": [dict(item)]}}
+        with tempfile.TemporaryDirectory() as directory:
+            report = summary.audit_final_document(
+                Client(), "large-auditor", document,
+                [{"id": "U1", "speaker": "@A", "text": item["text"]}],
+                Path(directory), public_items=[item], primary_model="fast-auditor",
+            )
+        self.assertTrue(report["status"] == "passed", report)
+        self.assertEqual(report["inherited_public_item_nodes"], 1)
+        self.assertEqual(report["independently_reviewed_surfaces"], 0)
+        self.assertEqual(report["escalated_surfaces"], 0)
+
     def test_final_audit_splits_when_model_omits_reviews(self):
         facts = [
             fact(statement="Первый тезис"),

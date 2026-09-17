@@ -4046,13 +4046,46 @@ def _document_audit_nodes(document):
     return nodes
 
 
-def audit_final_document(client, model, document, source_turns, run_dir):
-    """Audit every meaning-bearing final AST node against raw transcript spans."""
+def audit_final_document(client, model, document, source_turns, run_dir,
+                         public_items=None, primary_model=None):
+    """Audit new final-AST meaning and inherit already verified public nodes.
+
+    ``PublicItem`` text crosses a deterministic verification boundary before
+    document construction.  Re-sending those exact immutable surfaces to a
+    large model is both redundant and extremely expensive.  Derived or edited
+    nodes still receive an independent raw-source review; uncertain primary
+    reviews are escalated to the configured large public auditor.
+    """
     nodes = _document_audit_nodes(document)
     utterances = {str(item.get("id")): item for item in source_turns}
     reviews = {}
 
-    def review_batch(batch, offset):
+    def semantic_key(node):
+        return (
+            normalize_space(node.get("text") or node.get("value") or node.get("label")),
+            tuple(node.get("claim_ids", [])),
+            tuple(node.get("evidence_ids", [])),
+            node.get("relation_id"),
+        )
+
+    verified_public_keys = {semantic_key(item) for item in (public_items or [])}
+    pending_by_key = {}
+    for node in nodes:
+        key = semantic_key(node)
+        if key in verified_public_keys:
+            reviews[node["node_id"]] = {
+                "node_id": node["node_id"], "verdict": "supported",
+                "role": node.get("role"), "relation_id": node.get("relation_id"),
+                "evidence_ids": node.get("evidence_ids", []),
+                "verification_mode": "inherited_verified_public_item",
+                "reason": "Exact text and provenance passed the PublicItem boundary",
+            }
+        else:
+            pending_by_key.setdefault(key, []).append(node)
+    pending = [group[0] for group in pending_by_key.values()]
+    primary_model = primary_model or model
+
+    def review_batch(batch, offset, audit_model, artifact_group):
         payload = []
         for node in batch:
             payload.append({
@@ -4063,9 +4096,9 @@ def audit_final_document(client, model, document, source_turns, run_dir):
             })
         try:
             response = call_json_with_retries(
-                client, model, FINAL_DOCUMENT_AUDIT_SYSTEM,
+                client, audit_model, FINAL_DOCUMENT_AUDIT_SYSTEM,
                 json.dumps({"nodes": payload}, ensure_ascii=False),
-                run_dir / "final-document-audit" / f"nodes-{offset + 1:05d}-{offset + len(batch):05d}.json",
+                run_dir / "final-document-audit" / artifact_group / f"nodes-{offset + 1:05d}-{offset + len(batch):05d}.json",
                 attempts=2, num_predict=max(1000, 320 * len(batch)), num_ctx=16384,
                 contract="final_document_audit",
             ).get("response", {})
@@ -4082,8 +4115,10 @@ def audit_final_document(client, model, document, source_turns, run_dir):
                         review["verdict"] = "contradicted"
                     if node.get("relation_id") and review.get("relation_supported") is not True:
                         review["verdict"] = "insufficient_evidence"
+                    review["verification_mode"] = artifact_group
+                    review["model"] = audit_model
                     reviews[node["node_id"]] = review
-                review_batch(missing, offset + len(present))
+                review_batch(missing, offset + len(present), audit_model, artifact_group)
                 return
             for node in batch:
                 review = dict(returned[node["node_id"]])
@@ -4096,17 +4131,49 @@ def audit_final_document(client, model, document, source_turns, run_dir):
                     review["verdict"] = "contradicted"
                 if node.get("relation_id") and review.get("relation_supported") is not True:
                     review["verdict"] = "insufficient_evidence"
+                review["verification_mode"] = artifact_group
+                review["model"] = audit_model
                 reviews[node["node_id"]] = review
         except RuntimeError as exc:
             if len(batch) > 1:
                 middle = len(batch) // 2
-                review_batch(batch[:middle], offset)
-                review_batch(batch[middle:], offset + middle)
+                review_batch(batch[:middle], offset, audit_model, artifact_group)
+                review_batch(batch[middle:], offset + middle, audit_model, artifact_group)
                 return
-            reviews[batch[0]["node_id"]] = {"node_id": batch[0]["node_id"], "verdict": "verification_unavailable", "role": batch[0].get("role"), "relation_id": batch[0].get("relation_id"), "evidence_ids": batch[0].get("evidence_ids", []), "reason": str(exc)}
+            reviews[batch[0]["node_id"]] = {"node_id": batch[0]["node_id"], "verdict": "verification_unavailable", "role": batch[0].get("role"), "relation_id": batch[0].get("relation_id"), "evidence_ids": batch[0].get("evidence_ids", []), "reason": str(exc), "verification_mode": artifact_group, "model": audit_model}
 
-    for offset in range(0, len(nodes), 12):
-        review_batch(nodes[offset:offset + 12], offset)
+    emit(82.0, "summary_document_audit", f"Финальная проверка документа: {len(reviews)} из {len(nodes)} узлов")
+    for offset in range(0, len(pending), 12):
+        review_batch(pending[offset:offset + 12], offset, primary_model, "primary")
+        emit(
+            82 + 12 * min(1, len(reviews) / max(1, len(nodes))),
+            "summary_document_audit",
+            f"Финальная проверка документа: {len(reviews)} из {len(nodes)} узлов",
+        )
+
+    escalation = [node for node in pending if reviews.get(node["node_id"], {}).get("verdict") != "supported"]
+    for offset in range(0, len(escalation), 12):
+        review_batch(escalation[offset:offset + 12], offset, model, "escalation")
+        emit(
+            94 + 2 * min(1, (offset + len(escalation[offset:offset + 12])) / max(1, len(escalation))),
+            "summary_document_audit",
+            f"Усиленная проверка спорных узлов: {min(offset + 12, len(escalation))} из {len(escalation)}",
+        )
+
+    # Reuse one independently reviewed semantic surface wherever the renderer
+    # materializes it more than once; retain a review row per final node.
+    for group in pending_by_key.values():
+        representative = reviews[group[0]["node_id"]]
+        for node in group[1:]:
+            reviews[node["node_id"]] = {
+                **representative,
+                "node_id": node["node_id"], "role": node.get("role"),
+                "relation_id": node.get("relation_id"),
+                "evidence_ids": node.get("evidence_ids", []),
+                "verification_mode": "reused_equivalent_final_surface",
+                "reviewed_as_node_id": group[0]["node_id"],
+            }
+    emit(96.0, "summary_document_audit", f"Финальная проверка документа: {len(reviews)} из {len(nodes)} узлов")
     counts = Counter(item.get("verdict", "verification_unavailable") for item in reviews.values())
     report = {
         "schema": "FinalDocumentSemanticAudit", "schema_version": 1,
@@ -4115,6 +4182,11 @@ def audit_final_document(client, model, document, source_turns, run_dir):
         "counts": dict(counts), "reviews": [reviews[node["node_id"]] for node in nodes],
         "unknown_semantic_checks": counts.get("insufficient_evidence", 0) + counts.get("verification_unavailable", 0),
         "model": model,
+        "primary_model": primary_model,
+        "escalation_model": model,
+        "inherited_public_item_nodes": sum(item.get("verification_mode") == "inherited_verified_public_item" for item in reviews.values()),
+        "independently_reviewed_surfaces": len(pending),
+        "escalated_surfaces": len(escalation),
     }
     return report
 
@@ -4769,7 +4841,7 @@ def build_run_manifest(settings, cfg, source_manifest):
             "summary_public_audit": {"model": settings.get("high_risk_verifier"), "contract": "public_surface_reviews"},
             "summary_dialogue_counterexample": {"model": settings.get("public_auditor"), "contract": "dialogue_counterexample"},
             "public_document_writer": {"model": settings.get("writer"), "contract": "bounded_document_edit"},
-            "public_document_semantic_audit": {"model": settings.get("public_auditor"), "contract": "final_document_audit"},
+            "public_document_semantic_audit": {"model": settings.get("high_risk_verifier"), "escalation_model": settings.get("public_auditor"), "contract": "final_document_audit"},
             "public_document": {"model": None, "contract": "VerifiedDocumentSchema", "legacy_writer": "disabled"},
         },
         "vocabulary_sha256": hashlib.sha256(vocabulary.read_bytes()).hexdigest() if vocabulary.is_file() else None,
@@ -5121,16 +5193,20 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         "meeting_timezone": transcript_document.get("meeting_timezone"),
         "meeting_time_source_confidence": transcript_document.get("meeting_time_source_confidence", "unknown"),
     }, graph=state_v2)
+    emit(80.0, "summary_document_write", "Редактура заголовка и краткого обзора")
     final_document = apply_bounded_document_writer(
         client, settings["writer"], final_document, state_v2, run_dir
     )
+    emit(82.0, "summary_document_audit", "Проверка итогового документа по исходным репликам")
     writer_details.update({"bounded_writer_invoked": True, "bounded_writer_model": settings["writer"]})
     document_semantic_audit = audit_final_document(
-        client, settings["public_auditor"], final_document, source_turns, run_dir
+        client, settings["public_auditor"], final_document, source_turns, run_dir,
+        public_items=public_items, primary_model=settings["high_risk_verifier"],
     )
     final_document["semantic_audit"] = document_semantic_audit
     atomic_json(run_dir / "final_document_semantic_audit.json", document_semantic_audit)
-    writer_details["final_document_auditor_model"] = settings["public_auditor"]
+    writer_details["final_document_auditor_model"] = settings["high_risk_verifier"]
+    writer_details["final_document_auditor_escalation_model"] = settings["public_auditor"]
     writer_details["final_document_audit_status"] = document_semantic_audit["status"]
     if document_semantic_audit["status"] != "passed":
         persist_publication_failure("final_document_semantic_audit", document_semantic_audit)
