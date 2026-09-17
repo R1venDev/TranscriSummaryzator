@@ -26,6 +26,16 @@ def normalize_slot(slot):
     return SLOT_ALIASES.get(value, SLOT_ALIASES.get(str(slot or "").strip().casefold(), value.replace(" ", "_")))
 
 
+def infer_requested_slots(question):
+    """Recover a narrow typed slot when extraction omitted an obvious one."""
+    text = str(question or "")
+    if re.search(r"(?iu)\b(?:есть|имеется|существует)\s+ли\b[^?.]{0,80}\b(?:проблем\w*\s+с\s+)?задерж\w*\b", text):
+        return ["implementation_status"]
+    if re.search(r"(?iu)\b(?:проблем\w*\s+с\s+задерж\w*|задерж\w*)\b[^?.]{0,50}\b(?:есть|имеется|существует)\b", text):
+        return ["implementation_status"]
+    return []
+
+
 def _tokens(value):
     return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 2}
 

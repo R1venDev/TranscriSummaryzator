@@ -2516,12 +2516,19 @@ def _public_text(item):
     return text.strip()
 
 
-def _chapter_label(text, limit=78):
-    value = re.split(r"[.!?;]", re.sub(r"[*`]", "", text), maxsplit=1)[0].strip(" —:,")
+def _chapter_label(text, limit=160):
+    source = re.sub(r"(?iu)\bтех\.\s+(?=причин|огранич|детал|проблем)", "технических ", re.sub(r"[*`]", "", text))
+    value = re.split(r"[.!?;]", source, maxsplit=1)[0].strip(" —:,")
     if len(value) > limit:
         clauses = [part.strip(" —:,") for part in re.split(r"(?iu),|\s+[—–]\s+|\s+(?:и|или|потому что|из-за|после)\s+", value) if part.strip()]
-        value = next((part for part in clauses if 18 <= len(part) <= limit), clauses[0] if clauses else value)
-    value = shorten_text(value, limit).rstrip(".…")
+        complete = next((part for part in clauses if 24 <= len(part) <= limit and not re.search(r"(?iu)\b(?:и|или|что|чтобы|из-за|после|тех|тот\s+же\s+самый)$", part)), None)
+        # Keep the complete supported source sentence when no complete clause
+        # fits. A long heading is preferable to a fragment ending mid-thought.
+        if complete:
+            value = complete
+    value = value.rstrip(".")
+    if value and value[0].islower():
+        value = value[0].upper() + value[1:]
     return value if value and not re.search(r"(?iu)\b(?:и|или|что|чтобы|из-за|после)$", value) else "Ключевой результат эпизода"
 
 
@@ -2606,29 +2613,67 @@ def build_public_document(items, metadata=None, graph=None):
     contextual_sections = {"tasks", "questions", "technical", "experiments"}
 
     def context_tokens(value):
-        return {
-            token[:5] if len(token) >= 5 else token
-            for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold())
-            if len(token) > 2
-        }
+        stop = {"участник", "говорящий", "yachoy", "hottabbich", "riven", "misha", "который", "которая", "можно", "нужно", "будет"}
+        result = set()
+        for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()):
+            if len(token) <= 2 or token in stop:
+                continue
+            if re.fullmatch(r"[а-яё]+", token) and len(token) >= 4:
+                token = re.sub(r"[аяоеуыию]$", "", token)
+            result.add(token[:5] if len(token) >= 5 else token)
+        return result
 
     def context_duplicate(left, right, threshold=.72):
         a, b = context_tokens(left), context_tokens(right)
         return bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= threshold)
 
-    def context_node(text, claim_ids, evidence_ids, score, start=None):
+    def context_node(text, claim_ids, evidence_ids, score, start=None, *, kind=None,
+                     role="related", directly_linked=False):
         value = sanitize_public_surface(text)
         if not value or has_english_prose(value):
             return None
         return {"text": value, "claim_ids": list(dict.fromkeys(claim_ids)),
                 "evidence_ids": list(dict.fromkeys(evidence_ids)),
-                "start": float(start or 0), "_score": score}
+                "start": float(start or 0), "role": role,
+                "directly_linked": bool(directly_linked), "_kind": kind,
+                "_score": score}
 
     def context_score(item, text, start, base=0, linked=False):
         target, candidate = context_tokens(_public_text(item)), context_tokens(text)
         similarity = len(target & candidate) / max(1, min(len(target), len(candidate)))
         distance = abs(float(item.get("start", 0)) - float(start or 0))
         return base + 100 * similarity + max(0, 40 - distance / 3) + (35 if linked else 0)
+
+    def context_role(section, kind, text, *, answer=False):
+        if answer:
+            return "known_answer"
+        if section == "questions":
+            return "known_context"
+        if section == "tasks":
+            return "purpose" if (
+                kind in {"problem", "constraint", "question"}
+                or (kind in {"proposal", "hypothesis"} and re.search(r"(?iu)\b(?:чтобы|порог\w*|определ\w*|провер\w*)\b", str(text or "")))
+            ) else "related_step"
+        if section == "technical":
+            if kind in {"problem", "constraint"}:
+                return "importance"
+            if kind in {"proposal", "action", "follow_up", "resource"}:
+                return "application"
+            return "explanation"
+        if section == "experiments":
+            if kind in {"problem", "constraint"} or re.search(r"(?iu)\b(?:шум\w*|меша\w*|проблем\w*|огранич\w*)\b", str(text or "")):
+                return "motivation"
+            if kind in {"observation", "current_state"}:
+                return "observation"
+            return "test_detail"
+        return "related"
+
+    role_bonus = {
+        "known_answer": 55, "importance": 28, "motivation": 40,
+        "application": 18, "purpose": 18, "observation": 12,
+        "test_detail": 10, "explanation": 8, "related_step": 8,
+        "known_context": 6, "related": 0,
+    }
 
     def item_context(item):
         if item.get("section") not in contextual_sections:
@@ -2639,9 +2684,11 @@ def build_public_document(items, metadata=None, graph=None):
             claim = graph_by_source.get(record_id)
             if claim:
                 text = public_surface_text(claim)
+                role = context_role(item.get("section"), claim.get("content_kind"), text, answer=True)
                 node = context_node(
                     text, [claim.get("claim_id")], claim.get("evidence_ids", []),
-                    context_score(item, text, claim.get("start"), 65 - index), claim.get("start"),
+                    context_score(item, text, claim.get("start"), 65 - index) + role_bonus[role], claim.get("start"),
+                    kind=claim.get("content_kind"), role=role, directly_linked=True,
                 )
                 if node: candidates.append(node)
         related_cards = [card for card in outcome_cards if set(item.get("claim_ids", [])) & set(card.get("claim_ids", []))]
@@ -2652,30 +2699,34 @@ def build_public_document(items, metadata=None, graph=None):
                         float(x.get("start", item.get("start", 0))) for x in items
                         if set(x.get("claim_ids", [])) & set(field.get("claim_ids", []))
                     ] or [item.get("start", 0)])
+                    linked = bool(set(field.get("claim_ids", [])) & set(item.get("claim_ids", [])))
+                    role = context_role(item.get("section"), field.get("content_kind"), field.get("value"))
                     node = context_node(
                         field.get("value"), field.get("claim_ids", []), field.get("evidence_ids", []),
-                        context_score(item, field.get("value"), start, 55,
-                                      bool(set(field.get("claim_ids", [])) & set(item.get("claim_ids", [])))),
-                        start,
+                        context_score(item, field.get("value"), start, 55, linked) + role_bonus[role],
+                        start, kind=field.get("content_kind"), role=role, directly_linked=linked,
                     )
                     if node: candidates.append(node)
             for claim_id in card.get("claim_ids", []):
                 for related in items_by_claim.get(claim_id, []):
                     text = _public_text(related)
+                    linked = bool(set(related.get("claim_ids", [])) & set(item.get("claim_ids", [])))
+                    role = context_role(item.get("section"), related.get("content_kind"), text)
                     node = context_node(
                         text, related.get("claim_ids", []), related.get("evidence_ids", []),
-                        context_score(item, text, related.get("start"), 50 + utility(related),
-                                      bool(set(related.get("claim_ids", [])) & set(item.get("claim_ids", [])))),
-                        related.get("start"),
+                        context_score(item, text, related.get("start"), 50 + utility(related), linked) + role_bonus[role],
+                        related.get("start"), kind=related.get("content_kind"), role=role, directly_linked=linked,
                     )
                     if node: candidates.append(node)
         for related in items:
             if related.get("public_id") == item.get("public_id") or related.get("episode_id") != item.get("episode_id"):
                 continue
             text = _public_text(related)
+            role = context_role(item.get("section"), related.get("content_kind"), text)
             node = context_node(
                 text, related.get("claim_ids", []), related.get("evidence_ids", []),
-                context_score(item, text, related.get("start"), 35 + utility(related)), related.get("start"),
+                context_score(item, text, related.get("start"), 35 + utility(related)) + role_bonus[role], related.get("start"),
+                kind=related.get("content_kind"), role=role,
             )
             if node: candidates.append(node)
         # Public views deliberately stay compact, so the strongest explanatory
@@ -2683,26 +2734,51 @@ def build_public_document(items, metadata=None, graph=None):
         # supported active claim in the same episode; the document verifier
         # validates its claim/evidence closure against MeetingGraph.
         for claim in graph_claims:
-            if claim.get("episode_id") != item.get("episode_id") or claim.get("lifecycle", "active") != "active":
+            same_episode = claim.get("episode_id") == item.get("episode_id")
+            if claim.get("lifecycle", "active") != "active":
                 continue
             if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
                 continue
             text = public_surface_text(claim)
+            overlap = context_tokens(_public_text(item)) & context_tokens(text)
+            # Cross-episode context is allowed only for a strong topical match
+            # and an explanatory semantic role. This recovers a verified cause
+            # stated earlier in the meeting without admitting generic nearby
+            # material from an unrelated topic.
+            if not same_episode and not (
+                item.get("section") in {"technical", "experiments"}
+                and len(overlap) >= 2
+                and claim.get("content_kind") in {"problem", "constraint", "proposal", "observation", "current_state", "action"}
+            ):
+                continue
+            linked = claim.get("claim_id") in set(item.get("claim_ids", []))
+            role = context_role(item.get("section"), claim.get("content_kind"), text)
             node = context_node(
                 text, [claim.get("claim_id")], claim.get("evidence_ids", []),
-                context_score(item, text, claim.get("start"), 45,
-                              claim.get("claim_id") in set(item.get("claim_ids", []))),
-                claim.get("start"),
+                context_score(item, text, claim.get("start"), 45 if same_episode else 15, linked) + role_bonus[role],
+                claim.get("start"), kind=claim.get("content_kind"), role=role, directly_linked=linked,
             )
             if node: candidates.append(node)
+        target_tokens = context_tokens(_public_text(item))
         valid = [node for node in candidates
                  if node.get("claim_ids") and node.get("evidence_ids")
-                 and not context_duplicate(node["text"], _public_text(item))]
+                 and not context_duplicate(node["text"], _public_text(item))
+                 and not (item.get("section") != "questions" and set(node.get("claim_ids", [])) <= set(item.get("claim_ids", [])))
+                 and (node.get("directly_linked") or bool(target_tokens & context_tokens(node["text"])))]
         if not valid:
             return []
-        best = max(valid, key=lambda node: (node["_score"], len(node["evidence_ids"]), -len(node["text"])))
-        best.pop("_score", None)
-        return [best]
+        chosen = []
+        limit = 2 if item.get("section") in {"technical", "experiments"} else 1
+        for node in sorted(valid, key=lambda value: (-value["_score"], -len(value["evidence_ids"]), len(value["text"]))):
+            if any(node["role"] == prior["role"] or context_duplicate(node["text"], prior["text"], .62) for prior in chosen):
+                continue
+            chosen.append(node)
+            if len(chosen) >= limit:
+                break
+        for node in chosen:
+            node.pop("_score", None)
+            node.pop("_kind", None)
+        return chosen
 
     # Overview roles are selected from different semantic needs, not a global
     # lexical score.  This keeps state, constraint and next action distinct.
@@ -2837,8 +2913,15 @@ def render_public_document(document):
             stamp = time_link(float(item.get("start", 0)), total_seconds, job_id, base_url)
             qualifier = " (проверка недоступна; не подтверждено как договорённость)" if section == "requires_verification" else ""
             lines.append(f"- **{prefixes[section]}-{index:02d}.** {_public_text(item)}{qualifier} {stamp}")
-            context_label = {"questions": "Связанный контекст", "technical": "Практический контекст", "experiments": "Контекст гипотезы"}.get(section, "Контекст")
             for context in item.get("context", []):
+                role_labels = {
+                    "known_answer": "Что уже известно", "known_context": "Связанный факт",
+                    "purpose": "Зачем это нужно", "related_step": "Связанный шаг",
+                    "importance": "Почему это важно", "application": "Практическое применение",
+                    "explanation": "Пояснение", "motivation": "Зачем проверять",
+                    "observation": "Наблюдение", "test_detail": "Что именно проверяют",
+                }
+                context_label = role_labels.get(context.get("role"), "Контекст")
                 lines.append(f"  - **{context_label}:** {terminate_sentence(context['text'])}")
     if document.get("chronology"):
         lines.extend(["", "## Подробная хронология встречи", ""])

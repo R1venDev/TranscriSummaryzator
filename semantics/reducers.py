@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import re
-from .questions import normalize_slot, verify_slot_entailment
+from .questions import infer_requested_slots, normalize_slot, verify_slot_entailment
 
 
 PROPOSAL_WORDING_RE = re.compile(r"(?iu)\b(?:предлагалось|предлагает|можно|стоит|нужно\s+бы|планируется|планирует)\b")
@@ -348,6 +348,8 @@ def reduce_questions(propositions, events, relations, records):
             continue
         record = by_record.get(event.get("source_record_id"), {})
         requested = list(record.get("requested_slots", []))
+        if not requested:
+            requested = infer_requested_slots(record.get("statement") or prop.get("statement"))
         explicit_answered = list(record.get("answered_slots", []))
         answer_relations = _incoming(prop["proposition_id"], relations, {"answers", "partially_answers", "resolves"})
         events_by_prop = {}
@@ -387,11 +389,12 @@ def reduce_questions(propositions, events, relations, records):
             value for relation in answer_relations for value in relation.get("evidence_ids", [])
         ] + direct_answer_evidence))
         has_answer_support = bool(answer_relations or answer_ids or answer_evidence)
-        if upstream in {"answered", "resolved"} and ((requested and not missing and has_answer_support) or (not requested and has_answer_support)):
+        if requested and not missing and has_answer_support:
+            status, entailed, missing = "answered", requested, []
+        elif upstream in {"answered", "resolved"} and not requested and has_answer_support:
             status, entailed, missing = "answered", requested or explicit_answered, []
         elif upstream == "partially_answered" and has_answer_support and entailed:
             status = "partially_answered"
-        elif requested and not missing and answer_relations: status = "answered"
         elif entailed and answer_relations: status = "partially_answered"
         elif _incoming(prop["proposition_id"], relations, {"tentatively_answers"}): status = "tentatively_answered"
         elif upstream in {"deferred", "requires_external_verification", "rhetorical", "superseded"}: status = upstream

@@ -7,7 +7,7 @@ from pathlib import Path
 from contracts.meeting import PublicItemContract
 from pipeline import REQUIRED_GENERATION_FILES, current_summary_generation_id, current_summary_output
 from scripts.speech_acts import primary_speech_act
-from scripts.summary_worker import build_public_document, deterministic_fact_check, render_public_document
+from scripts.summary_worker import _chapter_label, build_public_document, deterministic_fact_check, render_public_document
 from semantics.entities import EntityRegistry
 from semantics.meeting_graph import build_meeting_graph
 from semantics.propositions import proposition_from_record
@@ -67,6 +67,22 @@ class Run13SemanticRegressions(unittest.TestCase):
         self.assertEqual(graph["question_states"][0]["status"], "answered")
         self.assertIn("U2", graph["question_states"][0]["answer_evidence_ids"])
 
+    def test_delay_status_question_infers_slot_and_closes_on_status_answer(self):
+        question = rec(
+            1, "question", "Есть ли проблема с задержкой в алгоразметке?", "ask",
+            question_status="partially_answered", answer_record_ids=["F2"],
+            dialogue_evidence=[
+                {"id": "U1", "start": 1, "text": "Есть ли проблема с задержкой в алгоразметке?"},
+                {"id": "U2", "start": 2, "text": "Задержку можно снять до одной свечи, но качество просядет."},
+            ],
+        )
+        answer = rec(2, "current_state", "Задержку можно снять до одной свечи, но качество просядет.", "answer")
+        graph = build_meeting_graph([question, answer])
+        state = next(item for item in graph["question_states"] if "задерж" in item["original_question"].casefold())
+        self.assertEqual(state["requested_slots"], ["implementation_status"])
+        self.assertEqual(state["status"], "answered")
+        self.assertIsNone(state["remaining_unknown"])
+
     def test_semantic_revision_changes_generation_id(self):
         first = build_meeting_graph([rec(1, "observation", "Сервис работает", verification_status="supported")], provenance={"recording_id": "R"})
         second = build_meeting_graph([rec(1, "observation", "Сервис работает", modality="tentative", verification_status="insufficient_evidence")], provenance={"recording_id": "R"})
@@ -119,8 +135,8 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(document["sections"]["tasks"][0]["context"][0]["text"], hypothesis["text"])
         self.assertEqual(document["sections"]["experiments"][0]["context"][0]["text"], task["text"])
         artifact = render_public_document(document)
-        self.assertIn("  - **Контекст:**", artifact)
-        self.assertIn("  - **Контекст гипотезы:**", artifact)
+        self.assertIn("  - **Зачем это нужно:**", artifact)
+        self.assertIn("  - **Что именно проверяют:**", artifact)
         self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
 
     def test_context_prefers_near_topic_claim_and_verifies_graph_provenance(self):
@@ -138,6 +154,25 @@ class Run13PublicationRegressions(unittest.TestCase):
         errors = verify_public_document(document, artifact, items, graph)["errors"]
         self.assertNotIn("unsupported_section_context", errors)
         self.assertNotIn("section_context_evidence_outside_closure", errors)
+
+    def test_technical_context_prefers_explanatory_constraint_over_nearby_topic(self):
+        graph = build_meeting_graph([
+            rec(1, "constraint", "Всё упирается в зону интереса старшего таймфрейма, которую не видно."),
+            rec(2, "definition", "Зоны интереса — это имбалансы, блоки, Breaker и зона OTE."),
+            rec(3, "proposal", "Существуют проекции внутридневной амплитуды цены."),
+        ])
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
+        items = build_public_items(graph, planned)
+        document = build_public_document(items, graph=graph)
+        target = next(item for item in document["sections"]["technical"] if "Зоны интереса" in item["text"])
+        self.assertIn("старшего таймфрейма", target["context"][0]["text"])
+        self.assertEqual(target["context"][0]["role"], "importance")
+
+    def test_chapter_label_never_hides_mid_sentence_truncation(self):
+        first = "Предлагается провести дополнительный бэктест для анализа тех. причин проигрышных сделок и исключения их из массива"
+        second = "Для разметки трёх свечных паттернов можно использовать тот же самый свинг-маркер, что и для пяти свечных"
+        self.assertEqual(_chapter_label(first), "Предлагается провести дополнительный бэктест для анализа технических причин проигрышных сделок и исключения их из массива")
+        self.assertEqual(_chapter_label(second), second)
 
     def test_goal_only_claim_is_not_labeled_as_experiment(self):
         graph = build_meeting_graph([rec(1, "hypothesis", "Discussed potential goal: creating a baseline solution with winrate around 30–40%.")])

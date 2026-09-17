@@ -534,6 +534,16 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "unknown_assignee_publications": sum("speaker_or_assignee_not_preserved" in x.get("errors", []) for x in audits),
     }
     def tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 3}
+    def context_stems(value):
+        stop = {"участник", "говорящий", "yachoy", "hottabbich", "riven", "misha", "который", "которая", "можно", "нужно", "будет"}
+        result = set()
+        for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()):
+            if len(token) <= 2 or token in stop:
+                continue
+            if re.fullmatch(r"[а-яё]+", token) and len(token) >= 4:
+                token = re.sub(r"[аяоеуыию]$", "", token)
+            result.add(token[:5] if len(token) >= 5 else token)
+        return result
     duplicates = 0
     cross_view_repetitions = 0
     for index, left in enumerate(items):
@@ -660,10 +670,19 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
             for item in contextual_items for context in item.get("context", [])
         )
         counters["section_context_low_relevance"] = sum(
-            not ({value[:5] if len(value) >= 5 else value for value in tokens(item.get("text"))}
-                 & {value[:5] if len(value) >= 5 else value for value in tokens(context.get("text"))})
-            and abs(float(context.get("start", item.get("start", 0))) - float(item.get("start", 0))) > 75
+            not context.get("directly_linked")
+            and not (context_stems(item.get("text")) & context_stems(context.get("text")))
             for item in contextual_items for context in item.get("context", [])
+        )
+        allowed_context_roles = {"known_answer", "known_context", "purpose", "related_step", "importance", "application", "explanation", "motivation", "observation", "test_detail"}
+        counters["section_context_missing_role"] = sum(
+            context.get("role") not in allowed_context_roles
+            for item in contextual_items for context in item.get("context", [])
+        )
+        counters["question_context_missing_known_answer"] = sum(
+            bool(item.get("question_state", {}).get("answer_record_ids"))
+            and not any(context.get("role") == "known_answer" for context in item.get("context", []))
+            for item in document.get("sections", {}).get("questions", [])
         )
         counters["goal_only_experiments"] = sum(
             bool(re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", str(item.get("text") or "")))
@@ -680,7 +699,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
                 )
         counters["chronology_duplicate_fields"] = chronology_duplicates
     else:
-        counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "section_context_low_relevance": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})
+        counters.update({"section_items_missing_context": 0, "section_context_repetitions": 0, "section_context_low_relevance": 0, "section_context_missing_role": 0, "question_context_missing_known_answer": 0, "goal_only_experiments": 0, "chronology_duplicate_fields": 0})
     counters["section_counts"] = item_counts
     counters["rendered_section_counts"] = rendered_counts
     counters["planner_overflow"] = {name: value.get("overflow_count", 0) for name, value in summary_plan.get("view_plans", {}).items()}
@@ -692,7 +711,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
     counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_items_missing_context", "section_context_repetitions", "section_context_low_relevance", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "overview_missing_htf_readiness", "overview_missing_htf_constraint", "overview_missing_committed_next_step", "section_items_missing_context", "section_context_repetitions", "section_context_low_relevance", "section_context_missing_role", "question_context_missing_known_answer", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0
