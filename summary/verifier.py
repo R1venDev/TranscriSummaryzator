@@ -414,7 +414,13 @@ def audit_realization(text, plan):
     number_words = {"один": "1", "одного": "1", "одну": "1", "два": "2", "две": "2", "три": "3", "четыре": "4"}
     normalize_scope = lambda value: re.sub(r"(?iu)\b(?:один|одного|одну|два|две|три|четыре)\b", lambda m: number_words[m.group(0).casefold()], str(value).casefold()).replace("ё", "е")
     allowed_scopes = [normalize_scope(x) for x in plan.get("time_scope", []) if isinstance(x, str) and x.strip()]
-    if allowed_scopes and not any(scope in normalize_scope(text or "") for scope in allowed_scopes):
+    scope_variants = {
+        variant
+        for scope in allowed_scopes
+        for variant in (scope, re.sub(r"^1\s+", "", scope))
+        if variant
+    }
+    if allowed_scopes and not any(scope in normalize_scope(text or "") for scope in scope_variants):
         errors.append("time_scope_not_preserved")
     allowed_values = list(plan.get("allowed_speakers", [])) + list(plan.get("allowed_assignees", []))
     allowed_speakers = set(allowed_values) | set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))

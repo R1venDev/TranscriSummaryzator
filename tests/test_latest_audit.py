@@ -68,6 +68,9 @@ class LatestAuditRegressionTests(unittest.TestCase):
         item = {"section": "minutes", "text": claims[0]["statement"], "claim_ids": ["C1"]}
         result = verify_generated_items([item], [plan], claims)
         self.assertTrue(result["passed"], result)
+        month_item = {"section": "minutes", "text": claims[1]["statement"], "claim_ids": ["C2"]}
+        result = verify_generated_items([month_item], [plan], claims)
+        self.assertTrue(result["passed"], result)
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}
