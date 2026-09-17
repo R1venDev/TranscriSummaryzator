@@ -646,13 +646,21 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
     bypass_cache = FRESH_MODEL_CALLS or (REPLAY_MODE == "semantics" and semantic_stage)
     candidates = () if bypass_cache else ((cache_path, "run_cache"), (global_cache, "global_content_addressed"))
     for candidate, reason in candidates:
-        if candidate and candidate.is_file():
-            cached = load_json(candidate)
-            if cached.get("request_key") == request_key and isinstance(cached.get("response"), dict):
-                if candidate != cache_path:
-                    atomic_json(cache_path, cached)
-                diagnostic_decision("llm_cache", "hit", metrics={"request_key": request_key}, refs={"cache": str(candidate)}, reasons=[reason])
-                return cached
+        try:
+            if candidate and candidate.is_file():
+                cached = load_json(candidate)
+                if cached.get("request_key") == request_key and isinstance(cached.get("response"), dict):
+                    if candidate != cache_path:
+                        atomic_json(cache_path, cached)
+                    diagnostic_decision("llm_cache", "hit", metrics={"request_key": request_key}, refs={"cache": str(candidate)}, reasons=[reason])
+                    return cached
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            diagnostic_event(
+                "llm_cache", category="cache", outcome="read_unavailable",
+                severity="WARN", error=exc,
+                refs={"cache": str(candidate), "request_key": request_key},
+                reasons=[reason, "cache_is_optional"],
+            )
     diagnostic_decision("llm_cache", "miss", metrics={"request_key": request_key}, refs={"cache": str(cache_path)}, reasons=["missing_or_request_key_changed"])
     errors = []
     for attempt in range(1, attempts + 1):
@@ -671,7 +679,19 @@ def call_json_with_retries(client, model, system, prompt, cache_path, attempts=3
                 parsed = validate_response(parsed, contract)
             atomic_json(cache_path, {"request_key": request_key, "response": parsed, "metrics": metrics, "attempt": attempt})
             if global_cache:
-                atomic_json(global_cache, load_json(cache_path))
+                try:
+                    atomic_json(global_cache, load_json(cache_path))
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    # The run-local cache is authoritative for this attempt.
+                    # A shared-cache permission or filesystem failure must not
+                    # discard a valid model response and trigger an expensive
+                    # duplicate generation.
+                    diagnostic_event(
+                        "llm_cache", category="cache", outcome="write_unavailable",
+                        severity="WARN", error=exc,
+                        refs={"cache": str(global_cache), "request_key": request_key},
+                        reasons=["global_cache_is_optional", "run_cache_persisted"],
+                    )
             diagnostic_event(
                 "llm_request", category="llm", outcome="completed", inputs={"model": model, "attempt": attempt, "contract": contract or "free_json", "schema_enforcement": "json_schema" if schema else "json_mode"},
                 metrics=metrics, refs={"cache": str(cache_path), "request_key": request_key, "request_attempt_id": request_attempt_id},
