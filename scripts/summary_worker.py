@@ -53,6 +53,7 @@ from contracts import SCHEMA_VERSIONS
 
 
 PIPELINE_VERSION = "meeting-intelligence-v26"
+FINAL_DOCUMENT_AUDIT_BATCH_SIZE = 4
 FACT_TYPES = set(CLAIM_KINDS)
 CRITICAL_TYPES = {"decision", "action", "metric", "schedule", "goal"}
 NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,:]\d+)*(?:\s*[%×xх])?(?!\w)", re.I)
@@ -4153,7 +4154,7 @@ def audit_final_document(client, model, document, source_turns, run_dir,
     pending = [group[0] for group in pending_by_key.values()]
     primary_model = primary_model or model
 
-    def review_batch(batch, offset, audit_model, artifact_group):
+    def review_batch(batch, offset, audit_model, artifact_group, progress_value):
         payload = []
         for node in batch:
             payload.append({
@@ -4163,11 +4164,17 @@ def audit_final_document(client, model, document, source_turns, run_dir,
                            for evidence_id in node.get("evidence_ids", []) if str(evidence_id) in utterances],
             })
         try:
+            phase = "Усиленная проверка" if artifact_group == "escalation" else "Финальная проверка"
             response = call_json_with_retries(
                 client, audit_model, FINAL_DOCUMENT_AUDIT_SYSTEM,
                 json.dumps({"nodes": payload}, ensure_ascii=False),
                 run_dir / "final-document-audit" / artifact_group / f"nodes-{offset + 1:05d}-{offset + len(batch):05d}.json",
                 attempts=2, num_predict=max(1000, 320 * len(batch)), num_ctx=16384,
+                progress=lambda generated: emit(
+                    progress_value, "summary_document_audit",
+                    f"{phase}: узлы {offset + 1}–{offset + len(batch)}; "
+                    f"ответ модели: {generated} фрагм.",
+                ),
                 contract="final_document_audit",
             ).get("response", {})
             returned = {item.get("node_id"): item for item in response.get("reviews", []) if isinstance(item, dict)}
@@ -4186,7 +4193,7 @@ def audit_final_document(client, model, document, source_turns, run_dir,
                     review["verification_mode"] = artifact_group
                     review["model"] = audit_model
                     reviews[node["node_id"]] = review
-                review_batch(missing, offset + len(present), audit_model, artifact_group)
+                review_batch(missing, offset + len(present), audit_model, artifact_group, progress_value)
                 return
             for node in batch:
                 review = dict(returned[node["node_id"]])
@@ -4205,14 +4212,23 @@ def audit_final_document(client, model, document, source_turns, run_dir,
         except RuntimeError as exc:
             if len(batch) > 1:
                 middle = len(batch) // 2
-                review_batch(batch[:middle], offset, audit_model, artifact_group)
-                review_batch(batch[middle:], offset + middle, audit_model, artifact_group)
+                review_batch(batch[:middle], offset, audit_model, artifact_group, progress_value)
+                review_batch(batch[middle:], offset + middle, audit_model, artifact_group, progress_value)
                 return
             reviews[batch[0]["node_id"]] = {"node_id": batch[0]["node_id"], "verdict": "verification_unavailable", "role": batch[0].get("role"), "relation_id": batch[0].get("relation_id"), "evidence_ids": batch[0].get("evidence_ids", []), "reason": str(exc), "verification_mode": artifact_group, "model": audit_model}
 
     emit(82.0, "summary_document_audit", f"Финальная проверка документа: {len(reviews)} из {len(nodes)} узлов")
-    for offset in range(0, len(pending), 12):
-        review_batch(pending[offset:offset + 12], offset, primary_model, "primary")
+    batch_size = FINAL_DOCUMENT_AUDIT_BATCH_SIZE
+    for offset in range(0, len(pending), batch_size):
+        batch = pending[offset:offset + batch_size]
+        emit(
+            82 + 12 * min(1, len(reviews) / max(1, len(nodes))),
+            "summary_document_audit",
+            f"Финальная проверка документа: пакет {offset // batch_size + 1} "
+            f"из {(len(pending) + batch_size - 1) // batch_size}",
+        )
+        primary_progress = 82 + 12 * min(1, len(reviews) / max(1, len(nodes)))
+        review_batch(batch, offset, primary_model, "primary", primary_progress)
         emit(
             82 + 12 * min(1, len(reviews) / max(1, len(nodes))),
             "summary_document_audit",
@@ -4220,12 +4236,20 @@ def audit_final_document(client, model, document, source_turns, run_dir,
         )
 
     escalation = [node for node in pending if reviews.get(node["node_id"], {}).get("verdict") != "supported"]
-    for offset in range(0, len(escalation), 12):
-        review_batch(escalation[offset:offset + 12], offset, model, "escalation")
+    for offset in range(0, len(escalation), batch_size):
+        batch = escalation[offset:offset + batch_size]
         emit(
-            94 + 2 * min(1, (offset + len(escalation[offset:offset + 12])) / max(1, len(escalation))),
+            94 + 2 * min(1, offset / max(1, len(escalation))),
             "summary_document_audit",
-            f"Усиленная проверка спорных узлов: {min(offset + 12, len(escalation))} из {len(escalation)}",
+            f"Усиленная проверка: пакет {offset // batch_size + 1} "
+            f"из {(len(escalation) + batch_size - 1) // batch_size}",
+        )
+        escalation_progress = 94 + 2 * min(1, offset / max(1, len(escalation)))
+        review_batch(batch, offset, model, "escalation", escalation_progress)
+        emit(
+            94 + 2 * min(1, (offset + len(batch)) / max(1, len(escalation))),
+            "summary_document_audit",
+            f"Усиленная проверка спорных узлов: {min(offset + len(batch), len(escalation))} из {len(escalation)}",
         )
 
     # Reuse one independently reviewed semantic surface wherever the renderer
@@ -5128,6 +5152,50 @@ def rejection_reason_by_revision(denials):
     return reasons
 
 
+def lineage_origin_root(origin_id):
+    """Return the stable fact lineage shared by split action propositions."""
+    return re.sub(r":A\d+$", "", str(origin_id or ""))
+
+
+def matching_candidate_claims(candidate, claims, claim_origins):
+    """Resolve an early candidate to its canonical successor without guessing.
+
+    Exact origins take precedence over a split-action family. A semantic
+    re-key is accepted only when normalized text is identical and immutable
+    evidence overlaps, which covers deterministic ID rewrites without merging
+    unrelated propositions from one recording.
+    """
+    origin = str(candidate.get("origin_id") or "")
+    exact = [
+        claim for claim in claims
+        if origin and origin in claim_origins.get(claim.get("claim_id"), set())
+    ]
+    if exact:
+        return exact, "exact_origin"
+
+    root = lineage_origin_root(origin)
+    family = [
+        claim for claim in claims
+        if root and any(
+            lineage_origin_root(value) == root
+            for value in claim_origins.get(claim.get("claim_id"), set())
+        )
+    ]
+    if family:
+        return family, "lineage_root"
+
+    statement = normalize_space(candidate.get("statement")).casefold()
+    evidence = set(candidate.get("evidence_ids", []))
+    rekeyed = [
+        claim for claim in claims
+        if statement
+        and statement == normalize_space(claim.get("statement")).casefold()
+        and evidence
+        and bool(evidence & set(claim.get("evidence_ids", [])))
+    ]
+    return rekeyed, "semantic_rekey" if rekeyed else None
+
+
 def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, coverage, fact_rejected, generation_suffix):
     transcript_document = load_json(output_dir / "transcript.json")
     def persist_publication_failure(code, audit):
@@ -5151,8 +5219,11 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
                         "evidence_ids": list(fact.get("evidence_ids", [])),
                          "source_word_ids": list(fact.get("source_word_ids", []))}
                         for fact in final_facts if fact.get("type") in {"action", "follow_up", "resource", "decision"}]
-    known_origins = {item["origin_id"] for item in early_candidates}
-    early_candidates.extend(item for item in later_candidates if item["origin_id"] not in known_origins)
+    known_lineage_roots = {lineage_origin_root(item["origin_id"]) for item in early_candidates}
+    early_candidates.extend(
+        item for item in later_candidates
+        if lineage_origin_root(item["origin_id"]) not in known_lineage_roots
+    )
     utterance_word_ids = {str(turn.get("id")): list(turn.get("source_word_ids") or [word.get("word_id") for word in turn.get("words", []) if word.get("word_id")])
                           for turn in transcript_document.get("utterances", [])}
     seen_origins = {}
@@ -5688,35 +5759,63 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
         )
         for claim in state_v2.get("claims", [])
     }
-    def referenced_origins(section=None):
-        return {origin for claim in state_v2.get("claims", [])
-                if any(claim.get("claim_id") in item.get("claim_ids", []) and (section is None or item.get("section") == section) for item in public_items)
-                for origin in claim_origins.get(claim.get("claim_id"), set())}
-    cited_sources = referenced_origins()
-    tasks_sources = referenced_origins("tasks")
-    quarantine_sources = referenced_origins("requires_verification")
-    origins_by_public_id = {
-        item.get("public_id"): set().union(*(claim_origins.get(claim_id, set()) for claim_id in item.get("claim_ids", [])))
-        for item in public_items
+    public_sections_by_claim = {}
+    for item in public_items:
+        for claim_id in item.get("claim_ids", []):
+            public_sections_by_claim.setdefault(claim_id, set()).add(item.get("section"))
+    planner_decisions_by_claim = {}
+    for view, view_plan in summary_plan.get("view_plans", {}).items():
+        for claim_id, decision in view_plan.get("dispositions", {}).items():
+            planner_decisions_by_claim.setdefault(claim_id, []).append((view, decision))
+    rejected_source_roots = {
+        lineage_origin_root(origin): reason for origin, reason in rejected_sources.items()
     }
-    canonical_rejections = {origin for claim in state_v2.get("claims", []) if claim.get("lifecycle") in {"rejected", "superseded"}
-                            for origin in claim_origins.get(claim.get("claim_id"), set())}
     for candidate in early_candidates:
         fact_id, origin = candidate["fact_id"], candidate["origin_id"]
-        evidence = set(candidate.get("evidence_ids", []))
-        if origin in quarantine_sources: status, reason = "requires_verification", "auditor_unavailable"
-        elif origin in tasks_sources: status, reason = "published_task", "canonical_task_state"
-        elif origin in cited_sources: status, reason = "published_other", "canonical_public_item"
-        elif origin in rejected_sources: status, reason = "rejected", rejected_sources[origin]
+        matched_claims, lineage_mode = matching_candidate_claims(
+            candidate, state_v2.get("claims", []), claim_origins,
+        )
+        matched_claim_ids = {claim.get("claim_id") for claim in matched_claims}
+        matched_sections = set().union(*(
+            public_sections_by_claim.get(claim_id, set()) for claim_id in matched_claim_ids
+        )) if matched_claim_ids else set()
+        planner_decisions = [
+            (view, decision)
+            for claim_id in matched_claim_ids
+            for view, decision in planner_decisions_by_claim.get(claim_id, [])
+        ]
+        root = lineage_origin_root(origin)
+        if "requires_verification" in matched_sections:
+            status, reason = "requires_verification", f"auditor_unavailable:{lineage_mode}"
+        elif "tasks" in matched_sections:
+            status, reason = "published_task", f"canonical_task_state:{lineage_mode}"
+        elif matched_sections:
+            status, reason = "published_other", f"canonical_public_item:{lineage_mode}"
+        elif origin in rejected_sources:
+            status, reason = "rejected", rejected_sources[origin]
+        elif root in rejected_source_roots:
+            status, reason = "rejected", rejected_source_roots[root]
         elif candidate["revision_id"] in rejected_revisions:
             status, reason = "rejected", rejected_revisions[candidate["revision_id"]]
-        elif origin in canonical_rejections: status, reason = "canonical_rejected", "state_transition_with_provenance"
+        elif any(claim.get("lifecycle") in {"rejected", "superseded"} for claim in matched_claims):
+            status, reason = "canonical_rejected", f"state_transition_with_provenance:{lineage_mode}"
         elif candidate.get("kind") == "resource": status, reason = "not_a_work_result", "contextual_resource_without_commitment"
         elif candidate.get("kind") == "proposal": status, reason = "proposal_unconfirmed", "no_acceptance_or_assignee"
         elif candidate.get("kind") == "follow_up" and re.search(r"(?iu)\b(?:вопрос|уточнение|спрашива)", candidate.get("statement", "")):
             status, reason = "not_a_work_result", "interrogative_routed_out_of_commitments"
+        elif planner_decisions:
+            reasons = sorted({
+                str(decision.get("reason") or decision.get("status") or "not_selected")
+                for _, decision in planner_decisions
+            })
+            status, reason = "not_selected", "planner:" + ",".join(reasons)
+        elif matched_claims:
+            status, reason = "not_selected", f"canonical_claim_not_selected:{lineage_mode}"
         else: status, reason = "unresolved", "candidate_lost_after_review_or_planning"
-        matching_items = [item for item in public_items if origin in origins_by_public_id.get(item.get("public_id"), set())]
+        matching_items = [
+            item for item in public_items
+            if matched_claim_ids & set(item.get("claim_ids", []))
+        ]
         disposition.append({"origin_id": candidate["origin_id"], "revision_id": candidate["revision_id"], "fact_id": fact_id,
                             "status": status, "reason": reason,
                             "published_public_ids": sorted({item.get("public_id") for item in matching_items if item.get("public_id")}),
