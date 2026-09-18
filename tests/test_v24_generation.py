@@ -159,6 +159,17 @@ class GenerationTests(unittest.TestCase):
         invented["overview"][0]["text"] += " Сервер уничтожен."
         self.assertFalse(verify_public_document(invented, artifact, [item])["passed"])
 
+    def test_final_document_verifier_uses_renderer_normalization(self):
+        item = {
+            "public_id": "PI00001", "section": "overview",
+            "text": "Можно подключать старшие таймфремы.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "start": 10.125,
+        }
+        document = build_public_document([item], {"job_id": 9, "project": "Проект"})
+        artifact = render_public_document(document)
+        self.assertIn("старшие таймфрейм", artifact)
+        self.assertTrue(verify_public_document(document, artifact, [item])["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
