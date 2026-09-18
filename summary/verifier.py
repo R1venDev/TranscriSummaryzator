@@ -1018,7 +1018,10 @@ def verify_public_document(document, artifact_text, items, graph=None):
         covered = {claim for field in fields for claim in field.get("claim_ids", [])}
         block = "\n".join(chapter_blocks.get(value, "") for value in chapter.get("outcome_ids", [chapter.get("outcome_id")]))
         for item_index, item in enumerate(chapter.get("items", []), 1):
-            represented = bool(fields) and set(item.get("claim_ids", [])) <= covered
+            represented = bool(fields) and (
+                set(item.get("claim_ids", [])) <= covered
+                or any(equivalent(item, field) for field in fields)
+            )
             rendered = surface(item.get("text")) in surface(block)
             render_trace.append({"node_id": f"chronology:{chapter_index}:{item_index}", "rendered": rendered,
                                  "reason": "represented_by_outcome_field" if represented and not rendered else None})
