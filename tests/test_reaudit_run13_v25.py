@@ -303,7 +303,8 @@ class Run13PublicationRegressions(unittest.TestCase):
         }
         document = build_public_document(items, graph=graph)
         self.assertFalse(any(
-            "CA" in field.get("claim_ids", [])
+            "internal_answer_projection" in str(field.get("value") or "")
+            or "Предложено проверить фильтр" in str(field.get("value") or "")
             for card in document["outcome_cards"]
             for raw in card.get("fields", {}).values()
             for field in (raw if isinstance(raw, list) else [raw] if raw else [])
