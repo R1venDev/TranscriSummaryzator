@@ -281,6 +281,34 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(card["fields"]["next_step"]["value"], "Предложено проверить дополнительный фильтр.")
         self.assertNotIn("спрашивает", card["fields"]["next_step"]["value"])
 
+    def test_question_only_support_claim_cannot_become_outcome_field(self):
+        items = [{
+            "public_id": "PIQ", "section": "questions", "text": "@A спрашивает: нужен ли фильтр?",
+            "claim_ids": ["CQ", "CA"], "evidence_ids": ["UQ", "UA"], "source_word_ids": ["WQ"],
+            "content_kind": "question", "social_state": "unanswered", "start": 1, "end": 2,
+            "episode_id": "E1", "question_state": {"answer_record_ids": ["FA"]},
+        }]
+        graph = {
+            "claims": [
+                {"claim_id": "CQ", "proposition_id": "PQ", "source_record_id": "FQ", "content_kind": "question",
+                 "statement": "Нужен ли фильтр?", "evidence_ids": ["UQ"], "lifecycle": "active", "verification_status": "supported"},
+                {"claim_id": "CA", "proposition_id": "PA", "source_record_id": "FA", "content_kind": "proposal",
+                 "statement": "internal_answer_projection", "publication_text": "Предложено проверить фильтр.",
+                 "evidence_ids": ["UA"], "lifecycle": "active", "verification_status": "supported"},
+            ],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Фильтр", "claim_ids": ["CQ", "CA"],
+                                  "ranges": [{"start": 1, "end": 2}]}],
+            "task_states": [],
+            "question_states": [{"proposition_id": "PQ", "status": "partially_answered", "remaining_unknown": "Нужен ли фильтр?"}],
+        }
+        document = build_public_document(items, graph=graph)
+        self.assertFalse(any(
+            "CA" in field.get("claim_ids", [])
+            for card in document["outcome_cards"]
+            for raw in card.get("fields", {}).values()
+            for field in (raw if isinstance(raw, list) else [raw] if raw else [])
+        ))
+
     def test_chapter_uses_episode_end(self):
         item = {"public_id": "PI1", "section": "minutes", "text": "Сервис работает", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "current_state", "social_state": "candidate", "start": 10, "end": 18, "episode_id": "E1"}
         chapter = build_public_document([item])["chronology"][0]
