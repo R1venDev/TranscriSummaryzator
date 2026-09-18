@@ -85,7 +85,10 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
         next_field = None
         if next_claim:
             task = task_by_prop.get(next_claim.get("proposition_id"), {})
-            label = str(task.get("deliverable") or next_claim.get("publication_text") or next_claim.get("statement") or "").strip()
+            # ``publication_text`` has already passed the public-surface
+            # grounding guard.  Prefer it to a semantic task deliverable,
+            # which may still contain an internal snake_case model label.
+            label = str(next_claim.get("publication_text") or task.get("deliverable") or next_claim.get("statement") or "").strip()
             if task.get("status"):
                 labels = {"self_committed": "участник взял на себя", "intent_to_attempt": "участник намерен попробовать", "in_progress": "в работе", "past_attempt": "ранее выполнялось", "assigned_pending": "назначение ожидает подтверждения", "assigned": "назначено", "accepted": "согласовано", "completed": "выполнено", "blocked": "заблокировано", "proposed": "предложено, не подтверждено", "idea": "идея, не подтверждена"}
                 label += f" (статус: {labels.get(task['status'], task['status'])})"
