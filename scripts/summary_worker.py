@@ -2560,9 +2560,43 @@ def build_public_document(items, metadata=None, graph=None):
             non_question = [item for item in public_candidates if item.get("section") != "questions"]
             candidate_pool = exact or non_question
             public_text = (max(candidate_pool, key=lambda item: utility(item)).get("text")
-                           if candidate_pool else sanitize_public_surface(claim.get("statement")))
+                           if candidate_pool else public_surface_text(claim))
             outcome_graph["claims"].append(dict(claim, publication_text=public_text))
     outcome_cards = build_outcome_cards(outcome_graph, allowed_claims) if outcome_graph else []
+    # Outcome builders operate on the canonical graph, whose evidence windows
+    # can be wider than the retained PublicItem projection.  Publication is
+    # allowed to cite only the evidence closure of those retained items.
+    public_evidence_by_claim = {}
+    for item in items:
+        for claim_id in item.get("claim_ids", []):
+            public_evidence_by_claim.setdefault(claim_id, set()).update(item.get("evidence_ids", []))
+
+    def public_evidence_closure(claim_ids):
+        return {
+            evidence_id
+            for claim_id in claim_ids
+            for evidence_id in public_evidence_by_claim.get(claim_id, set())
+        }
+
+    for card in outcome_cards:
+        allowed_evidence = public_evidence_closure(card.get("claim_ids", []))
+        card["evidence_ids"] = [
+            evidence_id for evidence_id in card.get("evidence_ids", [])
+            if evidence_id in allowed_evidence
+        ]
+        for name, raw in list(card.get("fields", {}).items()):
+            fields = raw if isinstance(raw, list) else [raw] if raw else []
+            retained = []
+            for field in fields:
+                field_allowed = public_evidence_closure(field.get("claim_ids", []))
+                field = dict(field)
+                field["evidence_ids"] = [
+                    evidence_id for evidence_id in field.get("evidence_ids", [])
+                    if evidence_id in field_allowed
+                ]
+                if field["evidence_ids"]:
+                    retained.append(field)
+            card["fields"][name] = retained if isinstance(raw, list) else (retained[0] if retained else None)
     minute_items = sorted(by_section.get("minutes", []), key=lambda item: float(item.get("start", 0)))
     # Episode topics are useful clustering hints, but can be model-authored and
     # are not necessarily supported by the claims selected into a card.  The
@@ -2986,8 +3020,11 @@ def render_public_document(document):
         lines.extend(["", "## Подробная хронология встречи", ""])
         cards = {card.get("outcome_id"): card for card in document.get("outcome_cards", [])}
         field_labels = {"current_state": "Состояние", "constraint": "Ограничение", "resolution": "Согласованный итог", "work_result": "Полученный результат", "mentioned_resource": "Упомянутый ресурс", "described_rule": "Описанное правило", "next_step": "Дальше", "remaining_unknown": "Осталось уточнить"}
-        chronology_values = []
         for chapter in document["chronology"]:
+            # Deduplication is local to a chapter.  Cross-chapter suppression
+            # made verified fields and source items disappear from the final
+            # document while the navigation still promised that episode.
+            chronology_values = []
             start = time_link(chapter["start"], total_seconds, job_id, base_url)
             end = display_time(chapter["end"], total_seconds)
             lines.extend([f"### {start}–{end} — {chapter['label']}", ""])
