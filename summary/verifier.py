@@ -31,6 +31,9 @@ GENERIC_QUESTION_RESIDUAL_RE = re.compile(
     r"проверить\s+объяснение|подтвердить\s+ответ|"
     r"уточнить\s+недостающ(?:ий\s+аспект|ий\s+результат))\s*[.?!]*\s*$"
 )
+CONTEXT_STOPWORDS = {
+    "участник", "говорящий", "который", "которая", "можно", "нужно", "будет",
+}
 
 
 def normalize_mixed_script_confusables(text):
@@ -56,6 +59,40 @@ def normalize_mixed_script_confusables(text):
         return candidate if not MIXED_SCRIPT_TOKEN_RE.search(candidate) else token
 
     return MIXED_SCRIPT_TOKEN_RE.sub(repair, str(text or ""))
+
+
+def public_context_tokens(value):
+    """Return identity-neutral lexical tokens for public-context comparisons."""
+    # Handles identify people, not topics. Removing every handle avoids both
+    # recording-specific stop lists and false similarity between unrelated
+    # statements made by the same participant.
+    surface = re.sub(r"@[\w.-]+", " ", str(value or "").casefold())
+    return {
+        token
+        for token in re.findall(r"(?iu)[a-zа-яё0-9]+", surface)
+        if len(token) > 3 and token not in CONTEXT_STOPWORDS
+    }
+
+
+def public_context_stems(value):
+    """Return coarse topic stems without embedding meeting-specific names."""
+    result = set()
+    for token in public_context_tokens(value):
+        if re.fullmatch(r"[а-яё]+", token):
+            token = re.sub(r"[аяоеуыию]$", "", token)
+        result.add(token[:5] if len(token) >= 5 else token)
+    return result
+
+
+def public_context_duplicate(left, right, threshold=.72):
+    """Apply the publication gate's one canonical context-overlap rule."""
+    left_tokens = public_context_tokens(left)
+    right_tokens = public_context_tokens(right)
+    return bool(
+        left_tokens and right_tokens
+        and len(left_tokens & right_tokens)
+        / max(1, min(len(left_tokens), len(right_tokens))) >= threshold
+    )
 
 
 def has_english_prose(text):
@@ -692,16 +729,6 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "unknown_assignee_publications": sum("speaker_or_assignee_not_preserved" in x.get("errors", []) for x in audits),
     }
     def tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 3}
-    def context_stems(value):
-        stop = {"участник", "говорящий", "yachoy", "hottabbich", "riven", "misha", "который", "которая", "можно", "нужно", "будет"}
-        result = set()
-        for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()):
-            if len(token) <= 2 or token in stop:
-                continue
-            if re.fullmatch(r"[а-яё]+", token) and len(token) >= 4:
-                token = re.sub(r"[аяоеуыию]$", "", token)
-            result.add(token[:5] if len(token) >= 5 else token)
-        return result
     duplicates = 0
     cross_view_repetitions = 0
     for index, left in enumerate(items):
@@ -805,12 +832,12 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         contextual_items = [item for section, values in document.get("sections", {}).items() if section in contextual_sections for item in values]
         counters["section_items_missing_context"] = 0  # absence is honest when no explicit relation exists
         counters["section_context_repetitions"] = sum(
-            bool(context.get("text")) and len(tokens(context.get("text")) & tokens(item.get("text"))) / max(1, min(len(tokens(context.get("text"))), len(tokens(item.get("text"))))) >= .72
+            public_context_duplicate(context.get("text"), item.get("text"))
             for item in contextual_items for context in item.get("context", [])
         )
         counters["section_context_low_relevance"] = sum(
             not context.get("directly_linked")
-            and not (context_stems(item.get("text")) & context_stems(context.get("text")))
+            and not (public_context_stems(item.get("text")) & public_context_stems(context.get("text")))
             for item in contextual_items for context in item.get("context", [])
         )
         # Keep this vocabulary aligned with build_public_document() and the
