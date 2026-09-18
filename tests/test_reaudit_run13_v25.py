@@ -27,6 +27,27 @@ def rec(number, kind, statement, act="assert", **extra):
 
 
 class Run13SemanticRegressions(unittest.TestCase):
+    def test_unverified_answers_keep_specific_questions_not_generic_slot_labels(self):
+        graph = build_meeting_graph([
+            rec(1, "question", "Почему первый сервис задерживает данные?", "ask",
+                requested_slots=["explanation"], answer_record_ids=["F3"]),
+            rec(2, "question", "Почему второй сервис теряет события?", "ask",
+                requested_slots=["explanation"], answer_record_ids=["F4"]),
+            rec(3, "observation", "Первый сервис включён.", "answer"),
+            rec(4, "observation", "Второй сервис включён.", "answer"),
+        ])
+        states = graph["question_states"]
+        self.assertTrue(all(item["status"] == "answer_not_verified" for item in states))
+        self.assertEqual(
+            {item["remaining_question"] for item in states},
+            {"Почему первый сервис задерживает данные?", "Почему второй сервис теряет события?"},
+        )
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        questions = [item["text"] for item in build_public_items(graph, planned) if item["section"] == "questions"]
+        self.assertEqual(len(questions), 2)
+        self.assertNotEqual(*questions)
+        self.assertFalse(any("проверить объяснение" in text for text in questions))
+
     def test_contextual_commitment_and_acceptance_are_detected(self):
         self.assertEqual(primary_speech_act("Потом встрою это в методичку"), "commit")
         self.assertEqual(primary_speech_act("А, месяца. Ну ладно"), "accept")
