@@ -15,6 +15,7 @@ COMPLETED_RE = re.compile(r"(?iu)\b(?:проверен[аоы]?|завершен
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|после|перед|пока|при|до тех пор)\b")
 ROLE_RELATION_RE = re.compile(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|подготов\w*|отправ\w*|переда\w*|покаж\w*|размет\w*|провер\w*|анализ\w*)[^@]{0,100}(@[\w.-]+)")
 INTERNAL_LABEL_RE = re.compile(r"(?iu)\b(?:self_committed|assigned_pending|explicit_self_commitment|additional_tools|rhythmic_entry_implementation|high_tf_result|stop_loss_options|should[_ ]\w+|[a-z]+_[a-z_]+)\b")
+ACRONYM_EXPANSION_RE = re.compile(r"\b(?P<acronym>[A-Z]{2,})\s*\(\s*[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+\s*\)")
 ENGLISH_WORD_RE = re.compile(r"(?i)\b[a-z]{3,}\b")
 def has_english_prose(text):
     value = re.sub(r"https?://\S+|@[\w.-]+", "", str(text or ""))
@@ -30,6 +31,11 @@ def sanitize_public_surface(text):
     # sanitization is deliberately limited to typography/known morphology and
     # never rewrites a meeting-specific proposition.
     value = re.sub(r"(?iu)\bсвичных\b", "свечных", value)
+    # An extractor may expand a source acronym from model knowledge.  The
+    # acronym itself is source material; an English parenthetical expansion is
+    # not.  Keeping only the original acronym is deterministic and cannot add
+    # meeting semantics.
+    value = ACRONYM_EXPANSION_RE.sub(lambda match: match.group("acronym"), value)
     return value
 
 
@@ -39,11 +45,15 @@ def public_surface_text(claim, preferred=None):
     if not has_english_prose(value) and not INTERNAL_LABEL_RE.search(value):
         return value
     allowed_evidence = set(claim.get("evidence_ids", []))
-    candidates = [
-        str(turn.get("text") or "").strip()
-        for turn in claim.get("dialogue_evidence", [])
-        if turn.get("id") in allowed_evidence and re.search(r"(?iu)[а-яё]{3,}", str(turn.get("text") or ""))
-    ]
+    candidates = []
+    for turn in claim.get("dialogue_evidence", []):
+        if turn.get("id") not in allowed_evidence:
+            continue
+        candidate = sanitize_public_surface(turn.get("text"))
+        if (re.search(r"(?iu)[а-яё]{3,}", candidate)
+                and not INTERNAL_LABEL_RE.search(candidate)
+                and not has_english_prose(candidate)):
+            candidates.append(candidate)
     if candidates:
         return sanitize_public_surface(max(candidates, key=len))
     return ""
@@ -761,8 +771,8 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
             for item in document.get("sections", {}).get("experiments", [])
         )
         chronology_duplicates = 0
-        chronology_values = []
         for block in re.split(r"(?m)^### ", artifact_text.split("## Подробная хронология встречи", 1)[-1] if "## Подробная хронология встречи" in artifact_text else ""):
+            chronology_values = []
             values = [normalize.group(1).casefold() for line in block.splitlines() if (normalize := re.match(r"^\*\*[^*]+:\*\*\s*(.+)$", line.strip()))]
             for value in values:
                 value_tokens = tokens(value)
