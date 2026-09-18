@@ -1104,3 +1104,4 @@ def qa_verify(text, plan):
     allowed_people = set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))
     mentioned_people = set(re.findall(r"@[\w.-]+", text or ""))
     checks = {"who": not assignment_claimed or (bool(mentioned_people) and mentioned_people.issubset(allowed_people)), "quantity": not plan.get("allowed_numbers") or set(NUMBER_RE.findall(text)).issubset(set(plan["allowed_numbers"])), "condition": not plan.get("conditions") or bool(CONDITION_RE.search(text)), "decision_state": not plan.get("decision_state") or not ("решено" in text.casefold() and "accepted" not in plan["decision_state"])}
+    return {"passed": all(checks.values()), "checks": checks}
