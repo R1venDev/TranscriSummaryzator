@@ -170,6 +170,18 @@ class GenerationTests(unittest.TestCase):
         self.assertIn("старшие таймфрейм", artifact)
         self.assertTrue(verify_public_document(document, artifact, [item])["passed"])
 
+    def test_equivalent_outcome_field_represents_chronology_item(self):
+        items = [
+            {"public_id": "PI1", "section": "minutes", "text": "@A доработать механизм обработки проигрышных сделок — статус: в работе",
+             "claim_ids": ["C1"], "evidence_ids": ["U1"], "start": 1, "end": 2, "episode_id": "E1"},
+            {"public_id": "PI2", "section": "minutes", "text": "Необходимо доработать механизм обработки проигрышных сделок.",
+             "claim_ids": ["C2"], "evidence_ids": ["U2"], "start": 2, "end": 3, "episode_id": "E1"},
+        ]
+        document = build_public_document(items, {"project": "Проект"})
+        artifact = render_public_document(document)
+        result = verify_public_document(document, artifact, items)
+        self.assertNotIn("chronology_source_item_not_rendered", result["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()
