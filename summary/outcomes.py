@@ -94,7 +94,12 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
                 label += f" (статус: {labels.get(task['status'], task['status'])})"
             next_field = _field(next_claim, label)
         resolution_field = _field(resolution)
-        if resolution_field and next_field and _near_duplicate(resolution_field, next_field):
+        earlier_fields = [
+            _field(candidate)
+            for candidate in (state, constraint, resolution, work, mentioned_resource, described_rule)
+            if candidate
+        ]
+        if next_field and any(_near_duplicate(field, next_field) for field in earlier_fields):
             next_field = None
         remaining = []
         for claim in claims:
