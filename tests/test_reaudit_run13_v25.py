@@ -196,6 +196,29 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(card["fields"]["resolution"]["value"], "Можно проверить точку входа")
         self.assertIsNone(card["fields"]["next_step"])
 
+    def test_outcome_card_does_not_repeat_current_state_as_next_step(self):
+        graph = {
+            "claims": [{
+                "claim_id": "C1", "proposition_id": "P1", "content_kind": "action",
+                "statement": "Проверяется область на старшем таймфрейме.",
+                "publication_text": "Проверяется область на старшем таймфрейме.",
+                "temporal_state": "in_progress", "task_status": "in_progress",
+                "evidence_ids": ["U1"],
+            }],
+            "dialogue_bundles": [{
+                "bundle_id": "DB1", "topic": "Проверка области", "claim_ids": ["C1"],
+                "ranges": [{"start": 1, "end": 2}],
+            }],
+            "task_states": [{
+                "task_id": "T1", "proposition_id": "P1", "status": "in_progress",
+                "deliverable": "internal_task_label",
+            }],
+            "question_states": [],
+        }
+        card = build_outcome_cards(graph)[0]
+        self.assertEqual(card["fields"]["current_state"]["value"], "Проверяется область на старшем таймфрейме.")
+        self.assertIsNone(card["fields"]["next_step"])
+
     def test_open_question_cannot_fill_state_or_next_step(self):
         graph = {
             "claims": [{"claim_id": "C1", "proposition_id": "P1", "content_kind": "observation",
