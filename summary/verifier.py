@@ -21,6 +21,43 @@ INTERNAL_LABEL_RE = re.compile(
 )
 ACRONYM_EXPANSION_RE = re.compile(r"\b(?P<acronym>[A-Z]{2,})\s*\(\s*[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+\s*\)")
 ENGLISH_WORD_RE = re.compile(r"(?i)\b[a-z]{3,}\b")
+MIXED_SCRIPT_TOKEN_RE = re.compile(r"(?iu)\b(?:[а-яё]+[a-z]+|[a-z]+[а-яё]+)[a-zа-яё]*\b")
+GENERIC_QUESTION_RESIDUAL_RE = re.compile(
+    r"(?iu)^\s*(?:проверить\s+статус\s+конкретной\s+реализации|"
+    r"подтвердить\s+точное\s+время\s+или\s+период|"
+    r"уточнить\s+участника\s+или\s+объект|"
+    r"подтвердить\s+действие\s+и\s+исполнителя|"
+    r"определить\s+проверяемое\s+значение\s+и\s+его\s+объект|"
+    r"проверить\s+объяснение|подтвердить\s+ответ|"
+    r"уточнить\s+недостающ(?:ий\s+аспект|ий\s+результат))\s*[.?!]*\s*$"
+)
+
+
+def normalize_mixed_script_confusables(text):
+    """Repair only visually identical minority-script letters in one token."""
+    cyr_to_lat = str.maketrans({
+        "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H",
+        "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X",
+        "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    })
+    lat_to_cyr = str.maketrans({
+        "A": "А", "B": "В", "E": "Е", "K": "К", "M": "М", "H": "Н",
+        "O": "О", "P": "Р", "C": "С", "T": "Т", "Y": "У", "X": "Х",
+        "a": "а", "e": "е", "o": "о", "p": "р", "c": "с", "y": "у", "x": "х",
+    })
+
+    def repair(match):
+        token = match.group(0)
+        latin = len(re.findall(r"[A-Za-z]", token))
+        cyrillic = len(re.findall(r"[А-Яа-яЁё]", token))
+        if latin == cyrillic:
+            return token
+        candidate = token.translate(cyr_to_lat if latin > cyrillic else lat_to_cyr)
+        return candidate if not MIXED_SCRIPT_TOKEN_RE.search(candidate) else token
+
+    return MIXED_SCRIPT_TOKEN_RE.sub(repair, str(text or ""))
+
+
 def has_english_prose(text):
     value = re.sub(r"https?://\S+|@[\w.-]+", "", str(text or ""))
     words = ENGLISH_WORD_RE.findall(value)
@@ -35,6 +72,10 @@ def sanitize_public_surface(text):
     # sanitization is deliberately limited to typography/known morphology and
     # never rewrites a meeting-specific proposition.
     value = re.sub(r"(?iu)\bсвичных\b", "свечных", value)
+    # ASR/model output can mix a single visually identical Cyrillic letter
+    # into a Latin name ("Мisha") or vice versa. Repairing only confusables in
+    # the minority script is typographic normalization, not translation.
+    value = normalize_mixed_script_confusables(value)
     # An extractor may expand a source acronym from model knowledge.  The
     # acronym itself is source material; an English parenthetical expansion is
     # not.  Keeping only the original acronym is deterministic and cannot add
@@ -296,6 +337,15 @@ def build_public_items(meeting_graph, summary_plan):
         if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") not in {"answered", "rhetorical", "superseded"}:
             state = question_states.get(claim.get("proposition_id"), {})
             question_text = state.get("residual_question_text") or state.get("remaining_question") or attributed_text(claim)
+            if GENERIC_QUESTION_RESIDUAL_RE.fullmatch(str(question_text or "")):
+                # Slot labels are diagnostics, not self-contained questions.
+                # Prefer the source-grounded original so two unrelated asks do
+                # not collapse into the same generic public bullet.
+                question_text = public_surface_text(
+                    claim, state.get("original_question") or claim.get("statement")
+                )
+            if not question_text or GENERIC_QUESTION_RESIDUAL_RE.fullmatch(str(question_text)):
+                continue
             if re.search(r"(?iu)^\s*уточнить\s+недостающ\w+\s+результат", str(question_text or "")):
                 continue
             speakers = list(claim.get("speaker_refs", []))
