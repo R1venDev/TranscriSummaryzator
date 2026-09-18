@@ -43,6 +43,28 @@ class LatestAuditRegressionTests(unittest.TestCase):
         self.assertFalse(substantive_unverified_surface("Да, на индексах в AM."))
         self.assertTrue(substantive_unverified_surface("Размер имбаланса в источнике не подтверждён."))
 
+    def test_internal_claim_label_falls_back_to_safe_dialogue_evidence(self):
+        claim = {
+            "statement": "@A fix_issue_by_linking_interest_zone_logic",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{
+                "id": "U1",
+                "text": "Проблема исправляется только привязкой логики зоны интереса.",
+            }],
+        }
+        self.assertEqual(
+            public_surface_text(claim),
+            "Проблема исправляется только привязкой логики зоны интереса.",
+        )
+
+    def test_model_authored_acronym_expansion_is_removed(self):
+        claim = {
+            "statement": "Можно отключить SM (Structure Maker) на четырёх часах.",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{"id": "U1", "text": "Можно отключить SM на четырёх часах."}],
+        }
+        self.assertEqual(public_surface_text(claim), "Можно отключить SM на четырёх часах.")
+
     def test_rejected_public_items_are_quarantined_with_full_audit(self):
         items = [{"public_id": "PI1"}, {"public_id": "PI2"}]
         report = {"audits": [
