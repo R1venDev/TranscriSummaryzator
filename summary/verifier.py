@@ -177,10 +177,10 @@ def build_public_items(meeting_graph, summary_plan):
 
     for claim in selected("requires_verification"):
         if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence", "contradicted"}:
-            # Extractors occasionally emit an internal snake_case label rather
-            # than prose.  It may be replaced only by an exact cited utterance;
-            # without a safe source surface the planner records an exclusion.
-            text = public_surface_text(claim)
+            # Quarantine is still a public surface.  An internal machine label
+            # is omitted with a planner disposition rather than expanded into
+            # a long context utterance that may contain several propositions.
+            text = str(claim.get("statement") or "")
             if (substantive_unverified_surface(text)
                     and not re.search(r"(?iu)\b(?:шутк|dow\s*jones|s&p|столет|тысячелет)\w*", text)):
                 task_state = task_states.get(claim.get("canonical_task_state_id"), {})
@@ -1104,4 +1104,3 @@ def qa_verify(text, plan):
     allowed_people = set(re.findall(r"@[\w.-]+", " ".join(allowed_values)))
     mentioned_people = set(re.findall(r"@[\w.-]+", text or ""))
     checks = {"who": not assignment_claimed or (bool(mentioned_people) and mentioned_people.issubset(allowed_people)), "quantity": not plan.get("allowed_numbers") or set(NUMBER_RE.findall(text)).issubset(set(plan["allowed_numbers"])), "condition": not plan.get("conditions") or bool(CONDITION_RE.search(text)), "decision_state": not plan.get("decision_state") or not ("решено" in text.casefold() and "accepted" not in plan["decision_state"])}
-    return {"passed": all(checks.values()), "checks": checks}
