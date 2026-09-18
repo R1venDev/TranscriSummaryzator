@@ -2742,6 +2742,12 @@ def build_public_document(items, metadata=None, graph=None):
         # may create them; lexical overlap, proximity and shared episode are
         # retrieval hints, never evidence for "why" or "purpose".
         item_claims = set(item.get("claim_ids", []))
+        question_state = item.get("question_state", {}) if item.get("section") == "questions" else {}
+        answer_verification = question_state.get("answer_verification", {}).get("status")
+        verified_answer_context = (
+            question_state.get("status") in {"answered", "partially_answered"}
+            and answer_verification not in {"insufficient_evidence", "contradicted", "not_evaluated"}
+        )
         linked_nodes = []
         for relation in (graph or {}).get("relations", []):
             source, target = relation.get("source_claim_id"), relation.get("target_claim_id")
@@ -2752,6 +2758,11 @@ def build_public_document(items, metadata=None, graph=None):
                 continue
             role = relation_roles.get(relation.get("type"))
             if not role:
+                continue
+            # Candidate answer edges remain useful for audit/retrieval even if
+            # typed entailment failed. They must not be labelled as a known
+            # answer on the public surface.
+            if item.get("section") == "questions" and role == "known_answer" and not verified_answer_context:
                 continue
             claim = graph_by_claim[other]
             if claim.get("lifecycle", "active") != "active" or claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence"}:
