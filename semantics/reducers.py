@@ -441,8 +441,15 @@ def reduce_questions(propositions, events, relations, records):
         typed_missing = [normalize_slot(x) for x in missing]
         remaining = "; ".join(dict.fromkeys(display.get(x, "уточнить недостающий результат") for x in typed_missing))
         original = str(prop["statement"])
-        human_original = original if re.search(r"[а-яё]", original, re.I) and not re.search(r"\b[a-z]+_[a-z_]+\b", original) else None
-        residual_text = human_original if human_original and status == "unanswered" else remaining or human_original
+        human_original = original if re.search(r"[а-яё]", original, re.I) and not re.search(r"(?iu)\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b", original) else None
+        if status == "partially_answered" and human_original and remaining:
+            residual_text = f"{human_original.rstrip(' ?.!')} — осталось уточнить: {remaining}"
+        elif human_original:
+            # When no answer was verified, a generic slot label such as
+            # "проверить объяснение" must not replace the actual question.
+            residual_text = human_original
+        else:
+            residual_text = remaining
         open_statuses = {"unanswered", "partially_answered", "deferred", "requires_external_verification", "ambiguous_answer", "answer_not_verified", "answer_retrieval_failed"}
         result.append({"question_id": "Q" + prop["proposition_id"][1:], "proposition_id": prop["proposition_id"], "source_record_id": event.get("source_record_id"), "intent": record.get("question_intent") or "unknown", "original_question": original, "known_answer": " ".join(known_parts) or None, "remaining_question": residual_text if status in open_statuses else None, "residual_question_text": residual_text if status in open_statuses else None, "answer_support": answer_evidence, "residual_support": prop.get("evidence_ids", []), "question_aspects": requested, "requested_slots": [normalize_slot(x) for x in requested], "answered_slots": [normalize_slot(x) for x in entailed], "missing_slots": typed_missing, "missing_slot_labels": [display.get(x, "уточнить недостающий результат") for x in typed_missing], "candidate_answer_ids": answer_ids, "answer_record_ids": answer_ids, "answer_evidence_ids": answer_evidence, "answer_relation_ids": [x["relation_id"] for x in answer_relations], "answer_verification": {"status": "supported" if status == "answered" else "partial" if status == "partially_answered" else "contradicted" if status == "ambiguous_answer" else "not_evaluated" if status == "answer_retrieval_failed" else "insufficient_evidence", "checks": checks + direct_checks}, "state_transition": {"from": upstream or "unknown", "to": status, "reason": "typed_slot_entailment" if entailed else "retrieval_failed" if status == "answer_retrieval_failed" else "no_entailed_answer", "evidence_ids": answer_evidence}, "status": status, "start": float(record.get("start", 0)), "closing_schedule_priority": prop["content_kind"] == "schedule"})
         result[-1].update({
