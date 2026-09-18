@@ -14,7 +14,11 @@ CERTAIN_RE = re.compile(r"(?iu)\b(?:точно|обязательно|гаран
 COMPLETED_RE = re.compile(r"(?iu)\b(?:проверен[аоы]?|завершен[аоы]?|готов[аоы]?|выполнен[аоы]?|сделан[аоы]?)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|после|перед|пока|при|до тех пор)\b")
 ROLE_RELATION_RE = re.compile(r"(?iu)(@[\w.-]+)\s+(?:долж\w*|сдела\w*|подготов\w*|отправ\w*|переда\w*|покаж\w*|размет\w*|провер\w*|анализ\w*)[^@]{0,100}(@[\w.-]+)")
-INTERNAL_LABEL_RE = re.compile(r"(?iu)\b(?:self_committed|assigned_pending|explicit_self_commitment|additional_tools|rhythmic_entry_implementation|high_tf_result|stop_loss_options|should[_ ]\w+|[a-z]+_[a-z_]+)\b")
+INTERNAL_LABEL_RE = re.compile(
+    r"(?iu)\b(?:self_committed|assigned_pending|explicit_self_commitment|"
+    r"additional_tools|rhythmic_entry_implementation|high_tf_result|"
+    r"stop_loss_options|should[_ ]\w+|[a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b"
+)
 ACRONYM_EXPANSION_RE = re.compile(r"\b(?P<acronym>[A-Z]{2,})\s*\(\s*[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+\s*\)")
 ENGLISH_WORD_RE = re.compile(r"(?i)\b[a-z]{3,}\b")
 def has_english_prose(text):
@@ -173,7 +177,10 @@ def build_public_items(meeting_graph, summary_plan):
 
     for claim in selected("requires_verification"):
         if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence", "contradicted"}:
-            text = str(claim.get("statement") or "")
+            # Extractors occasionally emit an internal snake_case label rather
+            # than prose.  It may be replaced only by an exact cited utterance;
+            # without a safe source surface the planner records an exclusion.
+            text = public_surface_text(claim)
             if (substantive_unverified_surface(text)
                     and not re.search(r"(?iu)\b(?:шутк|dow\s*jones|s&p|столет|тысячелет)\w*", text)):
                 task_state = task_states.get(claim.get("canonical_task_state_id"), {})
@@ -756,15 +763,34 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
             and not (context_stems(item.get("text")) & context_stems(context.get("text")))
             for item in contextual_items for context in item.get("context", [])
         )
-        allowed_context_roles = {"known_answer", "explanation", "motivation", "condition", "test_detail", "dependency", "refinement", "correction", "acceptance"}
+        # Keep this vocabulary aligned with build_public_document() and the
+        # renderer.  A renderer-supported role is not an internal label.
+        allowed_context_roles = {
+            "known_answer", "known_context", "purpose", "related_step",
+            "importance", "application", "explanation", "motivation",
+            "observation", "test_detail", "condition", "dependency",
+            "refinement", "correction", "acceptance",
+        }
         counters["section_context_missing_role"] = sum(
             context.get("role") not in allowed_context_roles
             for item in contextual_items for context in item.get("context", [])
         )
+        semantic_abstentions = (document.get("semantic_audit") or {}).get("abstentions", [])
+        abstained_answer_contexts = set()
+        for abstention in semantic_abstentions:
+            node = abstention.get("node", abstention) if isinstance(abstention, dict) else {}
+            match = re.fullmatch(r"context:questions:(\d+):\d+", str(node.get("node_id") or ""))
+            if match and node.get("role") == "known_answer":
+                abstained_answer_contexts.add(int(match.group(1)))
         counters["question_context_missing_known_answer"] = sum(
-            bool(item.get("question_state", {}).get("answer_record_ids"))
+            bool(question.get("answer_record_ids"))
+            and question.get("status") in {"answered", "partially_answered"}
+            and question.get("answer_verification", {}).get("status")
+                not in {"insufficient_evidence", "contradicted", "not_evaluated"}
             and not any(context.get("role") == "known_answer" for context in item.get("context", []))
-            for item in document.get("sections", {}).get("questions", [])
+            and index not in abstained_answer_contexts
+            for index, item in enumerate(document.get("sections", {}).get("questions", []), 1)
+            for question in [item.get("question_state", {})]
         )
         counters["goal_only_experiments"] = sum(
             bool(re.search(r"(?iu)\b(?:обсуждалась\s+цель|целевой\s+ориентир|базов\w*\s+решени\w*)\b", str(item.get("text") or "")))
@@ -794,7 +820,22 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     public_claims = {claim_id for item in items for claim_id in item.get("claim_ids", [])}
     candidate_ids = set(summary_plan.get("commitment_candidate_ids", []))
     routed_work = {claim_id for item in items if item.get("section") in {"tasks", "requires_verification"} for claim_id in item.get("claim_ids", [])}
-    counters.update({"unexplained_selected_claims": unexplained, "unexplained_commitment_candidates": len(candidate_ids - routed_work), "published_unique_claims": len(public_claims)})
+    # A verifier abstention is a terminal, auditable disposition rather than a
+    # silently lost commitment. Only exclusion-like dispositions carrying an
+    # explicit reason may satisfy the accounting invariant.
+    explained_candidates = {
+        claim_id
+        for view in summary_plan.get("view_plans", {}).values()
+        for claim_id, disposition in view.get("dispositions", {}).items()
+        if disposition.get("status") in {"excluded", "rejected", "abstained", "quarantined"}
+        and str(disposition.get("reason") or "").strip()
+    }
+    counters.update({
+        "unexplained_selected_claims": unexplained,
+        "explained_commitment_candidates": len((candidate_ids & explained_candidates) - routed_work),
+        "unexplained_commitment_candidates": len(candidate_ids - routed_work - explained_candidates),
+        "published_unique_claims": len(public_claims),
+    })
     integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "section_context_repetitions", "section_context_low_relevance", "section_context_missing_role", "question_context_missing_known_answer", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
