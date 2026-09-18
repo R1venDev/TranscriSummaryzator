@@ -27,6 +27,30 @@ def fact(kind="proposal", statement="Предложено проверить BOS
 
 
 class SummaryWorkerTests(unittest.TestCase):
+    def test_candidate_lineage_prefers_exact_action_then_safe_rekey(self):
+        claims = [
+            {"claim_id": "C-base", "statement": "Проверить сервис.",
+             "evidence_ids": ["U1"], "origin_ids": ["OR1"]},
+            {"claim_id": "C-action", "statement": "Проверить сервис.",
+             "evidence_ids": ["U1"], "origin_ids": ["OR1:A01"]},
+            {"claim_id": "C-rekey", "statement": "Свинги требуют две свечи.",
+             "evidence_ids": ["U2"], "origin_ids": ["OR-new"]},
+        ]
+        origins = {claim["claim_id"]: set(claim["origin_ids"]) for claim in claims}
+        matched, mode = summary.matching_candidate_claims(
+            {"origin_id": "OR1:A01", "statement": "Проверить сервис.", "evidence_ids": ["U1"]},
+            claims, origins,
+        )
+        self.assertEqual([claim["claim_id"] for claim in matched], ["C-action"])
+        self.assertEqual(mode, "exact_origin")
+
+        matched, mode = summary.matching_candidate_claims(
+            {"origin_id": "OR-old", "statement": "Свинги требуют две свечи.", "evidence_ids": ["U2"]},
+            claims, origins,
+        )
+        self.assertEqual([claim["claim_id"] for claim in matched], ["C-rekey"])
+        self.assertEqual(mode, "semantic_rekey")
+
     def test_optional_global_cache_write_failure_does_not_retry_valid_response(self):
         class Client:
             calls = 0
@@ -1288,6 +1312,41 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(report["inherited_public_item_nodes"], 1)
         self.assertEqual(report["independently_reviewed_surfaces"], 0)
         self.assertEqual(report["escalated_surfaces"], 0)
+
+    def test_final_document_audit_bounds_model_batches(self):
+        class Client:
+            def __init__(self):
+                self.batch_sizes = []
+                self.progress_callbacks = []
+
+            def chat(self, _model, _system, prompt, **kwargs):
+                nodes = json.loads(prompt)["nodes"]
+                self.batch_sizes.append(len(nodes))
+                self.progress_callbacks.append(kwargs.get("progress"))
+                if kwargs.get("progress"):
+                    kwargs["progress"](1)
+                return json.dumps({"reviews": [
+                    {"node_id": node["node_id"], "verdict": "supported", "reason": "source"}
+                    for node in nodes
+                ]}), {"done": True, "done_reason": "stop"}
+
+        document = {"overview": [
+            {"text": f"Подтверждённый факт {index}.", "claim_ids": [f"C{index}"],
+             "evidence_ids": [f"U{index}"]}
+            for index in range(9)
+        ]}
+        source = [
+            {"id": f"U{index}", "speaker": "@A", "text": f"Подтверждённый факт {index}."}
+            for index in range(9)
+        ]
+        client = Client()
+        with tempfile.TemporaryDirectory() as directory:
+            report = summary.audit_final_document(
+                client, "auditor", document, source, Path(directory), public_items=[],
+            )
+        self.assertEqual(client.batch_sizes, [4, 4, 1])
+        self.assertTrue(all(callable(callback) for callback in client.progress_callbacks))
+        self.assertEqual(report["status"], "passed")
 
     def test_final_document_reconciliation_quarantines_only_bad_context(self):
         item = {
