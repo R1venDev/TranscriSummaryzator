@@ -5426,6 +5426,9 @@ def finalize_summary(client, settings, cfg, run_dir, output_dir, final_facts, co
                         view_plan.setdefault("dispositions", {})[claim_id] = {
                             "status": "excluded", "reason": "post_render_verification_abstention",
                         }
+        # Persist the same lineage state that the runtime gate evaluates.  A
+        # failed run must remain exactly replayable from its audit artifacts.
+        atomic_json(run_dir / "summary_plan.json", summary_plan)
         atomic_json(run_dir / "public_item_abstentions.json", {
             "schema_version": 1,
             "input_item_count": initial_public_item_count,
