@@ -37,6 +37,14 @@ class LatestAuditRegressionTests(unittest.TestCase):
         self.assertEqual(sanitize_public_surface(source), source)
         self.assertTrue(has_english_prose(source))
 
+    def test_visual_mixed_script_typos_are_normalized_without_translation(self):
+        self.assertEqual(
+            sanitize_public_surface("Участник Мisha подготовил отчёт."),
+            "Участник Misha подготовил отчёт.",
+        )
+        self.assertEqual(sanitize_public_surface("Mиша подготовил отчёт."), "Миша подготовил отчёт.")
+        self.assertEqual(sanitize_public_surface("таймframe требует проверки"), "таймframe требует проверки")
+
     def test_internal_labels_and_bare_acknowledgements_are_not_public_surfaces(self):
         claim = {"statement": "@A link_stop_loss_to_projection_extremes", "evidence_ids": []}
         self.assertEqual(public_surface_text(claim), "")
