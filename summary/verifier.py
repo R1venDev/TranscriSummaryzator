@@ -860,7 +860,13 @@ def verify_public_document(document, artifact_text, items, graph=None):
     context_evidence_for = lambda claim_ids: evidence_for(claim_ids) | {
         evidence for claim_id in claim_ids for evidence in graph_claims.get(claim_id, {}).get("evidence_ids", [])
     }
-    surface = lambda value: re.sub(r"\s+", " ", re.sub(r"(?iu)\bсвичных\b", "свечных", re.sub(r"(?iu)\bbaseline\b", "ориентир", re.sub(r"[*`]", "", str(value or ""))))).strip().casefold()
+    surface = lambda value: re.sub(
+        r"\s+", " ",
+        re.sub(
+            r"(?iu)\bтаймфрем(?:ы|ов|ами)?\b", "таймфрейм",
+            re.sub(r"(?iu)\bbaseline\b", "ориентир", re.sub(r"[*`]", "", sanitize_public_surface(value))),
+        ),
+    ).strip().casefold()
     heading_sections = {"Главное": "overview", "Таймкоды": "navigation", "Принятые решения": "decisions", "Упомянутые действующие правила": "rules", "Задачи и следующие шаги": "tasks", "Что осталось уточнить": "questions", "Технические выводы и ограничения": "technical", "Идеи и эксперименты, ещё не проверенные": "experiments", "Требует проверки источника": "requires_verification", "Подробная хронология встречи": "chronology"}
     section_text = {}
     current = None
