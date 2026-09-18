@@ -46,7 +46,7 @@ from semantics.meeting_graph import build_meeting_graph, compatibility_state
 from summary.planner import plan as build_constrained_plan
 from summary.views import project_verified_document, project_views
 from summary.outcomes import build_outcome_cards
-from summary.verifier import audit_realization, build_public_items, diff_public_items, has_english_prose, partition_verified_public_items, public_surface_text, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
+from summary.verifier import audit_realization, build_public_items, diff_public_items, has_english_prose, partition_verified_public_items, public_context_duplicate, public_context_stems, public_surface_text, runtime_quality_gates, sanitize_public_surface, source_aware_plan, validate_public_items_contract, verify_generated_items, verify_public_document, verify_sentence_plan
 from project_memory.graph_store import ProjectGraphStore
 from pipeline_core.artifacts import manifest as artifact_manifest
 from contracts import SCHEMA_VERSIONS
@@ -2662,20 +2662,8 @@ def build_public_document(items, metadata=None, graph=None):
     graph_by_source = {claim.get("source_record_id"): claim for claim in graph_claims if claim.get("source_record_id")}
     contextual_sections = {"tasks", "questions", "technical", "experiments"}
 
-    def context_tokens(value):
-        stop = {"участник", "говорящий", "который", "которая", "можно", "нужно", "будет"}
-        result = set()
-        for token in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()):
-            if len(token) <= 2 or token in stop:
-                continue
-            if re.fullmatch(r"[а-яё]+", token) and len(token) >= 4:
-                token = re.sub(r"[аяоеуыию]$", "", token)
-            result.add(token[:5] if len(token) >= 5 else token)
-        return result
-
-    def context_duplicate(left, right, threshold=.72):
-        a, b = context_tokens(left), context_tokens(right)
-        return bool(a and b and len(a & b) / max(1, min(len(a), len(b))) >= threshold)
+    context_tokens = public_context_stems
+    context_duplicate = public_context_duplicate
 
     def context_node(text, claim_ids, evidence_ids, score, start=None, *, kind=None,
                      role="related", directly_linked=False):
