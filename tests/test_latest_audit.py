@@ -6,6 +6,7 @@ from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
 from summary.verifier import has_english_prose, partition_verified_public_items, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items
+from scripts.summary_worker import build_public_document
 from scripts.diagnostics import _safe, summarize
 
 
@@ -56,6 +57,85 @@ class LatestAuditRegressionTests(unittest.TestCase):
             public_surface_text(claim),
             "Проблема исправляется только привязкой логики зоны интереса.",
         )
+
+    def test_numbered_internal_claim_label_falls_back_to_cited_utterance(self):
+        claim = {
+            "statement": "@A uses_approach_1_time_range",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{
+                "id": "U1",
+                "text": "Первый подход используется на коротком временном диапазоне.",
+            }],
+        }
+        self.assertEqual(
+            public_surface_text(claim),
+            "Первый подход используется на коротком временном диапазоне.",
+        )
+
+    def test_unverified_candidate_answer_is_not_published_as_known(self):
+        question = {
+            "public_id": "PIQ", "section": "questions",
+            "text": "@A спрашивает: доступен ли сервис?", "claim_ids": ["CQ"],
+            "evidence_ids": ["UQ"], "source_word_ids": ["WQ"],
+            "content_kind": "question", "social_state": "answer_not_verified",
+            "start": 1, "end": 2, "episode_id": "E1",
+            "question_state": {
+                "status": "answer_not_verified", "answer_record_ids": ["FA"],
+                "answer_verification": {"status": "insufficient_evidence"},
+            },
+        }
+        graph = {
+            "claims": [
+                {"claim_id": "CQ", "content_kind": "question", "statement": "Доступен ли сервис?",
+                 "evidence_ids": ["UQ"], "verification_status": "supported", "lifecycle": "active"},
+                {"claim_id": "CA", "content_kind": "observation", "statement": "Сервис доступен.",
+                 "source_record_id": "FA", "evidence_ids": ["UA"], "verification_status": "supported",
+                 "lifecycle": "active", "start": 2},
+            ],
+            "relations": [{"relation_id": "R1", "type": "partially_answers",
+                           "source_claim_id": "CA", "target_claim_id": "CQ",
+                           "evidence_ids": ["UQ", "UA"], "confidence": .8}],
+            "dialogue_bundles": [], "task_states": [], "question_states": [],
+        }
+        document = build_public_document([question], graph=graph)
+        self.assertEqual(document["sections"]["questions"][0]["context"], [])
+
+    def test_quality_gate_accounts_for_abstentions_and_verified_answers(self):
+        plan = {
+            "commitment_candidate_ids": ["C1"],
+            "view_plans": {"tasks": {"selected_claim_ids": ["C1"], "dispositions": {
+                "C1": {"status": "excluded", "reason": "post_render_verification_abstention"},
+            }}},
+        }
+        question = {
+            "section": "questions", "text": "Что осталось проверить?", "claim_ids": ["CQ"],
+            "evidence_ids": ["UQ"], "source_word_ids": ["WQ"],
+            "question_state": {
+                "status": "answer_not_verified", "answer_record_ids": ["FA"],
+                "answer_verification": {"status": "insufficient_evidence"},
+            },
+        }
+        document = {"sections": {"questions": [{**question, "context": []}]}, "metadata": {}}
+        audit = publication_audit({"audits": []}, "# Встреча — Итоги\n", [question], plan, document=document)
+        self.assertEqual(audit["unexplained_commitment_candidates"], 0)
+        self.assertEqual(audit["explained_commitment_candidates"], 1)
+        self.assertEqual(audit["question_context_missing_known_answer"], 0)
+
+        verified = dict(question)
+        verified["question_state"] = {
+            "status": "partially_answered", "answer_record_ids": ["FA"],
+            "answer_verification": {"status": "partial"},
+        }
+        document["sections"]["questions"] = [{**verified, "context": []}]
+        missing = publication_audit({"audits": []}, "# Встреча — Итоги\n", [verified], {}, document=document)
+        self.assertEqual(missing["question_context_missing_known_answer"], 1)
+
+        document["semantic_audit"] = {"abstentions": [{
+            "node": {"node_id": "context:questions:1:1", "role": "known_answer"},
+            "review": {"verdict": "insufficient_evidence"},
+        }]}
+        explained = publication_audit({"audits": []}, "# Встреча — Итоги\n", [verified], {}, document=document)
+        self.assertEqual(explained["question_context_missing_known_answer"], 0)
 
     def test_model_authored_acronym_expansion_is_removed(self):
         claim = {
