@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
-from summary.verifier import has_english_prose, partition_verified_public_items, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items
+from summary.verifier import has_english_prose, partition_verified_public_items, public_context_duplicate, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items
 from scripts.summary_worker import build_public_document
 from scripts.diagnostics import _safe, summarize
 
@@ -44,6 +44,21 @@ class LatestAuditRegressionTests(unittest.TestCase):
         )
         self.assertEqual(sanitize_public_surface("Mиша подготовил отчёт."), "Миша подготовил отчёт.")
         self.assertEqual(sanitize_public_surface("таймframe требует проверки"), "таймframe требует проверки")
+
+    def test_context_repetition_uses_one_identity_neutral_contract(self):
+        task = (
+            "Отчёта на первое время хватит, поэтому @Analyst будет параллельно "
+            "обновлять расчёты — исполнитель: @Analyst"
+        )
+        self.assertTrue(
+            public_context_duplicate(task, "Отчёта на первое время хватит для работы.")
+        )
+        self.assertFalse(
+            public_context_duplicate(
+                "@Analyst обновит отчёт для клиента.",
+                "@Analyst проверит доступность резервного сервера.",
+            )
+        )
 
     def test_internal_labels_and_bare_acknowledgements_are_not_public_surfaces(self):
         claim = {"statement": "@A link_stop_loss_to_projection_extremes", "evidence_ids": []}
