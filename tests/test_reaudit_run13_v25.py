@@ -212,7 +212,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertIsNone(card["fields"]["next_step"])
         self.assertEqual(card["fields"]["remaining_unknown"][0]["value"], "Есть ли задержка?")
 
-    def test_chronology_deduplicates_fields_across_chapters(self):
+    def test_chronology_retains_fields_across_chapters(self):
         def card(number):
             return {"outcome_id": f"OC{number}", "fields": {
                 "current_state": {"value": "Общий подтверждённый факт", "claim_ids": [f"C{number}"], "evidence_ids": [f"U{number}"]},
@@ -229,7 +229,7 @@ class Run13PublicationRegressions(unittest.TestCase):
             ],
         }
         artifact = render_public_document(document)
-        self.assertEqual(artifact.count("Общий подтверждённый факт."), 1)
+        self.assertEqual(artifact.count("Общий подтверждённый факт."), 2)
 
     def test_question_projection_does_not_overwrite_answer_claim_in_outcome(self):
         items = [
@@ -343,6 +343,52 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(set(card["claim_ids"]), {"C1", "C2"})
         self.assertEqual(set(card["evidence_ids"]), {"U1", "U2"})
         self.assertEqual(card["fields"]["remaining_unknown"][0]["evidence_ids"], ["U1"])
+
+    def test_public_document_restricts_outcome_evidence_to_public_items(self):
+        item = {
+            "public_id": "PI1", "section": "minutes", "text": "Сервис работает",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "current_state", "social_state": "candidate",
+            "start": 1, "end": 2,
+        }
+        graph = {
+            "claims": [{
+                "claim_id": "C1", "proposition_id": "P1", "content_kind": "current_state",
+                "statement": "Сервис работает", "evidence_ids": ["U1", "U-context"],
+                "lifecycle": "active", "verification_status": "supported",
+            }],
+            "dialogue_bundles": [{
+                "bundle_id": "DB1", "topic": "Сервис", "claim_ids": ["C1"],
+                "ranges": [{"start": 1, "end": 2}],
+            }],
+            "question_states": [], "task_states": [], "relations": [],
+        }
+        document = build_public_document([item], graph=graph)
+        card = document["outcome_cards"][0]
+        self.assertEqual(card["evidence_ids"], ["U1"])
+        self.assertEqual(card["fields"]["current_state"]["evidence_ids"], ["U1"])
+        artifact = render_public_document(document)
+        self.assertTrue(verify_public_document(document, artifact, [item], graph)["passed"])
+
+    def test_chronology_deduplication_does_not_cross_chapter_boundaries(self):
+        field = lambda claim, evidence: {
+            "value": "Одинаковое состояние", "claim_ids": [claim], "evidence_ids": [evidence],
+        }
+        document = {
+            "title": {"text": "Состояние сервиса", "claim_ids": ["C1"], "evidence_ids": ["U1"]},
+            "overview": [], "sections": {}, "navigation": [],
+            "outcome_cards": [
+                {"outcome_id": "OC1", "fields": {"current_state": field("C1", "U1")}},
+                {"outcome_id": "OC2", "fields": {"current_state": field("C2", "U2")}},
+            ],
+            "chronology": [
+                {"label": "Первый эпизод", "start": 1, "end": 2, "outcome_id": "OC1", "items": []},
+                {"label": "Второй эпизод", "start": 3, "end": 4, "outcome_id": "OC2", "items": []},
+            ],
+            "metadata": {"project": "Проект", "duration_seconds": 10},
+        }
+        artifact = render_public_document(document)
+        self.assertEqual(artifact.count("**Состояние:** Одинаковое состояние."), 2)
 
 
 if __name__ == "__main__":
