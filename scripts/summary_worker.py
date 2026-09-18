@@ -2544,6 +2544,17 @@ def build_public_document(items, metadata=None, graph=None):
         for claim_id in item.get("claim_ids", []):
             items_by_claim.setdefault(claim_id, []).append(item)
     allowed_claims = {claim for item in items for claim in item.get("claim_ids", [])}
+    # A claim cited only as provenance for a multi-claim question has no
+    # independently verified public wording.  It may support that question,
+    # but must not become a standalone OutcomeCard field or overview sentence.
+    outcome_allowed_claims = {
+        claim_id
+        for claim_id, candidates in items_by_claim.items()
+        if any(
+            item.get("claim_ids") == [claim_id] or item.get("section") != "questions"
+            for item in candidates
+        )
+    }
     outcome_graph = graph
     if graph:
         outcome_graph = dict(graph)
@@ -2562,7 +2573,7 @@ def build_public_document(items, metadata=None, graph=None):
             public_text = (max(candidate_pool, key=lambda item: utility(item)).get("text")
                            if candidate_pool else public_surface_text(claim))
             outcome_graph["claims"].append(dict(claim, publication_text=public_text))
-    outcome_cards = build_outcome_cards(outcome_graph, allowed_claims) if outcome_graph else []
+    outcome_cards = build_outcome_cards(outcome_graph, outcome_allowed_claims) if outcome_graph else []
     # Outcome builders operate on the canonical graph, whose evidence windows
     # can be wider than the retained PublicItem projection.  Publication is
     # allowed to cite only the evidence closure of those retained items.
