@@ -27,6 +27,25 @@ def rec(number, kind, statement, act="assert", **extra):
 
 
 class Run13SemanticRegressions(unittest.TestCase):
+    def test_unverified_answers_are_not_reopened_as_raw_questions(self):
+        graph = build_meeting_graph([
+            rec(1, "question", "Почему первый сервис задерживает данные?", "ask",
+                requested_slots=["explanation"], answer_record_ids=["F3"]),
+            rec(2, "question", "Почему второй сервис теряет события?", "ask",
+                requested_slots=["explanation"], answer_record_ids=["F4"]),
+            rec(3, "observation", "Первый сервис включён.", "answer"),
+            rec(4, "observation", "Второй сервис включён.", "answer"),
+        ])
+        states = graph["question_states"]
+        self.assertTrue(all(item["status"] == "answer_not_verified" for item in states))
+        self.assertEqual(
+            {item["remaining_question"] for item in states},
+            {"Почему первый сервис задерживает данные?", "Почему второй сервис теряет события?"},
+        )
+        planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
+        questions = [item["text"] for item in build_public_items(graph, planned) if item["section"] == "questions"]
+        self.assertEqual(questions, [])
+
     def test_contextual_commitment_and_acceptance_are_detected(self):
         self.assertEqual(primary_speech_act("Потом встрою это в методичку"), "commit")
         self.assertEqual(primary_speech_act("А, месяца. Ну ладно"), "accept")
@@ -79,7 +98,7 @@ class Run13SemanticRegressions(unittest.TestCase):
         answer = rec(2, "current_state", "Задержку можно снять до одной свечи, но качество просядет.", "answer")
         graph = build_meeting_graph([question, answer])
         state = next(item for item in graph["question_states"] if "задерж" in item["original_question"].casefold())
-        self.assertEqual(state["requested_slots"], ["implementation_status"])
+        self.assertEqual(state["requested_slots"], ["implementation_state"])
         self.assertEqual(state["status"], "answered")
         self.assertIsNone(state["remaining_unknown"])
 
@@ -118,6 +137,15 @@ class Run13PublicationRegressions(unittest.TestCase):
         item = next(x for x in build_public_items(graph, result) if x["section"] == "tasks")
         PublicItemContract.model_validate(item)
 
+    def test_public_contract_accepts_an_explicitly_unentailed_proposal(self):
+        item = {
+            "public_id": "PI1", "section": "technical", "text": "Предложена дополнительная проверка",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "proposal", "social_state": "candidate",
+            "acceptance_check": "not_entailed",
+        }
+        PublicItemContract.model_validate(item)
+
     def test_unknown_evidence_and_unrendered_card_are_rejected(self):
         item = {"public_id": "PI1", "section": "overview", "text": "Сервис работает", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "current_state", "social_state": "candidate", "start": 1, "end": 2}
         document = build_public_document([item])
@@ -128,15 +156,15 @@ class Run13PublicationRegressions(unittest.TestCase):
         document["outcome_cards"][0]["fields"]["current_state"]["value"] = "Выдуманное состояние"
         self.assertFalse(verify_public_document(document, artifact, [item])["passed"])
 
-    def test_contextual_sections_render_evidence_bound_explanations(self):
+    def test_contextual_sections_do_not_invent_relations_from_proximity(self):
         task = {"public_id": "PI1", "section": "tasks", "text": "@A подготовит демонстрацию", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "action", "social_state": "self_committed", "start": 10, "end": 11, "episode_id": "E1"}
         hypothesis = {"public_id": "PI2", "section": "experiments", "text": "Демонстрация нужна для проверки точки входа", "claim_ids": ["C2"], "evidence_ids": ["U2"], "source_word_ids": ["W2"], "content_kind": "hypothesis", "social_state": "candidate", "start": 9, "end": 10, "episode_id": "E1"}
         document = build_public_document([task, hypothesis])
-        self.assertEqual(document["sections"]["tasks"][0]["context"][0]["text"], hypothesis["text"])
-        self.assertEqual(document["sections"]["experiments"][0]["context"][0]["text"], task["text"])
+        self.assertEqual(document["sections"]["tasks"][0]["context"], [])
+        self.assertEqual(document["sections"]["experiments"][0]["context"], [])
         artifact = render_public_document(document)
-        self.assertIn("  - **Зачем это нужно:**", artifact)
-        self.assertIn("  - **Что именно проверяют:**", artifact)
+        self.assertNotIn("  - **Зачем это нужно:**", artifact)
+        self.assertNotIn("  - **Что именно проверяют:**", artifact)
         self.assertTrue(verify_public_document(document, artifact, [task, hypothesis])["passed"])
 
     def test_context_prefers_near_topic_claim_and_verifies_graph_provenance(self):
@@ -147,6 +175,14 @@ class Run13PublicationRegressions(unittest.TestCase):
         ])
         planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
         items = build_public_items(graph, planned)
+        marker = next(claim for claim in graph["claims"] if "тот же свинг-маркер" in claim["statement"])
+        task_claim = next(claim for claim in graph["claims"] if "задача на разметчик" in claim["statement"])
+        graph["relations"].append({
+            "relation_id": "R-explicit", "type": "explains",
+            "source_claim_id": task_claim["claim_id"], "target_claim_id": marker["claim_id"],
+            "evidence_ids": list(dict.fromkeys(task_claim["evidence_ids"] + marker["evidence_ids"])),
+            "confidence": 1.0,
+        })
         document = build_public_document(items, graph=graph)
         target = next(item for item in document["sections"]["technical"] if "тот же свинг-маркер" in item["text"])
         self.assertIn("задача на разметчик трёх свечных паттернов", target["context"][0]["text"])
@@ -155,7 +191,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertNotIn("unsupported_section_context", errors)
         self.assertNotIn("section_context_evidence_outside_closure", errors)
 
-    def test_technical_context_prefers_explanatory_constraint_over_nearby_topic(self):
+    def test_technical_context_requires_explicit_relation(self):
         graph = build_meeting_graph([
             rec(1, "constraint", "Всё упирается в зону интереса старшего таймфрейма, которую не видно."),
             rec(2, "definition", "Зоны интереса — это имбалансы, блоки, Breaker и зона OTE."),
@@ -165,8 +201,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         items = build_public_items(graph, planned)
         document = build_public_document(items, graph=graph)
         target = next(item for item in document["sections"]["technical"] if "Зоны интереса" in item["text"])
-        self.assertIn("старшего таймфрейма", target["context"][0]["text"])
-        self.assertEqual(target["context"][0]["role"], "importance")
+        self.assertEqual(target["context"], [])
 
     def test_chapter_label_never_hides_mid_sentence_truncation(self):
         first = "Предлагается провести дополнительный бэктест для анализа тех. причин проигрышных сделок и исключения их из массива"
@@ -189,6 +224,29 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(card["fields"]["resolution"]["value"], "Можно проверить точку входа")
         self.assertIsNone(card["fields"]["next_step"])
 
+    def test_outcome_card_does_not_repeat_current_state_as_next_step(self):
+        graph = {
+            "claims": [{
+                "claim_id": "C1", "proposition_id": "P1", "content_kind": "action",
+                "statement": "Проверяется область на старшем таймфрейме.",
+                "publication_text": "Проверяется область на старшем таймфрейме.",
+                "temporal_state": "in_progress", "task_status": "in_progress",
+                "evidence_ids": ["U1"],
+            }],
+            "dialogue_bundles": [{
+                "bundle_id": "DB1", "topic": "Проверка области", "claim_ids": ["C1"],
+                "ranges": [{"start": 1, "end": 2}],
+            }],
+            "task_states": [{
+                "task_id": "T1", "proposition_id": "P1", "status": "in_progress",
+                "deliverable": "internal_task_label",
+            }],
+            "question_states": [],
+        }
+        card = build_outcome_cards(graph)[0]
+        self.assertEqual(card["fields"]["current_state"]["value"], "Проверяется область на старшем таймфрейме.")
+        self.assertIsNone(card["fields"]["next_step"])
+
     def test_open_question_cannot_fill_state_or_next_step(self):
         graph = {
             "claims": [{"claim_id": "C1", "proposition_id": "P1", "content_kind": "observation",
@@ -205,7 +263,7 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertIsNone(card["fields"]["next_step"])
         self.assertEqual(card["fields"]["remaining_unknown"][0]["value"], "Есть ли задержка?")
 
-    def test_chronology_deduplicates_fields_across_chapters(self):
+    def test_chronology_retains_fields_across_chapters(self):
         def card(number):
             return {"outcome_id": f"OC{number}", "fields": {
                 "current_state": {"value": "Общий подтверждённый факт", "claim_ids": [f"C{number}"], "evidence_ids": [f"U{number}"]},
@@ -222,7 +280,7 @@ class Run13PublicationRegressions(unittest.TestCase):
             ],
         }
         artifact = render_public_document(document)
-        self.assertEqual(artifact.count("Общий подтверждённый факт."), 1)
+        self.assertEqual(artifact.count("Общий подтверждённый факт."), 2)
 
     def test_question_projection_does_not_overwrite_answer_claim_in_outcome(self):
         items = [
@@ -250,6 +308,35 @@ class Run13PublicationRegressions(unittest.TestCase):
         card = document["outcome_cards"][0]
         self.assertEqual(card["fields"]["next_step"]["value"], "Предложено проверить дополнительный фильтр.")
         self.assertNotIn("спрашивает", card["fields"]["next_step"]["value"])
+
+    def test_question_only_support_claim_cannot_become_outcome_field(self):
+        items = [{
+            "public_id": "PIQ", "section": "questions", "text": "@A спрашивает: нужен ли фильтр?",
+            "claim_ids": ["CQ", "CA"], "evidence_ids": ["UQ", "UA"], "source_word_ids": ["WQ"],
+            "content_kind": "question", "social_state": "unanswered", "start": 1, "end": 2,
+            "episode_id": "E1", "question_state": {"answer_record_ids": ["FA"]},
+        }]
+        graph = {
+            "claims": [
+                {"claim_id": "CQ", "proposition_id": "PQ", "source_record_id": "FQ", "content_kind": "question",
+                 "statement": "Нужен ли фильтр?", "evidence_ids": ["UQ"], "lifecycle": "active", "verification_status": "supported"},
+                {"claim_id": "CA", "proposition_id": "PA", "source_record_id": "FA", "content_kind": "proposal",
+                 "statement": "internal_answer_projection", "publication_text": "Предложено проверить фильтр.",
+                 "evidence_ids": ["UA"], "lifecycle": "active", "verification_status": "supported"},
+            ],
+            "dialogue_bundles": [{"bundle_id": "DB1", "topic": "Фильтр", "claim_ids": ["CQ", "CA"],
+                                  "ranges": [{"start": 1, "end": 2}]}],
+            "task_states": [],
+            "question_states": [{"proposition_id": "PQ", "status": "partially_answered", "remaining_unknown": "Нужен ли фильтр?"}],
+        }
+        document = build_public_document(items, graph=graph)
+        self.assertFalse(any(
+            "internal_answer_projection" in str(field.get("value") or "")
+            or "Предложено проверить фильтр" in str(field.get("value") or "")
+            for card in document["outcome_cards"]
+            for raw in card.get("fields", {}).values()
+            for field in (raw if isinstance(raw, list) else [raw] if raw else [])
+        ))
 
     def test_chapter_uses_episode_end(self):
         item = {"public_id": "PI1", "section": "minutes", "text": "Сервис работает", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "current_state", "social_state": "candidate", "start": 10, "end": 18, "episode_id": "E1"}
@@ -297,13 +384,13 @@ class Run13PublicationRegressions(unittest.TestCase):
         result = verify_generated_items([concise], [self.sentence_plan("C1")], [claim])
         self.assertTrue(result["passed"], result)
 
-    def test_sanitized_translation_preserves_source_negation(self):
+    def test_free_translation_is_not_treated_as_deterministic_sanitization(self):
         source = "@Yachoy suggests returning to algorithmic thinking and potentially incorporating higher timeframes if the current approach does not yield results."
         text = "Если текущий подход не даст результата, @Yachoy предлагает вернуться к алгоритмическому подходу и, возможно, подключить старшие таймфреймы."
         item = {"section": "minutes", "text": text, "claim_ids": ["C1"], "evidence_ids": ["U1"]}
         claim = {"claim_id": "C1", "statement": source, "evidence_ids": ["U1"], "lifecycle": "active", "speaker_refs": ["@Yachoy"]}
         result = verify_generated_items([item], [self.sentence_plan("C1", allowed_speakers=["@Yachoy"])], [claim])
-        self.assertTrue(result["passed"], result)
+        self.assertFalse(result["passed"], result)
 
     def test_repeated_task_actor_metadata_is_not_a_role_swap(self):
         text = "@Yachoy подготовит TradingView. — исполнитель: @Yachoy — статус: участник взял на себя"
@@ -336,6 +423,52 @@ class Run13PublicationRegressions(unittest.TestCase):
         self.assertEqual(set(card["claim_ids"]), {"C1", "C2"})
         self.assertEqual(set(card["evidence_ids"]), {"U1", "U2"})
         self.assertEqual(card["fields"]["remaining_unknown"][0]["evidence_ids"], ["U1"])
+
+    def test_public_document_restricts_outcome_evidence_to_public_items(self):
+        item = {
+            "public_id": "PI1", "section": "minutes", "text": "Сервис работает",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "current_state", "social_state": "candidate",
+            "start": 1, "end": 2,
+        }
+        graph = {
+            "claims": [{
+                "claim_id": "C1", "proposition_id": "P1", "content_kind": "current_state",
+                "statement": "Сервис работает", "evidence_ids": ["U1", "U-context"],
+                "lifecycle": "active", "verification_status": "supported",
+            }],
+            "dialogue_bundles": [{
+                "bundle_id": "DB1", "topic": "Сервис", "claim_ids": ["C1"],
+                "ranges": [{"start": 1, "end": 2}],
+            }],
+            "question_states": [], "task_states": [], "relations": [],
+        }
+        document = build_public_document([item], graph=graph)
+        card = document["outcome_cards"][0]
+        self.assertEqual(card["evidence_ids"], ["U1"])
+        self.assertEqual(card["fields"]["current_state"]["evidence_ids"], ["U1"])
+        artifact = render_public_document(document)
+        self.assertTrue(verify_public_document(document, artifact, [item], graph)["passed"])
+
+    def test_chronology_deduplication_does_not_cross_chapter_boundaries(self):
+        field = lambda claim, evidence: {
+            "value": "Одинаковое состояние", "claim_ids": [claim], "evidence_ids": [evidence],
+        }
+        document = {
+            "title": {"text": "Состояние сервиса", "claim_ids": ["C1"], "evidence_ids": ["U1"]},
+            "overview": [], "sections": {}, "navigation": [],
+            "outcome_cards": [
+                {"outcome_id": "OC1", "fields": {"current_state": field("C1", "U1")}},
+                {"outcome_id": "OC2", "fields": {"current_state": field("C2", "U2")}},
+            ],
+            "chronology": [
+                {"label": "Первый эпизод", "start": 1, "end": 2, "outcome_id": "OC1", "items": []},
+                {"label": "Второй эпизод", "start": 3, "end": 4, "outcome_id": "OC2", "items": []},
+            ],
+            "metadata": {"project": "Проект", "duration_seconds": 10},
+        }
+        artifact = render_public_document(document)
+        self.assertEqual(artifact.count("**Состояние:** Одинаковое состояние."), 2)
 
 
 if __name__ == "__main__":

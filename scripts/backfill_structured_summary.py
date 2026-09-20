@@ -75,7 +75,7 @@ def main():
         metadata={
             "source": transcript.get("source"),
             "duration_seconds": transcript.get("duration_seconds"),
-            "project": cfg.get("summary_project_name", "Aurion"),
+            "project": cfg.get("summary_project_name", "Project"),
         },
         semantic_registry=registry,
     )

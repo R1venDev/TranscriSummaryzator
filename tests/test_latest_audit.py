@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
-from summary.verifier import has_english_prose, publication_audit, sanitize_public_surface, verify_generated_items
+from summary.verifier import has_english_prose, partition_verified_public_items, public_context_duplicate, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items, verify_public_document
+from scripts.summary_worker import build_public_document, render_public_document
 from scripts.diagnostics import _safe, summarize
 
 
@@ -15,7 +16,7 @@ class LatestAuditRegressionTests(unittest.TestCase):
         self.assertTrue(verify_slot_entailment(["should_Misha_make_OrderBlock_labeler"], yes)["passed"])
         window = {"text": "Рабочее окно с 16:30 до 18:00", "speech_act": "answer"}
         self.assertTrue(verify_slot_entailment(["диапазон времени"], window, {"text": "Какой рабочий диапазон?"})["passed"])
-        self.assertEqual(normalize_slot("result on higher timeframes"), "implementation_status")
+        self.assertEqual(normalize_slot("result on higher timeframes"), "implementation_state")
         cross_day = {"text": "Она закрывается автоматически после 00:00.", "speech_act": "answer"}
         self.assertTrue(verify_slot_entailment(["cross_day_closure_feasibility"], cross_day)["passed"])
 
@@ -32,15 +33,235 @@ class LatestAuditRegressionTests(unittest.TestCase):
 
     def test_handles_are_not_mistaken_for_english_prose(self):
         self.assertFalse(has_english_prose("@Yachoy подготовит TradingView — исполнитель: @Yachoy"))
-        self.assertEqual(sanitize_public_surface("Discussed potential goal: creating a baseline solution with winrate around 30–40%."), "Обсуждалась цель: создать базовое решение с винрейтом около 30–40%.")
+        source = "Discussed potential goal: creating a baseline solution with winrate around 30–40%."
+        self.assertEqual(sanitize_public_surface(source), source)
+        self.assertTrue(has_english_prose(source))
+
+    def test_visual_mixed_script_typos_are_normalized_without_translation(self):
         self.assertEqual(
-            sanitize_public_surface("Обсуждалась возможность инструмент улучшения (связывание объемов и принтов) планировалось внедрить."),
-            "Связывание объёмов и принтов рассматривалось как возможное улучшение.",
+            sanitize_public_surface("Участник Мisha подготовил отчёт."),
+            "Участник Misha подготовил отчёт.",
+        )
+        self.assertEqual(sanitize_public_surface("Mиша подготовил отчёт."), "Миша подготовил отчёт.")
+        self.assertEqual(sanitize_public_surface("таймframe требует проверки"), "таймframe требует проверки")
+
+    def test_public_surface_removes_only_leading_dialogue_filler(self):
+        self.assertEqual(
+            sanitize_public_surface("Угу. Есть такой инструмент ТПО."),
+            "Есть такой инструмент ТПО.",
         )
         self.assertEqual(
-            sanitize_public_surface("@Yachoy / @HoTTaBbicH должен разметить какой-нибудь параметр порога, который скажет размер какого имбаланса нужно учитывать."),
-            "Нужно разметить порог размера имбаланса, чтобы определить, какие имбалансы учитывать.",
+            sanitize_public_surface("Ну, как сказать? Система пока работает на постобработке."),
+            "Система пока работает на постобработке.",
         )
+        self.assertEqual(sanitize_public_surface("Нет, система не готова."), "Нет, система не готова.")
+
+    def test_context_repetition_uses_one_identity_neutral_contract(self):
+        task = (
+            "Отчёта на первое время хватит, поэтому @Analyst будет параллельно "
+            "обновлять расчёты — исполнитель: @Analyst"
+        )
+        self.assertTrue(
+            public_context_duplicate(task, "Отчёта на первое время хватит для работы.")
+        )
+        self.assertFalse(
+            public_context_duplicate(
+                "@Analyst обновит отчёт для клиента.",
+                "@Analyst проверит доступность резервного сервера.",
+            )
+        )
+
+    def test_title_ignores_participant_handles_and_uses_supported_outcome(self):
+        item = {
+            "public_id": "PI1", "section": "overview",
+            "text": "Остаётся задержка обработки старших таймфреймов.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "problem", "social_state": "asserted", "start": 1,
+            "topic_entities": ["@A", "@B", "задержка старших таймфреймов"],
+        }
+        document = build_public_document([item], {"participants": ["@A", "@B"]})
+        self.assertEqual(document["title"]["text"], "Остаётся задержка обработки старших таймфреймов")
+
+    def test_utility_gate_rejects_editorially_bad_public_surface(self):
+        items = [
+            {"section": "decisions", "text": "Предлагается изменить алгоритм.", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "proposal", "social_state": "accepted"},
+            {"section": "tasks", "text": "Обсуждение результата.", "claim_ids": ["C2"], "evidence_ids": ["U2"], "source_word_ids": ["W2"], "content_kind": "observation", "social_state": "in_progress", "task_state_id": "T2", "task_state": {"status": "in_progress", "deliverable": "Обсуждение результата"}},
+        ]
+        report = {"audits": [{"passed": True, "errors": []}] * len(items)}
+        audit = publication_audit(report, "# Встреча — @A; @B\n", items, {}, document={"metadata": {}, "sections": {}})
+        self.assertEqual(audit["participant_only_title"], 1)
+        self.assertEqual(audit["tentative_decision_surfaces"], 1)
+        self.assertEqual(audit["non_action_task_surfaces"], 1)
+        self.assertEqual(audit["reports"]["utility"]["status"], "failed")
+
+    def test_utility_gate_rejects_action_or_dangling_title_fragments(self):
+        base = {"metadata": {}, "sections": {}, "overview": [], "chronology": []}
+        action = publication_audit(
+            {"audits": []}, "# Попробовать обновить модель; Проверить данные\n", [], {},
+            document=base,
+        )
+        dangling = publication_audit(
+            {"audits": []}, "# Разметка трёх свечных\n", [], {},
+            document=base,
+        )
+        self.assertEqual(action["title_action_fragment"], 1)
+        self.assertEqual(dangling["title_dangling_fragment"], 1)
+        self.assertEqual(action["reports"]["utility"]["status"], "failed")
+        self.assertEqual(dangling["reports"]["utility"]["status"], "failed")
+
+    def test_independently_supported_overview_paraphrase_passes_lexical_guard(self):
+        item = {
+            "public_id": "PI1", "section": "overview", "text": "Система обработки работает стабильно.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "current_state", "social_state": "asserted", "start": 1,
+            "topic_entities": ["система обработки"],
+        }
+        document = build_public_document([item])
+        document["outcome_cards"] = []
+        document["overview"][0]["text"] = "Подтверждена стабильная эксплуатация вычислительного контура."
+        artifact = render_public_document(document)
+        self.assertIn("overview_semantic_drift", verify_public_document(document, artifact, [item])["errors"])
+        document["semantic_audit"] = {
+            "reviews": [{"node_id": "overview:1", "verdict": "supported"}],
+        }
+        self.assertTrue(verify_public_document(document, artifact, [item])["passed"])
+
+    def test_internal_labels_and_bare_acknowledgements_are_not_public_surfaces(self):
+        claim = {"statement": "@A link_stop_loss_to_projection_extremes", "evidence_ids": []}
+        self.assertEqual(public_surface_text(claim), "")
+        self.assertFalse(substantive_unverified_surface("Угу."))
+        self.assertFalse(substantive_unverified_surface("Да, на индексах в AM."))
+        self.assertTrue(substantive_unverified_surface("Размер имбаланса в источнике не подтверждён."))
+
+    def test_internal_claim_label_falls_back_to_safe_dialogue_evidence(self):
+        claim = {
+            "statement": "@A fix_issue_by_linking_interest_zone_logic",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{
+                "id": "U1",
+                "text": "Проблема исправляется только привязкой логики зоны интереса.",
+            }],
+        }
+        self.assertEqual(
+            public_surface_text(claim),
+            "Проблема исправляется только привязкой логики зоны интереса.",
+        )
+
+    def test_numbered_internal_claim_label_falls_back_to_cited_utterance(self):
+        claim = {
+            "statement": "@A uses_approach_1_time_range",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{
+                "id": "U1",
+                "text": "Первый подход используется на коротком временном диапазоне.",
+            }],
+        }
+        self.assertEqual(
+            public_surface_text(claim),
+            "Первый подход используется на коротком временном диапазоне.",
+        )
+
+    def test_unverified_candidate_answer_is_not_published_as_known(self):
+        question = {
+            "public_id": "PIQ", "section": "questions",
+            "text": "@A спрашивает: доступен ли сервис?", "claim_ids": ["CQ"],
+            "evidence_ids": ["UQ"], "source_word_ids": ["WQ"],
+            "content_kind": "question", "social_state": "answer_not_verified",
+            "start": 1, "end": 2, "episode_id": "E1",
+            "question_state": {
+                "status": "answer_not_verified", "answer_record_ids": ["FA"],
+                "answer_verification": {"status": "insufficient_evidence"},
+            },
+        }
+        graph = {
+            "claims": [
+                {"claim_id": "CQ", "content_kind": "question", "statement": "Доступен ли сервис?",
+                 "evidence_ids": ["UQ"], "verification_status": "supported", "lifecycle": "active"},
+                {"claim_id": "CA", "content_kind": "observation", "statement": "Сервис доступен.",
+                 "source_record_id": "FA", "evidence_ids": ["UA"], "verification_status": "supported",
+                 "lifecycle": "active", "start": 2},
+            ],
+            "relations": [{"relation_id": "R1", "type": "partially_answers",
+                           "source_claim_id": "CA", "target_claim_id": "CQ",
+                           "evidence_ids": ["UQ", "UA"], "confidence": .8}],
+            "dialogue_bundles": [], "task_states": [], "question_states": [],
+        }
+        document = build_public_document([question], graph=graph)
+        self.assertEqual(document["sections"]["questions"][0]["context"], [])
+
+    def test_quality_gate_accounts_for_abstentions_and_verified_answers(self):
+        plan = {
+            "commitment_candidate_ids": ["C1"],
+            "view_plans": {"tasks": {"selected_claim_ids": ["C1"], "dispositions": {
+                "C1": {"status": "excluded", "reason": "post_render_verification_abstention"},
+            }}},
+        }
+        question = {
+            "section": "questions", "text": "Что осталось проверить?", "claim_ids": ["CQ"],
+            "evidence_ids": ["UQ"], "source_word_ids": ["WQ"],
+            "question_state": {
+                "status": "answer_not_verified", "answer_record_ids": ["FA"],
+                "answer_verification": {"status": "insufficient_evidence"},
+            },
+        }
+        document = {"sections": {"questions": [{**question, "context": []}]}, "metadata": {}}
+        audit = publication_audit({"audits": []}, "# Встреча — Итоги\n", [question], plan, document=document)
+        self.assertEqual(audit["unexplained_commitment_candidates"], 0)
+        self.assertEqual(audit["explained_commitment_candidates"], 1)
+        self.assertEqual(audit["question_context_missing_known_answer"], 0)
+
+        verified = dict(question)
+        verified["question_state"] = {
+            "status": "partially_answered", "answer_record_ids": ["FA"],
+            "answer_verification": {"status": "partial"},
+        }
+        document["sections"]["questions"] = [{**verified, "context": []}]
+        missing = publication_audit({"audits": []}, "# Встреча — Итоги\n", [verified], {}, document=document)
+        self.assertEqual(missing["question_context_missing_known_answer"], 1)
+
+        document["semantic_audit"] = {"abstentions": [{
+            "node": {"node_id": "context:questions:1:1", "role": "known_answer"},
+            "review": {"verdict": "insufficient_evidence"},
+        }]}
+        explained = publication_audit({"audits": []}, "# Встреча — Итоги\n", [verified], {}, document=document)
+        self.assertEqual(explained["question_context_missing_known_answer"], 0)
+
+    def test_model_authored_acronym_expansion_is_removed(self):
+        claim = {
+            "statement": "Можно отключить SM (Structure Maker) на четырёх часах.",
+            "evidence_ids": ["U1"],
+            "dialogue_evidence": [{"id": "U1", "text": "Можно отключить SM на четырёх часах."}],
+        }
+        self.assertEqual(public_surface_text(claim), "Можно отключить SM на четырёх часах.")
+
+    def test_rejected_public_items_are_quarantined_with_full_audit(self):
+        items = [{"public_id": "PI1"}, {"public_id": "PI2"}]
+        report = {"audits": [
+            {"passed": True, "errors": []},
+            {"passed": False, "errors": ["qa_slot_failure"]},
+        ]}
+        retained, rejected = partition_verified_public_items(items, report)
+        self.assertEqual([item["public_id"] for item in retained], ["PI1"])
+        self.assertEqual(rejected[0]["public_item"]["public_id"], "PI2")
+        self.assertEqual(rejected[0]["audit"]["errors"], ["qa_slot_failure"])
+
+    def test_group_plan_time_scope_does_not_leak_between_claims(self):
+        plan = {
+            "claim_ids": ["C1", "C2"], "relation_ids": [], "allowed_numbers": ["1"],
+            "allowed_relation_markers": [], "allowed_speakers": [], "allowed_assignees": [],
+            "polarity": ["positive", "positive"], "modality": ["certain", "certain"],
+            "conditions": [], "time_scope": ["1 месяц"],
+        }
+        claims = [
+            {"claim_id": "C1", "statement": "Можно проверить спотовую стратегию.", "lifecycle": "active"},
+            {"claim_id": "C2", "statement": "Нужны данные за месяц.", "time_scope": "1 месяц", "lifecycle": "active"},
+        ]
+        item = {"section": "minutes", "text": claims[0]["statement"], "claim_ids": ["C1"]}
+        result = verify_generated_items([item], [plan], claims)
+        self.assertTrue(result["passed"], result)
+        month_item = {"section": "minutes", "text": claims[1]["statement"], "claim_ids": ["C2"]}
+        result = verify_generated_items([month_item], [plan], claims)
+        self.assertTrue(result["passed"], result)
 
     def test_actor_swap_is_rejected_outside_task_view(self):
         claim = {"claim_id": "C1", "statement": "@A должен доставить документ для @B", "speaker_refs": ["@A", "@B"]}

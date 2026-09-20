@@ -39,13 +39,14 @@ class IntegrityTests(unittest.TestCase):
         intervals=[{'start':1.,'end':1.15,'speaker':'A'}]
         _,result=consensus.consensus(intervals,intervals,tolerance=.3)
         self.assertTrue(result);self.assertAlmostEqual(sum(i['end']-i['start'] for i in result),.15)
-    def test_final_auditor_catches_editor_error(self):
+    def test_final_auditor_retypes_supported_content_instead_of_deleting_it(self):
         class Client:
             def chat(self,*a,**kw):return json.dumps({'reviews':[{'fact_id':'F00001','verdict':'reject','reason':'Вопрос не подтверждает завершение'}]}),{}
         with tempfile.TemporaryDirectory() as d:
             accepted,rejected=summary.audit_final_facts(Client(),'auditor',[fact()],Path(d))
-            self.assertEqual(accepted,[]);self.assertEqual(len(rejected),1)
-            self.assertTrue((Path(d)/'final-semantic-rejected.json').exists())
+            self.assertEqual(len(accepted),1);self.assertEqual(rejected,[])
+            self.assertEqual(accepted[0]['type'],'proposal')
+            self.assertEqual(accepted[0]['interpretation_status'],'retyped_after_review')
     def test_technical_token_not_invented(self):
         item=fact(statement='Обсудили алгоритм')
         d={'topics':[{'title':'Тема','items':[{'text':'Использовать M4','fact_ids':['F00001']}]}]}

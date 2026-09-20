@@ -11,6 +11,72 @@ SPEC.loader.exec_module(quality)
 
 
 class QualitySchemaTests(unittest.TestCase):
+    def test_first_person_work_onset_survives_proposal_retyping_and_model_failure(self):
+        fact = {
+            "fact_id": "F-onset", "type": "proposal",
+            "statement": "Обсуждалась структура, после чего участник начал её делать.",
+            "speaker_refs": ["@A"], "owner_refs": [], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A", "text": "Я структуру пошёл делать."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({}, fact)
+        self.assertEqual(record["assignees"], ["@A"])
+        self.assertEqual(record["assignment_status"], "unconfirmed")
+        self.assertEqual(len(record["actions"]), 1)
+        self.assertEqual(record["actions"][0]["actor"], "@A")
+        self.assertEqual(record["actions"][0]["predicate"].casefold(), "делать")
+        self.assertEqual(record["actions"][0]["object"].casefold(), "структуру")
+        self.assertEqual(record["actions"][0]["temporal_state"], "in_progress")
+        self.assertEqual(record["actions"][0]["commitment_state"], "unknown")
+
+    def test_work_onset_about_another_person_does_not_assign_the_speaker(self):
+        fact = {
+            "fact_id": "F-third-person", "type": "proposal",
+            "statement": "Обсуждалось начало работы над панелью.",
+            "speaker_refs": ["@A"], "owner_refs": [], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A", "text": "Я думаю, он начал делать панель."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({}, fact)
+        self.assertEqual(record["assignees"], [])
+        self.assertEqual(record["actions"], [])
+
+    def test_source_first_person_commitment_restores_owner_after_editorial_rewrite(self):
+        fact = {
+            "fact_id": "F-demo", "type": "action",
+            "statement": "Участник подготовит демонстрацию или отправит файл.",
+            "speaker_refs": ["@A"], "owner_refs": [], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A",
+                          "text": "К следующему разу я подготовлю демонстрацию или отправлю файл."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"actions": [{
+            "predicate": "prepare_or_send", "temporal_state": "unknown",
+            "commitment_state": "unknown", "evidence_ids": ["U1"],
+        }]}, fact)
+        self.assertEqual(record["speech_act"], "commit")
+        self.assertEqual(record["assignees"], ["@A"])
+        self.assertEqual(record["commitment_actor"], "@A")
+        self.assertEqual(len(record["actions"]), 1)
+        self.assertEqual(record["actions"][0]["temporal_state"], "planned")
+        self.assertEqual(record["actions"][0]["commitment_state"], "explicit_commitment")
+
+    def test_source_past_attempt_overrides_model_in_progress_label(self):
+        fact = {
+            "fact_id": "F-past", "type": "action", "statement": "Проверка через модель.",
+            "speaker_refs": ["@A"], "owner_refs": [], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A",
+                          "text": "Я попробовал решить это через модель; это то, чем я занимался."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"actions": [{
+            "predicate": "проверить", "temporal_state": "in_progress",
+            "commitment_state": "explicit_commitment", "evidence_ids": ["U1"],
+        }]}, fact)
+        self.assertEqual(record["assignees"], ["@A"])
+        self.assertEqual(record["actions"][0]["temporal_state"], "past_attempt")
+        self.assertEqual(record["actions"][0]["commitment_state"], "none")
+
     def test_structured_time_expression_is_normalized_to_text(self):
         fact = {
             "fact_id": "F00001", "type": "action", "statement": "Сделать отчёт",
@@ -135,6 +201,95 @@ class QualitySchemaTests(unittest.TestCase):
         self.assertEqual(record["assignees"], ["@Misha"])
         self.assertEqual(record["assignment_status"], "unconfirmed")
 
+    def test_two_source_actions_survive_one_opaque_model_frame(self):
+        fact = {
+            "fact_id": "F-order", "type": "action",
+            "statement": "Создать разметчик и затем провести эксперименты.",
+            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"],
+            "evidence_ids": ["U1"],
+            "evidence": [{
+                "id": "U1", "speaker": "@Misha",
+                "text": "Мне сделать тебе разметчик Order Block и пойти экспериментировать с имбалансами?",
+            }],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"actions": [{
+            "action_id": "opaque", "actor": "@Misha",
+            "predicate": "create_order_block_marker_tool", "object": None,
+            "recipient": None, "temporal_state": "planned",
+            "commitment_state": "unknown", "evidence_ids": ["U1"],
+            "actor_evidence_ids": ["U1"], "predicate_evidence_ids": ["U1"],
+        }]}, fact)
+        self.assertEqual(len(record["actions"]), 2)
+        self.assertEqual(
+            [item["predicate"].casefold() for item in record["actions"]],
+            ["сделать", "экспериментировать"],
+        )
+        self.assertTrue(all(item["actor"] == "@Misha" for item in record["actions"]))
+
+    def test_single_source_action_replaces_extra_opaque_model_frames(self):
+        fact = {
+            "fact_id": "F-demo", "type": "action",
+            "statement": "Подготовить демонстрацию результата.",
+            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "evidence_ids": ["U1"],
+            "evidence": [{
+                "id": "U1", "speaker": "@Yachoy",
+                "text": "Я подготовлю это в TradingView.",
+            }],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"actions": [
+            {"predicate": "commit_prepare_tradingview_works", "actor": "@Yachoy", "evidence_ids": ["U1"]},
+            {"predicate": "show_demo_to_team", "actor": "@Yachoy", "evidence_ids": ["U1"]},
+        ]}, fact)
+        self.assertEqual(len(record["actions"]), 1)
+        self.assertEqual(record["actions"][0]["predicate"].casefold(), "подготовлю")
+
+    def test_delivery_alternatives_remain_one_task_clause(self):
+        fact = {
+            "fact_id": "F-alternative", "type": "action",
+            "statement": "Подготовить демонстрацию или передать файл.",
+            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "evidence_ids": ["U1"],
+            "evidence": [{
+                "id": "U1", "speaker": "@Yachoy",
+                "text": "Я подготовлю в TradingView или отправлю EXE-файл.",
+            }],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"actions": [{
+            "predicate": "prepare_demo", "actor": "@Yachoy", "evidence_ids": ["U1"],
+        }]}, fact)
+        self.assertEqual(len(record["actions"]), 1)
+        self.assertIn("или отправлю EXE-файл", record["actions"][0]["object"])
+
+    def test_model_action_type_does_not_turn_an_assertion_into_commitment(self):
+        fact = {
+            "fact_id": "F-state", "type": "action",
+            "statement": "Система добавляет отметку на график.",
+            "speaker_refs": ["@A"], "owner_refs": ["@A"],
+            "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A", "text": "Система добавляет отметку на график."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({"speech_act": "commit", "actions": [{
+            "predicate": "добавляет", "actor": "@A", "temporal_state": "in_progress",
+            "commitment_state": "unknown", "evidence_ids": ["U1"],
+        }]}, fact)
+        self.assertEqual(record["speech_act"], "assert")
+
+    def test_conditional_instruction_is_typed_as_rule_without_domain_vocabulary(self):
+        fact = {
+            "fact_id": "F-rule", "type": "proposal",
+            "statement": "Если запись просрочена, уведомление отправляется автоматически.",
+            "speaker_refs": ["@A"], "owner_refs": [], "evidence_ids": ["U1"],
+            "evidence": [{"id": "U1", "speaker": "@A", "text": "Если запись просрочена, уведомление отправляется автоматически."}],
+            "uncertainty": {"needs_review": False},
+        }
+        record = quality.normalize_semantic_record({}, fact)
+        self.assertEqual(record["content_kind"], "system_rule")
+
     def test_task_is_separate_record(self):
         record = {
             "record_id": "F00007", "kind": "action", "statement": "Проверить данные",
@@ -147,6 +302,7 @@ class QualitySchemaTests(unittest.TestCase):
         self.assertEqual(task["task_id"], "T00007")
         self.assertEqual(task["assignees"], ["B"])
         self.assertTrue(task["automation_eligible"])
+        self.assertEqual(task["automation_status"], "eligible")
 
     def test_tasks_are_sorted_by_source_time(self):
         def record(record_id, start):
@@ -170,6 +326,7 @@ class QualitySchemaTests(unittest.TestCase):
         }
         task = quality.task_records([record])[0]
         self.assertFalse(task["automation_eligible"])
+        self.assertEqual(task["automation_status"], "unknown")
 
     def test_question_status_requires_grounded_answer(self):
         fact = {

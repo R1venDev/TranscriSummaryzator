@@ -143,7 +143,8 @@ class GenerationTests(unittest.TestCase):
             self.assertLess(time.monotonic() - start, 4)
 
     def test_portable_transcript_link_without_private_server_address(self):
-        self.assertEqual(time_link(10.125, job_id=9), "[00:00:10](transcript.html#t-10125)")
+        self.assertEqual(time_link(10.125, job_id=9), "00:00:10")
+        self.assertEqual(time_link(10.125, job_id=9, base_url="https://example.test"), "[00:00:10](https://example.test/result?id=9#t-10125)")
 
     def test_final_document_mutations_are_rejected(self):
         item = {"public_id": "PI00001", "section": "overview", "text": "Нужно проверить качество сигналов.",
@@ -157,6 +158,29 @@ class GenerationTests(unittest.TestCase):
         invented = json.loads(json.dumps(document))
         invented["overview"][0]["text"] += " Сервер уничтожен."
         self.assertFalse(verify_public_document(invented, artifact, [item])["passed"])
+
+    def test_final_document_verifier_uses_renderer_normalization(self):
+        item = {
+            "public_id": "PI00001", "section": "overview",
+            "text": "Можно подключать старшие таймфремы.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "start": 10.125,
+        }
+        document = build_public_document([item], {"job_id": 9, "project": "Проект"})
+        artifact = render_public_document(document)
+        self.assertIn("старшие таймфрейм", artifact)
+        self.assertTrue(verify_public_document(document, artifact, [item])["passed"])
+
+    def test_equivalent_outcome_field_represents_chronology_item(self):
+        items = [
+            {"public_id": "PI1", "section": "minutes", "text": "@A доработать механизм обработки проигрышных сделок — статус: в работе",
+             "claim_ids": ["C1"], "evidence_ids": ["U1"], "start": 1, "end": 2, "episode_id": "E1"},
+            {"public_id": "PI2", "section": "minutes", "text": "Необходимо доработать механизм обработки проигрышных сделок.",
+             "claim_ids": ["C2"], "evidence_ids": ["U2"], "start": 2, "end": 3, "episode_id": "E1"},
+        ]
+        document = build_public_document(items, {"project": "Проект"})
+        artifact = render_public_document(document)
+        result = verify_public_document(document, artifact, items)
+        self.assertNotIn("chronology_source_item_not_rendered", result["errors"])
 
 
 if __name__ == "__main__":

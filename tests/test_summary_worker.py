@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "summary_worker.py"
@@ -26,6 +27,71 @@ def fact(kind="proposal", statement="Предложено проверить BOS
 
 
 class SummaryWorkerTests(unittest.TestCase):
+    def test_progress_never_moves_backwards_between_nested_stages(self):
+        summary._LAST_EMITTED_PROGRESS = 0.0
+        with mock.patch.object(summary, "diagnostic_event") as diagnostic, mock.patch("builtins.print"):
+            summary.emit(75.0, "summary_public_audit", "public done")
+            summary.emit(73.1, "summary_structure", "structure started")
+        reported = [call.kwargs["metrics"]["progress"] for call in diagnostic.call_args_list]
+        self.assertEqual(reported, [75.0, 75.0])
+        summary._LAST_EMITTED_PROGRESS = 0.0
+
+    def test_candidate_lineage_prefers_exact_action_then_safe_rekey(self):
+        claims = [
+            {"claim_id": "C-base", "statement": "Проверить сервис.",
+             "evidence_ids": ["U1"], "origin_ids": ["OR1"]},
+            {"claim_id": "C-action", "statement": "Проверить сервис.",
+             "evidence_ids": ["U1"], "origin_ids": ["OR1:A01"]},
+            {"claim_id": "C-rekey", "statement": "Свинги требуют две свечи.",
+             "evidence_ids": ["U2"], "origin_ids": ["OR-new"]},
+        ]
+        origins = {claim["claim_id"]: set(claim["origin_ids"]) for claim in claims}
+        matched, mode = summary.matching_candidate_claims(
+            {"origin_id": "OR1:A01", "statement": "Проверить сервис.", "evidence_ids": ["U1"]},
+            claims, origins,
+        )
+        self.assertEqual([claim["claim_id"] for claim in matched], ["C-action"])
+        self.assertEqual(mode, "exact_origin")
+
+        matched, mode = summary.matching_candidate_claims(
+            {"origin_id": "OR-old", "statement": "Свинги требуют две свечи.", "evidence_ids": ["U2"]},
+            claims, origins,
+        )
+        self.assertEqual([claim["claim_id"] for claim in matched], ["C-rekey"])
+        self.assertEqual(mode, "semantic_rekey")
+
+    def test_optional_global_cache_write_failure_does_not_retry_valid_response(self):
+        class Client:
+            calls = 0
+
+            def model_digest(self, _model):
+                return "digest"
+
+            def chat(self, *_args, **_kwargs):
+                self.calls += 1
+                return json.dumps({"value": "ok"}), {"done": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_cache = root / "run" / "response.json"
+            global_root = root / "global"
+            original_atomic_json = summary.atomic_json
+
+            def selective_atomic_json(path, value):
+                if Path(path).is_relative_to(global_root):
+                    raise PermissionError("read-only shared cache")
+                return original_atomic_json(path, value)
+
+            client = Client()
+            with mock.patch.object(summary, "GLOBAL_LLM_CACHE_ROOT", global_root), \
+                    mock.patch.object(summary, "atomic_json", side_effect=selective_atomic_json):
+                result = summary.call_json_with_retries(
+                    client, "model", "system", "prompt", run_cache, attempts=2,
+                )
+            self.assertEqual(result["response"], {"value": "ok"})
+            self.assertEqual(client.calls, 1)
+            self.assertTrue(run_cache.is_file())
+
     def test_evidence_repair_uses_only_work_tree_for_download_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -74,15 +140,15 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_rejected_revision_is_terminal_despite_origin_rewrite(self):
         denials = [
-            {"fact": {"fact_id": "F00181", "origin_id": "ORafter",
+            {"fact": {"fact_id": "F00181", "origin_id": "ORafter", "revision_id": "RV-after",
                       "evidence_ids": ["U00302"]}, "reason": "Нет доказательств решения."},
-            {"fact": {"fact_id": "F00181", "origin_id": "ORother",
+            {"fact": {"fact_id": "F00181", "origin_id": "ORother", "revision_id": "RV-other",
                       "evidence_ids": ["U00327"]}, "reason": "Метафора, не факт."},
         ]
         reasons = summary.rejection_reason_by_revision(denials)
-        self.assertEqual(reasons[("F00181", ("U00302",))], "Нет доказательств решения.")
-        self.assertEqual(reasons[("F00181", ("U00327",))], "Метафора, не факт.")
-        self.assertNotIn(("F00180", ("U00302",)), reasons)
+        self.assertEqual(reasons["RV-after"], "Нет доказательств решения.")
+        self.assertEqual(reasons["RV-other"], "Метафора, не факт.")
+        self.assertNotIn("F00181", reasons)
 
     def test_section_and_detailed_views_are_not_limited_to_executive_facts(self):
         core = fact(statement="Основной результат встречи")
@@ -172,7 +238,8 @@ class SummaryWorkerTests(unittest.TestCase):
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
         }
         rendered = summary.render_markdown(document, [item], {"covered_seconds": 100, "total_seconds": 100})
-        self.assertIn("[00:00:10](transcript.html#t-10125)", rendered)
+        self.assertIn("00:00:10", rendered)
+        self.assertNotIn("transcript.html", rendered)
         self.assertNotIn("F00001", rendered)
 
     def test_public_renderer_has_prose_overview_timecode_index_and_detailed_chronology(self):
@@ -184,14 +251,16 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
         ]
         rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
-        self.assertIn("Bitcoin, Order Block: результаты, ограничения и следующие шаги", rendered.splitlines()[0])
+        self.assertIn("Bitcoin", rendered.splitlines()[0])
+        self.assertIn("Order Block", rendered.splitlines()[0])
+        self.assertNotIn("результаты, ограничения и следующие шаги", rendered.splitlines()[0])
         self.assertNotIn("торговой системы", rendered.splitlines()[0])
         overview = rendered.split("## Главное", 1)[1].split("## Таймкоды", 1)[0]
         self.assertNotIn("\n- ", overview)
         self.assertNotIn("/result?", overview)
         self.assertIn("## Таймкоды", rendered)
         self.assertIn("## Подробная хронология встречи", rendered)
-        self.assertIn("transcript.html#t-10000", rendered)
+        self.assertNotIn("transcript.html", rendered)
 
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
         item = fact()
@@ -332,20 +401,16 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(summary.clean_publication_statement(imbalance), imbalance["statement"])
         self.assertEqual(summary.clean_publication_statement(action), action["statement"])
 
-    def test_people_are_rendered_as_canonical_bold_handles(self):
-        rendered = summary.canonicalize_people("Николай спросил Мишу, Хоттабыч ответил Максиму и сослался на код Макса")
-        self.assertIn("**@Riven**", rendered)
-        self.assertIn("**@Misha**", rendered)
-        self.assertIn("**@HoTTaBbicH**", rendered)
-        self.assertIn("**@Yachoy / @HoTTaBbicH**", rendered)
+    def test_only_explicit_handles_are_rendered_as_bold_people(self):
+        rendered = summary.canonicalize_people("@A спросил Николая, @B ответил")
+        self.assertIn("**@A**", rendered)
+        self.assertIn("**@B**", rendered)
+        self.assertIn("Николая", rendered)
 
     def test_people_are_canonical_in_structured_text_without_markdown(self):
-        rendered = summary.canonicalize_people_plain(
-            "Николай спросил Мишу, Максим ответил Yachoy"
-        )
-        self.assertEqual(rendered, "@Riven спросил @Misha, @Yachoy / @HoTTaBbicH ответил @Yachoy")
+        rendered = summary.canonicalize_people_plain("Николай спросил Мишу, Максим ответил Yachoy")
+        self.assertEqual(rendered, "Николай спросил Мишу, Максим ответил Yachoy")
         self.assertNotIn("**", rendered)
-        self.assertNotIn("Николай", rendered)
 
     def test_all_unresolved_questions_are_retained_in_human_summary(self):
         facts = []
@@ -521,16 +586,13 @@ class SummaryWorkerTests(unittest.TestCase):
             "Возможность использовать M15 для подтверждения точки входа",
         )
 
-    def test_navigation_label_adds_context_to_session_hours(self):
+    def test_navigation_label_does_not_invent_domain_context_for_hours(self):
         item = fact(
             kind="proposal",
             statement="Первый подход — с 17 до 18, второй подход — с 16:30 до 18.",
         )
         item["topic"] = "сессия AM для индексов"
-        self.assertEqual(
-            summary.navigation_label(item),
-            "Сравнение торговых окон AM-сессии: 17:00–18:00 и 16:30–18:00",
-        )
+        self.assertEqual(summary.navigation_label(item), "")
 
     def test_navigation_rejects_editorial_doubt_and_embedded_question(self):
         doubtful = fact(statement="Факт требует перепроверки из-за контекста разговора")
@@ -659,6 +721,7 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_bare_maxim_is_marked_ambiguous(self):
         item = fact(statement="Макс посмотрел результат", evidence=[utterance(1, 1, 3, speaker="@Yachoy")])
+        item["ambiguous_person_mentions"] = ["Макс"]
         updated = summary.repair_fact_attribution(item)
         self.assertTrue(updated["uncertainty"]["needs_review"])
         self.assertIn("ambiguous_mentioned_person", updated["uncertainty"]["reasons"])
@@ -1224,6 +1287,154 @@ class SummaryWorkerTests(unittest.TestCase):
             self.assertEqual(kept[0]["verification_status"], "verification_unavailable")
             self.assertEqual(kept[0]["verification_failure_stage"], "editorial_review")
 
+    def test_semantic_structure_retains_single_fact_after_output_limit(self):
+        class Client:
+            def chat(self, *_args, **_kwargs):
+                raise RuntimeError("ответ оборван или достигнут лимит вывода")
+
+        source = fact(kind="definition", statement="Термин означает исходное состояние")
+        with tempfile.TemporaryDirectory() as directory:
+            registry = summary.build_semantic_registry(Client(), "model", [source], Path(directory))
+        self.assertEqual(len(registry["records"]), 1)
+        record = registry["records"][0]
+        self.assertEqual(record["statement"], source["statement"])
+        self.assertEqual(record["semantic_structure_status"], "verification_unavailable")
+        self.assertIn("semantic_structure_unavailable", record["uncertainty"]["reasons"])
+
+    def test_final_document_audit_inherits_exact_verified_public_item(self):
+        class Client:
+            def chat(self, *_args, **_kwargs):
+                raise AssertionError("exact verified PublicItem must not be re-audited")
+
+        item = {
+            "text": "Сервис работает в тестовом режиме.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+        }
+        document = {"sections": {"technical": [dict(item)]}}
+        with tempfile.TemporaryDirectory() as directory:
+            report = summary.audit_final_document(
+                Client(), "large-auditor", document,
+                [{"id": "U1", "speaker": "@A", "text": item["text"]}],
+                Path(directory), public_items=[item], primary_model="fast-auditor",
+            )
+        self.assertTrue(report["status"] == "passed", report)
+        self.assertEqual(report["inherited_public_item_nodes"], 1)
+        self.assertEqual(report["independently_reviewed_surfaces"], 0)
+        self.assertEqual(report["escalated_surfaces"], 0)
+
+    def test_final_document_audit_bounds_model_batches(self):
+        class Client:
+            def __init__(self):
+                self.batch_sizes = []
+                self.progress_callbacks = []
+
+            def chat(self, _model, _system, prompt, **kwargs):
+                nodes = json.loads(prompt)["nodes"]
+                self.batch_sizes.append(len(nodes))
+                self.progress_callbacks.append(kwargs.get("progress"))
+                if kwargs.get("progress"):
+                    kwargs["progress"](1)
+                return json.dumps({"reviews": [
+                    {"node_id": node["node_id"], "verdict": "supported", "reason": "source"}
+                    for node in nodes
+                ]}), {"done": True, "done_reason": "stop"}
+
+        document = {"overview": [
+            {"text": f"Подтверждённый факт {index}.", "claim_ids": [f"C{index}"],
+             "evidence_ids": [f"U{index}"]}
+            for index in range(9)
+        ]}
+        source = [
+            {"id": f"U{index}", "speaker": "@A", "text": f"Подтверждённый факт {index}."}
+            for index in range(9)
+        ]
+        client = Client()
+        with tempfile.TemporaryDirectory() as directory:
+            report = summary.audit_final_document(
+                client, "auditor", document, source, Path(directory), public_items=[],
+            )
+        self.assertEqual(client.batch_sizes, [4, 4, 1])
+        self.assertTrue(all(callable(callback) for callback in client.progress_callbacks))
+        self.assertEqual(report["status"], "passed")
+
+    def test_final_document_title_reaudit_uses_monotonic_bounded_progress_and_output(self):
+        class Client:
+            def __init__(self):
+                self.num_predict = []
+
+            def chat(self, _model, _system, prompt, **kwargs):
+                self.num_predict.append(kwargs.get("num_predict"))
+                if kwargs.get("progress"):
+                    kwargs["progress"](7)
+                node = json.loads(prompt)["nodes"][0]
+                return json.dumps({"reviews": [{
+                    "node_id": node["node_id"], "verdict": "supported",
+                    "reason": "Тема дословно подтверждена источником.",
+                }]}), {"done": True, "done_reason": "stop"}
+
+        document = {"title": {
+            "text": "Проверка торговой системы.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+        }}
+        source = [{"id": "U1", "speaker": "@A", "text": "Проверяем торговую систему."}]
+        client = Client()
+        progress = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            summary, "emit", side_effect=lambda value, *_args, **_kwargs: progress.append(value)
+        ):
+            report = summary.audit_final_document(
+                client, "auditor", document, source, Path(directory), public_items=[],
+                progress_start=96.0, progress_end=96.1,
+            )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(client.num_predict, [420])
+        self.assertEqual(progress, sorted(progress))
+        self.assertGreaterEqual(min(progress), 96.0)
+        self.assertLessEqual(max(progress), 96.1)
+
+    def test_final_document_reconciliation_quarantines_only_bad_context(self):
+        item = {
+            "text": "Сервис работает в тестовом режиме.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+            "section": "technical", "start": 10,
+        }
+        context = {
+            "text": "Это якобы решает другую проблему.",
+            "claim_ids": ["C2"], "evidence_ids": ["U2"],
+            "role": "explanation", "relation_id": "R1",
+        }
+        document = {"sections": {"technical": [{**item, "context": [context]}]}}
+        report = {
+            "status": "failed", "total_nodes": 2, "evaluated_nodes": 2,
+            "counts": {"supported": 1, "insufficient_evidence": 1},
+            "reviews": [
+                {"node_id": "section:technical:1", "verdict": "supported"},
+                {"node_id": "context:technical:1:1", "verdict": "insufficient_evidence"},
+            ],
+        }
+        repaired, reconciled = summary.reconcile_final_document_audit(document, report, [item])
+        self.assertEqual(repaired["sections"]["technical"][0]["context"], [])
+        self.assertEqual(repaired["sections"]["technical"][0]["text"], item["text"])
+        self.assertEqual(reconciled["status"], "passed")
+        self.assertEqual(reconciled["abstention_count"], 1)
+        self.assertEqual(reconciled["unresolved_node_ids"], [])
+
+    def test_final_document_reconciliation_does_not_hide_bad_public_item(self):
+        item = {
+            "text": "Неподтверждённое утверждение.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"],
+            "section": "technical", "start": 10,
+        }
+        document = {"sections": {"technical": [dict(item)]}}
+        report = {
+            "status": "failed", "total_nodes": 1, "evaluated_nodes": 1,
+            "counts": {"contradicted": 1},
+            "reviews": [{"node_id": "section:technical:1", "verdict": "contradicted"}],
+        }
+        _repaired, reconciled = summary.reconcile_final_document_audit(document, report, [])
+        self.assertEqual(reconciled["status"], "failed")
+        self.assertIn("section:technical:1", reconciled["unresolved_node_ids"])
+
     def test_final_audit_splits_when_model_omits_reviews(self):
         facts = [
             fact(statement="Первый тезис"),
@@ -1350,11 +1561,11 @@ class SummaryWorkerTests(unittest.TestCase):
             dict(fact(statement="В показанном сценарии использовалась модель M1 без задержек."), fact_id="F00002"),
         ]
         result = summary.normalize_main_topic("Обсуждение задержек на M1.", facts)
-        self.assertEqual(result, "Обсуждение задержек алгоритма на разных таймфреймах.")
+        self.assertEqual(result, "Обсуждение задержек на M1.")
 
     def test_chapter_title_does_not_assign_delay_only_to_m1(self):
         result = summary.normalize_topic_title("Анализ задержек на M1 и работа со сломов структуры")
-        self.assertEqual(result, "Задержки на разных таймфреймах и работа со сломами структуры")
+        self.assertEqual(result, "Анализ задержек на M1 и работа со сломами структуры")
 
     def test_primary_validation_splits_incomplete_response(self):
         facts = [fact(), dict(fact(statement="Второй подтверждённый тезис"), fact_id="F00002")]

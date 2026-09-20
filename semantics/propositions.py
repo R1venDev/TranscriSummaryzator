@@ -43,7 +43,10 @@ def normalize_quantity(raw, statement=""):
     value = raw.get("value") if raw.get("value") is not None else normalized.get("value")
     return {
         "value": value, "unit": raw.get("unit") or normalized.get("unit"), "entity_id": raw.get("entity_id") or raw.get("entity"),
-        "role": raw.get("role") or raw.get("kind"), "operator": raw.get("operator") or normalized.get("operator") or "unknown",
+        "role": raw.get("role") or raw.get("kind"), "dimension": raw.get("dimension") or "unknown",
+        "object_binding": raw.get("object_binding") or raw.get("entity_id") or raw.get("entity"),
+        "metric_status": raw.get("metric_status") or "defined",
+        "operator": raw.get("operator") or normalized.get("operator") or "unknown",
         "direction": raw.get("direction") or normalized.get("direction"), "source_span": raw.get("source_span") or raw.get("raw_text") or str(value or ""),
         "evidence_ids": list(raw.get("evidence_ids", [])),
     }
@@ -82,8 +85,10 @@ def proposition_signature(record, registry=None):
         "object": _clean(record.get("object")), "scope": record.get("scope") or {},
         "conditions": [{"antecedent": _clean(x["antecedent"]), "consequent": _clean(x["consequent"])} for x in conditions],
         "polarity": record.get("polarity") or ("negative" if NEGATION_RE.search(statement) else "positive"),
-        "quantities": [{k: x.get(k) for k in ("value", "unit", "entity_id", "role", "operator", "direction")} for x in quantities],
+        "quantities": [{k: x.get(k) for k in ("value", "unit", "entity_id", "role", "dimension", "object_binding", "metric_status", "operator", "direction")} for x in quantities],
         "time_scope": record.get("time_scope") or record.get("time_expression"),
+        "temporal_state": record.get("temporal_state") or "unknown",
+        "commitment_state": record.get("commitment_state") or "unknown",
         "entities": sorted(x["entity_id"] for x in entities),
         "negated_arguments": sorted(_clean(value) for value in ARGUMENT_NEGATION_RE.findall(statement)),
     }
