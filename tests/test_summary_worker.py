@@ -12,14 +12,14 @@ summary = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(summary)
 
 
-def utterance(index, start, end, speaker="@Riven", text="Текст"):
+def utterance(index, start, end, speaker="@Alpha", text="Текст"):
     return {"id": f"U{index:05d}", "start": start, "end": end, "speaker": speaker, "speaker_id": speaker, "text": text, "flags": []}
 
 
-def fact(kind="proposal", statement="Предложено проверить BOS", evidence=None):
-    evidence = evidence or [utterance(1, 10.125, 12.75, text="Предлагаю проверить BOS")]
+def fact(kind="proposal", statement="Предложено проверить ABC", evidence=None):
+    evidence = evidence or [utterance(1, 10.125, 12.75, text="Предлагаю проверить ABC")]
     return {
-        "fact_id": "F00001", "type": kind, "topic": "BOS", "statement": statement,
+        "fact_id": "F00001", "type": kind, "topic": "ABC", "statement": statement,
         "certainty": "explicit", "evidence_ids": [item["id"] for item in evidence],
         "speaker_refs": [evidence[0]["speaker"]], "start": evidence[0]["start"],
         "end": evidence[-1]["end"], "evidence": evidence, "source_chunks": [1],
@@ -133,9 +133,9 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(sum(map(len, batches)), 168)
 
     def test_empty_writer_chapter_has_one_deterministic_topic(self):
-        facts = [dict(fact(statement=f"Тезис {index}"), fact_id=f"F{index:05d}", topic="Имбалансы") for index in range(1, 6)]
+        facts = [dict(fact(statement=f"Тезис {index}"), fact_id=f"F{index:05d}", topic="Аномалии") for index in range(1, 6)]
         topic = summary.deterministic_chapter(facts, 3)
-        self.assertEqual(topic["title"], "Имбалансы")
+        self.assertEqual(topic["title"], "Аномалии")
         self.assertEqual(len(topic["items"]), 5)
 
     def test_rejected_revision_is_terminal_despite_origin_rewrite(self):
@@ -199,13 +199,13 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("10%", reason)
 
     def test_rejects_invented_profile_tag(self):
-        item = fact(statement="@Maxim должен проверить BOS")
+        item = fact(statement="@Epsilon должен проверить ABC")
         okay, reason = summary.deterministic_fact_check(item)
         self.assertFalse(okay)
-        self.assertIn("@Maxim", reason)
+        self.assertIn("@Epsilon", reason)
 
     def test_rejects_technical_marker_missing_from_evidence(self):
-        item = fact(statement="Точка BOS отображается на M4")
+        item = fact(statement="Точка ABC отображается на M4")
         okay, reason = summary.deterministic_fact_check(item)
         self.assertFalse(okay)
         self.assertIn("m4", reason)
@@ -220,19 +220,19 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_proposal_cannot_enter_decisions(self):
         item = fact(kind="proposal")
-        document = {"decisions": [{"text": "Решили проверить BOS", "fact_ids": ["F00001"]}]}
+        document = {"decisions": [{"text": "Решили проверить ABC", "fact_ids": ["F00001"]}]}
         clean, rejected = summary.sanitize_structured(document, [item])
         self.assertEqual(clean["decisions"], [])
         self.assertEqual(len(rejected), 1)
 
     def test_renderer_uses_evidence_timestamps(self):
         item = fact(
-            statement="Предложено проверить работу фильтра BOS на текущей реализации",
+            statement="Предложено проверить работу фильтра ABC на текущей реализации",
             evidence=[utterance(1, 10.125, 12.75,
-                                text="Предложено проверить работу фильтра BOS на текущей реализации")],
+                                text="Предложено проверить работу фильтра ABC на текущей реализации")],
         )
         document = {
-            "main_topic": {"text": "Обсуждение BOS", "fact_ids": ["F00001"]},
+            "main_topic": {"text": "Обсуждение ABC", "fact_ids": ["F00001"]},
             "objective": None, "overview": [],
             "chronology": [{"text": "Предложили проверку", "fact_ids": ["F00001"]}],
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
@@ -243,16 +243,16 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertNotIn("F00001", rendered)
 
     def test_public_renderer_has_prose_overview_timecode_index_and_detailed_chronology(self):
-        base = {"claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "observation", "social_state": "candidate", "lifecycle": "active", "relation_ids": [], "topic_entities": ["Order Block", "Bitcoin"]}
+        base = {"claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "observation", "social_state": "candidate", "lifecycle": "active", "relation_ids": [], "topic_entities": ["Event Mark", "Atlas"]}
         items = [
             dict(base, public_id="PI1", section="overview", text="Обсудили фильтрацию сигналов", start=10),
             dict(base, public_id="PI2", section="overview", text="Зафиксировали следующий шаг", start=20),
             dict(base, public_id="PI3", section="minutes", text="Разобрали текущую реализацию", start=10),
             dict(base, public_id="PI4", section="minutes", text="Согласовали дальнейшую проверку", start=20),
         ]
-        rendered = summary.render_public_items(items, {"source": "12.07.2026.mkv", "project": "Aurion", "job_id": 8})
-        self.assertIn("Bitcoin", rendered.splitlines()[0])
-        self.assertIn("Order Block", rendered.splitlines()[0])
+        rendered = summary.render_public_items(items, {"source": "03.04.2030.mkv", "project": "DemoProject", "job_id": 8})
+        self.assertIn("Atlas", rendered.splitlines()[0])
+        self.assertIn("Event Mark", rendered.splitlines()[0])
         self.assertNotIn("результаты, ограничения и следующие шаги", rendered.splitlines()[0])
         self.assertNotIn("торговой системы", rendered.splitlines()[0])
         overview = rendered.split("## Главное", 1)[1].split("## Таймкоды", 1)[0]
@@ -265,16 +265,16 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_compact_renderer_has_required_sections_and_no_empty_optional_sections(self):
         item = fact()
         document = {
-            "main_topic": {"text": "Встреча была посвящена проверке BOS.", "fact_ids": ["F00001"]},
+            "main_topic": {"text": "Встреча была посвящена проверке ABC.", "fact_ids": ["F00001"]},
             "objective": None, "overview": [],
-            "chronology": [{"text": "Проверили логику BOS.", "fact_ids": ["F00001"]}],
+            "chronology": [{"text": "Проверили логику ABC.", "fact_ids": ["F00001"]}],
             "topics": [], "decisions": [], "actions": [], "open_questions": [],
         }
         rendered = summary.render_markdown(
             document, [item], {"covered_seconds": 100, "total_seconds": 100},
-            metadata={"source": "12.07.2026 — встреча.mp4", "project": "Aurion", "duration_seconds": 100},
+            metadata={"source": "03.04.2030 — встреча.mp4", "project": "DemoProject", "duration_seconds": 100},
         )
-        self.assertTrue(rendered.startswith("# 12.07.2026 | Aurion — проверке BOS"))
+        self.assertTrue(rendered.startswith("# 03.04.2030 | DemoProject — проверке ABC"))
         for heading in ("## Краткое описание", "## Участники", "## Таймкоды", "## Подробное описание встречи"):
             self.assertIn(heading, rendered)
         self.assertNotIn("## Решения", rendered)
@@ -282,18 +282,18 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertNotIn("Покрытие:", rendered)
 
     def test_tasks_render_from_structured_registry(self):
-        item = fact(kind="action", statement="Проверить BOS")
+        item = fact(kind="action", statement="Проверить ABC")
         item["uncertainty"] = {"needs_review": False}
         document = {
-            "main_topic": {"text": "Проверка BOS", "fact_ids": ["F00001"]},
+            "main_topic": {"text": "Проверка ABC", "fact_ids": ["F00001"]},
             "objective": None, "overview": [], "chronology": [], "topics": [],
-            "decisions": [], "actions": [{"text": "Проверить BOS", "fact_ids": ["F00001"]}],
+            "decisions": [], "actions": [{"text": "Проверить ABC", "fact_ids": ["F00001"]}],
             "open_questions": [],
         }
         registry = {"tasks": [{
-            "description": "Проверить BOS", "title": "Проверка сигналов BOS",
-            "details": "Сопоставить ложные сигналы BOS с условиями входа.",
-            "assignees": ["@Riven"],
+            "description": "Проверить ABC", "title": "Проверка сигналов ABC",
+            "details": "Сопоставить ложные сигналы ABC с условиями входа.",
+            "assignees": ["@Alpha"],
             "assignment_status": "confirmed", "due": "до пятницы",
             "conditions": [], "source_record_id": "F00001", "evidence_ids": ["U00001"],
             "uncertainty": {"needs_review": False},
@@ -303,31 +303,31 @@ class SummaryWorkerTests(unittest.TestCase):
             semantic_registry=registry,
         )
         self.assertIn("## Задачи и следующие шаги", rendered)
-        self.assertIn("**T-01. Проверка сигналов BOS**", rendered)
-        self.assertIn("Сопоставить ложные сигналы BOS", rendered)
-        self.assertIn("**@Riven** (подтверждено)", rendered)
+        self.assertIn("**T-01. Проверка сигналов ABC**", rendered)
+        self.assertIn("Сопоставить ложные сигналы ABC", rendered)
+        self.assertIn("**@Alpha** (подтверждено)", rendered)
 
     def test_hypothesis_renders_author(self):
         item = fact(
             kind="hypothesis",
             statement="Старший таймфрейм может отфильтровать ложные сигналы",
-            evidence=[utterance(1, 10, 12, speaker="@Yachoy",
+            evidence=[utterance(1, 10, 12, speaker="@Gamma",
                                 text="Старший таймфрейм может отфильтровать ложные сигналы")],
         )
-        item["speaker_refs"] = ["@Yachoy"]
+        item["speaker_refs"] = ["@Gamma"]
         rendered = summary.render_markdown(
             {"main_topic": {"text": "Фильтрация", "fact_ids": ["F00001"]},
              "objective": None, "overview": [], "chronology": [], "topics": [],
              "decisions": [], "actions": [], "open_questions": []},
             [item], {"total_seconds": 60}, semantic_registry={"records": [], "tasks": []},
         )
-        self.assertIn("автор: **@Yachoy**", rendered)
+        self.assertIn("автор: **@Gamma**", rendered)
 
     def test_unreliable_task_is_published_as_review_candidate(self):
         item = fact(kind="action", statement="Неясное обещание что-то попробовать")
         item["uncertainty"] = {"needs_review": True, "reasons": ["overlap"]}
         registry = {"records": [], "tasks": [{
-            "description": item["statement"], "assignees": ["@Riven"],
+            "description": item["statement"], "assignees": ["@Alpha"],
             "assignment_status": "confirmed", "automation_eligible": False,
             "due": None, "conditions": [], "source_record_id": "F00001",
             "uncertainty": item["uncertainty"],
@@ -376,7 +376,7 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_malformed_asr_term_is_kept_out_of_public_summary(self):
         item = fact(
             kind="observation",
-            statement="Трёхсычный (трёхсочный) паттерн имеет маленький имбаланс",
+            statement="Трёхсычный (трёхсочный) паттерн имеет маленький аномалия",
         )
         self.assertTrue(summary.fact_needs_transcript_review(item))
         self.assertFalse(summary.fact_is_reliable_for_main(item))
@@ -392,11 +392,11 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_publication_cleanup_turns_literal_fragments_into_standalone_text(self):
         imbalance = fact(
             kind="observation",
-            statement="Может быть там три или четыре точки на одном имбалансе линии.",
+            statement="Может быть там три или четыре точки на одном аномалии линии.",
         )
         action = fact(
             kind="action",
-            statement="@Yachoy говорит, что подготовит TradingView к следующему разу или отправит EXE-файл.",
+            statement="@Gamma говорит, что подготовит демо-панель к следующему разу или отправит PDF-файл.",
         )
         self.assertEqual(summary.clean_publication_statement(imbalance), imbalance["statement"])
         self.assertEqual(summary.clean_publication_statement(action), action["statement"])
@@ -408,8 +408,8 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("Николая", rendered)
 
     def test_people_are_canonical_in_structured_text_without_markdown(self):
-        rendered = summary.canonicalize_people_plain("Николай спросил Мишу, Максим ответил Yachoy")
-        self.assertEqual(rendered, "Николай спросил Мишу, Максим ответил Yachoy")
+        rendered = summary.canonicalize_people_plain("Тестовый ведущий спросил помощника, Участник ответил Gamma")
+        self.assertEqual(rendered, "Тестовый ведущий спросил помощника, Участник ответил Gamma")
         self.assertNotIn("**", rendered)
 
     def test_all_unresolved_questions_are_retained_in_human_summary(self):
@@ -448,8 +448,8 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_detailed_chronology_covers_distant_parts_of_meeting(self):
         first = fact(
-            statement="Обсудили работу фильтра BOS на текущей реализации",
-            evidence=[utterance(1, 10, 14, text="Обсудили работу фильтра BOS на текущей реализации")],
+            statement="Обсудили работу фильтра ABC на текущей реализации",
+            evidence=[utterance(1, 10, 14, text="Обсудили работу фильтра ABC на текущей реализации")],
         )
         second = dict(
             fact(statement="Проверили задержку подтверждения структуры на M15",
@@ -464,8 +464,8 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_detail_keeps_material_before_first_salient_anchor(self):
         opening = fact(
-            kind="current_state", statement="Имбалансы пока только подсвечиваются на постобработке",
-            evidence=[utterance(1, 10, 14, text="Имбалансы пока только подсвечиваются на постобработке")],
+            kind="current_state", statement="Аномалии пока только подсвечиваются на постобработке",
+            evidence=[utterance(1, 10, 14, text="Аномалии пока только подсвечиваются на постобработке")],
         )
         anchor = dict(
             fact(kind="action", statement="Подготовить размеченные данные для симуляции на M15",
@@ -575,7 +575,7 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual([item["fact_id"] for item in points], ["F00003"])
 
     def test_navigation_label_is_standalone_and_not_a_short_fragment(self):
-        self.assertEqual(summary.navigation_label(fact(statement="Нужен BOS")), "")
+        self.assertEqual(summary.navigation_label(fact(statement="Нужен ABC")), "")
         item = fact(
             kind="proposal",
             statement="Обсуждалась возможность использовать M15 для подтверждения точки входа",
@@ -695,33 +695,33 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("не подтверждено", updated["statement"])
 
     def test_first_person_commitment_becomes_action(self):
-        evidence = [utterance(1, 1, 3, speaker="@Yachoy", text="К следующему разу я подготовлю TradingView и скину файл")]
-        item = fact(kind="proposal", statement="Необходимо подготовить TradingView и отправить файл", evidence=evidence)
+        evidence = [utterance(1, 1, 3, speaker="@Gamma", text="К следующему разу я подготовлю демо-панель и скину файл")]
+        item = fact(kind="proposal", statement="Необходимо подготовить демо-панель и отправить файл", evidence=evidence)
         updated = summary.enforce_fact_policy(item)
         self.assertEqual(updated["type"], "action")
         self.assertEqual(updated["certainty"], "explicit")
 
     def test_single_evidence_speaker_is_restored_and_invalid_reference_removed(self):
-        item = fact(statement="Сообщил о результате", evidence=[utterance(1, 1, 3, speaker="@Yachoy")])
-        item["speaker_refs"] = ["@Riven"]
+        item = fact(statement="Сообщил о результате", evidence=[utterance(1, 1, 3, speaker="@Gamma")])
+        item["speaker_refs"] = ["@Alpha"]
         updated = summary.repair_fact_attribution(item)
-        self.assertEqual(updated["speaker_refs"], ["@Yachoy"])
+        self.assertEqual(updated["speaker_refs"], ["@Gamma"])
 
     def test_action_owner_is_derived_from_first_person_commitment(self):
         item = fact(kind="action", statement="Подготовить демонстрацию",
-                    evidence=[utterance(1, 1, 3, speaker="@Yachoy", text="Я подготовлю демонстрацию")])
+                    evidence=[utterance(1, 1, 3, speaker="@Gamma", text="Я подготовлю демонстрацию")])
         updated = summary.repair_fact_attribution(item)
-        self.assertEqual(updated["owner_refs"], ["@Yachoy"])
+        self.assertEqual(updated["owner_refs"], ["@Gamma"])
 
     def test_bare_proposal_does_not_create_action_owner(self):
         item = fact(kind="action", statement="Подготовить демонстрацию",
-                    evidence=[utterance(1, 1, 3, speaker="@Yachoy", text="Нужно подготовить демонстрацию")])
+                    evidence=[utterance(1, 1, 3, speaker="@Gamma", text="Нужно подготовить демонстрацию")])
         updated = summary.repair_fact_attribution(item)
         self.assertEqual(updated["owner_refs"], [])
 
     def test_bare_maxim_is_marked_ambiguous(self):
-        item = fact(statement="Макс посмотрел результат", evidence=[utterance(1, 1, 3, speaker="@Yachoy")])
-        item["ambiguous_person_mentions"] = ["Макс"]
+        item = fact(statement="Участник посмотрел результат", evidence=[utterance(1, 1, 3, speaker="@Gamma")])
+        item["ambiguous_person_mentions"] = ["Участник"]
         updated = summary.repair_fact_attribution(item)
         self.assertTrue(updated["uncertainty"]["needs_review"])
         self.assertIn("ambiguous_mentioned_person", updated["uncertainty"]["reasons"])
@@ -740,12 +740,12 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_unclear_audio_fragment_is_not_used_as_participant_contribution(self):
         bad = fact(kind="problem", statement="Окончание фразы оборвано и требует проверки по аудио",
-                   evidence=[utterance(1, 1, 3, speaker="@Riven")])
-        bad["speaker_refs"] = ["@Riven"]
+                   evidence=[utterance(1, 1, 3, speaker="@Alpha")])
+        bad["speaker_refs"] = ["@Alpha"]
         good = dict(fact(kind="proposal", statement="Предложил проверить реализацию",
-                         evidence=[utterance(2, 5, 7, speaker="@Riven",
+                         evidence=[utterance(2, 5, 7, speaker="@Alpha",
                                              text="Предложил проверить реализацию")]), fact_id="F00002")
-        good["speaker_refs"] = ["@Riven"]
+        good["speaker_refs"] = ["@Alpha"]
         rendered = "\n".join(summary.participant_lines([bad, good]))
         self.assertEqual(rendered, "")
         self.assertNotIn("Окончание фразы", rendered)
@@ -773,7 +773,7 @@ class SummaryWorkerTests(unittest.TestCase):
         )
 
     def test_first_person_intent_cannot_be_silently_classified_as_context(self):
-        source = utterance(1, 1, 3, speaker="@Yachoy", text="Я сейчас, наверное, сделаю упор на доработку этого способа")
+        source = utterance(1, 1, 3, speaker="@Gamma", text="Я сейчас, наверное, сделаю упор на доработку этого способа")
         focused = {"index": 0, "utterances": [source], "start": 1, "end": 3}
         facts, resolved, nonfacts = summary.apply_resolution_response(
             {"facts": [], "non_facts": [{"id": "U00001", "class": "context", "reason": "контекст"}]},
@@ -785,7 +785,7 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_omitted_tentative_intent_is_recovered_as_action(self):
         source = utterance(
-            1, 10, 14, speaker="@Yachoy",
+            1, 10, 14, speaker="@Gamma",
             text="Скорее, возможно, мне нужно ещё над этим посидеть и меньше часть ИИ пилить",
         )
         facts, recovered = summary.recover_omitted_intent("U00001", [source], [])
@@ -793,22 +793,22 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["type"], "action")
         self.assertEqual(facts[0]["certainty"], "tentative")
-        self.assertEqual(facts[0]["owner_refs"], ["@Yachoy"])
+        self.assertEqual(facts[0]["owner_refs"], ["@Gamma"])
 
     def test_followup_intent_is_attached_to_nearby_action(self):
-        first = utterance(1, 10, 14, speaker="@Yachoy", text="Мне нужно ещё над этим посидеть")
-        second = utterance(2, 30, 34, speaker="@Yachoy", text="Мне надо ещё раз это попробовать")
-        existing = fact(kind="action", statement="@Yachoy намерен ещё раз проверить подход", evidence=[first])
-        existing["speaker_refs"] = ["@Yachoy"]
-        existing["owner_refs"] = ["@Yachoy"]
+        first = utterance(1, 10, 14, speaker="@Gamma", text="Мне нужно ещё над этим посидеть")
+        second = utterance(2, 30, 34, speaker="@Gamma", text="Мне надо ещё раз это попробовать")
+        existing = fact(kind="action", statement="@Gamma намерен ещё раз проверить подход", evidence=[first])
+        existing["speaker_refs"] = ["@Gamma"]
+        existing["owner_refs"] = ["@Gamma"]
         facts, recovered = summary.recover_omitted_intent("U00002", [first, second], [existing])
         self.assertTrue(recovered)
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["evidence_ids"], ["U00001", "U00002"])
 
     def test_first_person_future_with_details_becomes_action(self):
-        evidence = [utterance(1, 1, 3, speaker="@Yachoy", text="Я Bitcoin 2021 года тебе дам для симуляции")]
-        item = fact(kind="proposal", statement="Предоставить данные Bitcoin за 2021 год", evidence=evidence)
+        evidence = [utterance(1, 1, 3, speaker="@Gamma", text="Я Atlas 2029 года тебе дам для симуляции")]
+        item = fact(kind="proposal", statement="Предоставить данные Atlas за 2029 год", evidence=evidence)
         updated = summary.enforce_fact_policy(item)
         self.assertEqual(updated["type"], "action")
 
@@ -820,25 +820,25 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(summary.enforce_fact_policy(commitment)["type"], "action")
 
     def test_promoted_action_survives_second_policy_pass(self):
-        evidence = [utterance(1, 1, 3, speaker="@HoTTaBbicH", text="Order Block я буду параллельно размечивать")]
-        item = fact(kind="proposal", statement="Параллельно размечать Order Block", evidence=evidence)
+        evidence = [utterance(1, 1, 3, speaker="@Delta", text="Event Mark я буду параллельно размечивать")]
+        item = fact(kind="proposal", statement="Параллельно размечать Event Mark", evidence=evidence)
         promoted = summary.enforce_fact_policy(item)
         self.assertEqual(promoted["type"], "action")
         self.assertEqual(summary.enforce_fact_policy(promoted)["type"], "action")
 
     def test_action_statement_removes_editorial_wrapper(self):
-        text = "Обсуждалась необходимость участник Yachoy предлагает предоставить данные Bitcoin"
-        self.assertEqual(summary.concise_action_statement(text), "Предоставить данные Bitcoin")
+        text = "Обсуждалась необходимость участник Gamma предлагает предоставить данные Atlas"
+        self.assertEqual(summary.concise_action_statement(text), "Предоставить данные Atlas")
 
     def test_action_statement_removes_explanatory_lead_in(self):
-        text = "Поскольку данных уже хватит, необходимо параллельно размечать Order Blocks"
-        self.assertEqual(summary.concise_action_statement(text), "Параллельно размечать Order Blocks")
+        text = "Поскольку данных уже хватит, необходимо параллельно размечать Event Marks"
+        self.assertEqual(summary.concise_action_statement(text), "Параллельно размечать Event Marks")
 
     def test_action_statement_removes_declared_intention_wrapper(self):
-        text = "Спикер заявил о намерении подготовить TradingView и отправить EXE-файл"
+        text = "Спикер заявил о намерении подготовить демо-панель и отправить PDF-файл"
         self.assertEqual(
             summary.concise_action_statement(text),
-            "Подготовить TradingView и отправить EXE-файл",
+            "Подготовить демо-панель и отправить PDF-файл",
         )
 
     def test_recovered_action_is_made_reusable(self):
@@ -862,7 +862,7 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_long_title_ends_at_a_complete_topic(self):
         document = {"main_topic": {"text": (
-            "Статус имбалансов, анализ разворотов после пробоя барьеров, "
+            "Статус аномалий, анализ разворотов после пробоя барьеров, "
             "поведение цены после снятия минимума Лондона, тактика максимизации прибыли, "
             "стратегии входа и выхода с дополнительными фильтрами"
         )}}
@@ -946,8 +946,8 @@ class SummaryWorkerTests(unittest.TestCase):
             ("hypothesis", "При одной свече качество проседает на 8%"),
             ("observation", "При сокращении до одной свечи качество просядет на 10%"),
             ("observation", "Обсудили направление тренда"),
-            ("proposal", "Предложено проверить Bitcoin"),
-            ("action", "Параллельно размечать Order Blocks"),
+            ("proposal", "Предложено проверить Atlas"),
+            ("action", "Параллельно размечать Event Marks"),
         ]
         for index, (kind, statement) in enumerate(statements, 1):
             facts.append(dict(
@@ -960,7 +960,7 @@ class SummaryWorkerTests(unittest.TestCase):
             ))
         text = (
             "Сначала сравнили оценки 8% и 10%, затем обсудили направление тренда, "
-            "проверку Bitcoin и разметку Order Blocks."
+            "проверку Atlas и разметку Event Marks."
         )
         clean, _ = summary.sanitize_structured({
             "chronology": [{"text": text, "fact_ids": [item["fact_id"] for item in facts]}],
@@ -969,12 +969,12 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertIn("При одной свече качество проседает на 8%.", clean["chronology"][0]["text"])
 
     def test_evidence_containment_does_not_remove_additional_action(self):
-        first = fact(kind="action", statement="Параллельно размечать Order Block")
+        first = fact(kind="action", statement="Параллельно размечать Event Mark")
         second = dict(
-            fact(kind="action", statement="Order Block нужно параллельно размечать и встраивать"),
+            fact(kind="action", statement="Event Mark нужно параллельно размечать и встраивать"),
             fact_id="F00002",
             evidence_ids=["U00001", "U00002"],
-            evidence=[utterance(1, 10.125, 12.75, text="Я буду размечать Order Block"), utterance(2, 13, 14, text="Да")],
+            evidence=[utterance(1, 10.125, 12.75, text="Я буду размечать Event Mark"), utterance(2, 13, 14, text="Да")],
         )
         self.assertEqual(len(summary.deduplicate([first, second])), 2)
 
@@ -993,9 +993,9 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(merged[0]["evidence_ids"], ["U00001"])
 
     def test_owner_question_plus_local_yes_confirms_assignment(self):
-        question = utterance(1, 1, 3, speaker="@Misha", text="Мне сделать тебе разметчик Order Block?")
-        confirmation = utterance(2, 3.1, 4, speaker="@HoTTaBbicH", text="Да, дальше этап апробации")
-        item = fact(kind="proposal", statement="Misha должен сделать разметчик Order Block", evidence=[question])
+        question = utterance(1, 1, 3, speaker="@Beta", text="Мне сделать тебе разметчик Event Mark?")
+        confirmation = utterance(2, 3.1, 4, speaker="@Delta", text="Да, дальше этап апробации")
+        item = fact(kind="proposal", statement="Beta должен сделать разметчик Event Mark", evidence=[question])
         updated = summary.resolve_dialogue_commitments([item], [question, confirmation])[0]
         self.assertEqual(updated["type"], "action")
         self.assertEqual(updated.get("policy_note"), "confirmed_owner_question_promoted")
@@ -1082,17 +1082,17 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(reviewed, set())
 
     def test_backfill_guarantees_every_fact_is_used(self):
-        first = fact(kind="proposal", statement="Предложено проверить BOS")
+        first = fact(kind="proposal", statement="Предложено проверить ABC")
         second = dict(
-            fact(kind="action", statement="Подготовить TradingView"),
+            fact(kind="action", statement="Подготовить демо-панель"),
             fact_id="F00002",
             evidence_ids=["U00002"],
-            evidence=[utterance(2, 20, 24, text="Я подготовлю TradingView")],
+            evidence=[utterance(2, 20, 24, text="Я подготовлю демо-панель")],
             start=20,
             end=24,
         )
         document = {
-            "main_topic": {"text": "Обсуждение BOS", "fact_ids": ["F00001"]},
+            "main_topic": {"text": "Обсуждение ABC", "fact_ids": ["F00001"]},
             "objective": None,
             "overview": [], "chronology": [], "topics": [],
             "decisions": [], "actions": [], "open_questions": [],
@@ -1106,7 +1106,7 @@ class SummaryWorkerTests(unittest.TestCase):
         document = summary.empty_document()
         document["main_topic"] = {"text": "Общая тема", "fact_ids": ["F00001", "F00002"]}
         document["topics"] = [{
-            "title": "BOS", "items": [{"text": facts[0]["statement"], "fact_ids": ["F00001"]}],
+            "title": "ABC", "items": [{"text": facts[0]["statement"], "fact_ids": ["F00001"]}],
         }]
         repaired = summary.backfill_topic_facts(document, facts)
         self.assertEqual(summary.topic_fact_ids(repaired), {"F00001", "F00002"})
@@ -1147,9 +1147,9 @@ class SummaryWorkerTests(unittest.TestCase):
             summary.require_structural_quality(report, final=True)
 
     def test_named_topic_repair_avoids_catch_all(self):
-        item = fact(statement="Предложено проверить BOS")
+        item = fact(statement="Предложено проверить ABC")
         repaired = summary.add_missing_to_named_topics(summary.empty_document(), [item])
-        self.assertEqual(repaired["topics"][0]["title"], "BOS")
+        self.assertEqual(repaired["topics"][0]["title"], "ABC")
         self.assertNotEqual(repaired["topics"][0]["title"], "Дополнительные подтверждённые детали")
 
     def test_rejected_chapter_chronology_gets_evidence_safe_fallback(self):
@@ -1157,14 +1157,14 @@ class SummaryWorkerTests(unittest.TestCase):
         chapter["topics"] = [{
             "title": "Структура",
             "items": [
-                {"text": "Сначала обсудили BOS", "fact_ids": ["F00001"]},
+                {"text": "Сначала обсудили ABC", "fact_ids": ["F00001"]},
                 {"text": "Затем договорились проверить результат", "fact_ids": ["F00002"]},
             ],
         }]
         repaired = summary.ensure_chapter_chronology(chapter)
         self.assertEqual(len(repaired["chronology"]), 1)
         self.assertEqual(repaired["chronology"][0]["fact_ids"], ["F00001", "F00002"])
-        self.assertIn("Сначала обсудили BOS", repaired["chronology"][0]["text"])
+        self.assertIn("Сначала обсудили ABC", repaired["chronology"][0]["text"])
 
     def test_generated_chronology_is_replaced_by_all_sanitized_topic_items(self):
         chapter = summary.empty_document()
@@ -1207,14 +1207,14 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_unanswered_question_about_completed_work_stays_question(self):
         item = fact(
             kind="observation",
-            statement="Миша уже сделал имбалансы.",
-            evidence=[utterance(1, 1, 4, text="Ты сделал уже имбалансы, да? Если я ничего не путаю.")],
+            statement="Помощник уже сделал аномалии.",
+            evidence=[utterance(1, 1, 4, text="Ты сделал уже аномалии, да? Если я ничего не путаю.")],
         )
         class Client:
             def chat(self, *args, **kwargs):
                 return json.dumps({"reviews": [{
                     "fact_id": "F00001", "verdict": "corrected", "type": "question",
-                    "statement": "У Миши уточнили, завершена ли разметка имбалансов.", "evidence_ids": ["U00001"],
+                    "statement": "У помощника уточнили, завершена ли разметка аномалий.", "evidence_ids": ["U00001"],
                     "confidence": 0.9, "reason": "",
                 }]}), {}
         with tempfile.TemporaryDirectory() as directory:
@@ -1457,13 +1457,13 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(rejected, [])
 
     def test_large_public_auditor_removes_unsupported_visible_fact(self):
-        first = fact(kind="action", statement="Проверить BOS в симуляции")
-        first["owner_refs"] = ["@Riven"]
+        first = fact(kind="action", statement="Проверить ABC в симуляции")
+        first["owner_refs"] = ["@Alpha"]
         second = dict(
             fact(kind="action", statement="Отправить неподтверждённый отчёт"),
             fact_id="F00002", evidence_ids=["U00002"],
             evidence=[utterance(2, 20, 22, text="Такого действия не было")],
-            start=20, end=22, owner_refs=["@Riven"],
+            start=20, end=22, owner_refs=["@Alpha"],
         )
 
         class Client:
@@ -1482,8 +1482,8 @@ class SummaryWorkerTests(unittest.TestCase):
         self.assertEqual(details["degraded_batches"], [])
 
     def test_large_public_auditor_failure_quarantines_critical_fact(self):
-        item = fact(kind="action", statement="Проверить BOS в симуляции")
-        item["owner_refs"] = ["@Riven"]
+        item = fact(kind="action", statement="Проверить ABC в симуляции")
+        item["owner_refs"] = ["@Alpha"]
 
         class Client:
             def chat(self, *_args, **_kwargs):
@@ -1501,32 +1501,32 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_overview_uses_real_chapter_evidence(self):
         document = summary.empty_document()
         document["topics"] = [{
-            "title": "Точки входа и BOS",
+            "title": "Точки входа и ABC",
             "items": [
                 {"text": "Первый тезис", "fact_ids": ["F00001"]},
                 {"text": "Второй тезис", "fact_ids": ["F00002", "F00001"]},
             ],
         }]
         overview = summary.overview_from_chapters(document)
-        self.assertEqual(overview, [{"text": "Точки входа и BOS.", "fact_ids": ["F00001", "F00002"]}])
+        self.assertEqual(overview, [{"text": "Точки входа и ABC.", "fact_ids": ["F00001", "F00002"]}])
 
     def test_chapter_items_use_exact_validated_facts_not_model_paraphrase(self):
         facts = [
-            fact(statement="Было предложено, чтобы Максим разметил размер имбалансов."),
-            dict(fact(statement="Миша предложил показать точки на демо."), fact_id="F00002"),
+            fact(statement="Было предложено, чтобы Участник разметил размер аномалий."),
+            dict(fact(statement="Помощник предложил показать точки на демо."), fact_id="F00002"),
         ]
         chapter = summary.empty_document()
         chapter["topics"] = [{
-            "title": "Имбалансы",
+            "title": "Аномалии",
             "items": [{
-                "text": "Максим предложил разметить имбалансы и показать демо.",
+                "text": "Участник предложил разметить аномалии и показать демо.",
                 "fact_ids": ["F00001", "F00002"],
             }],
         }]
         grounded = summary.ground_chapter_items(chapter, facts)
         text = grounded["topics"][0]["items"][0]["text"]
-        self.assertIn("Было предложено, чтобы Максим", text)
-        self.assertNotIn("Максим предложил разметить", text)
+        self.assertIn("Было предложено, чтобы Участник", text)
+        self.assertNotIn("Участник предложил разметить", text)
 
     def test_conflicting_percent_facts_are_split_from_neighboring_claims(self):
         facts = [
@@ -1546,12 +1546,12 @@ class SummaryWorkerTests(unittest.TestCase):
     def test_main_topic_lists_every_chapter(self):
         document = summary.empty_document()
         document["topics"] = [
-            {"title": "Имбалансы", "items": []},
+            {"title": "Аномалии", "items": []},
             {"title": "Стоп-лоссы", "items": []},
             {"title": "Симуляция", "items": []},
         ]
         result = summary.main_topic_from_chapters(document, [fact()])
-        self.assertIn("имбалансы", result["text"])
+        self.assertIn("аномалии", result["text"])
         self.assertIn("стоп-лоссы", result["text"])
         self.assertIn("симуляция", result["text"])
 
@@ -1672,8 +1672,8 @@ class SummaryWorkerTests(unittest.TestCase):
 
     def test_critical_consensus_requires_identical_corrections(self):
         original = dict(fact(kind="decision"), confidence=.8)
-        primary = dict(original, validation="corrected", statement="Предложено проверить BOS", confidence=.9)
-        secondary = dict(original, validation="corrected", statement="Решено проверить BOS", confidence=.9)
+        primary = dict(original, validation="corrected", statement="Предложено проверить ABC", confidence=.9)
+        secondary = dict(original, validation="corrected", statement="Решено проверить ABC", confidence=.9)
         accepted, rejected = summary.critical_verifier_consensus(
             [original], [primary], [secondary], "ministral", "gemma"
         )

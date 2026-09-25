@@ -1,6 +1,20 @@
 # Архитектура TranscriSummaryzator
 
-> Актуальная архитектура работающей системы. Документ описывает production-путь `pipeline.py` + `scripts/summary_worker.py` версии `meeting-intelligence-v27`, формальные контракты, вспомогательные инструменты и эксплуатационный контур. Источником истины при расхождении документа и реализации остаются versioned contracts и исполняемые проверки репозитория.
+## Текущее состояние кода и Linux deployment — 2026-09-26
+
+| Контур | Фактическое состояние | Граница |
+|---|---|---|
+| Речь и действующий summary | `meeting-transcript.service` работает из `/mnt/shared-data/MeetingTranscript`, основа `87adbbe` с серверными runtime-изменениями. В нём остаётся legacy summary на локальных моделях. | Код `main` не равен автоматически текущему исполняемому release. Изменения summary не должны запускать ASR/диаризацию повторно. |
+| Удаление записей | Серверный dashboard использует `record_dashboard_wrapper.py` через systemd drop-in и актуальную разметку `dashboard.html`. | Обёртка удаляет terminal legacy-записи; output, связанный с Luna ledger, она отклоняет HTTP 409 даже после accepted. Совмещённый rollout пока не покрыт. Deployment-настройки и данные не публикуются в Git. |
+| Luna Batch | Отдельный release `/mnt/shared-data/transcri-work/summary-luna-openrouter` на `4ada035`; dashboard и scheduler изолированы. `summary_backend: luna_batch` выбирается явной конфигурацией, пример оставляет `legacy_local`. | Синтетический Batch smoke принят; полный Batch зарегистрирован, но его terminal результат и смысловая приёмка на последнем checkpoint не подтверждены. Production не переключён. |
+
+Этот репозиторий содержит оба summary-маршрута. Для нового пути входом служит **готовый** `transcript.json` с существующими U ID, speaker/time metadata. `summary/luna_v1/source.py` готовит один канонический текст; `prompt_v1.md` и `output_schema_v1.json` задают один типизированный документ. `scripts/luna_summary_worker.py` отправляет его через backend OpenRouter Batch и ведёт приватный ledger; `summary/luna_v1/publication.py` публикует поколение атомарно после локальных проверок. `summary/luna_v1/tasks.py` хранит ручные версии карточек с необязательным исполнителем. Markdown, HTML, JSON и локальный task export строятся из одного effective state. Ключи вводятся через защищённый `/summary-settings` и хранятся на сервере в зашифрованном store. Никакая часть этого пути не подключает Plane.
+
+Пользователь разрешил OpenRouter Batch с хранением входа и результата до 30 дней и **без provider ZDR**. Это внешний inference только для summary; аудио, voice embeddings и полный evidence ledger туда не передаются. Локальный общий недельный предел $1 и резерв до отправки описаны в [документе Batch](docs/SUMMARY_LUNA_BATCH.md). Состояние чужого провайдера, фактический счёт и качество результата устанавливаются по terminal ledger и источниковой проверке, а не по этому описанию.
+
+### Legacy v27: архитектура прежнего действующего summary
+
+Ниже сохранена подробная карта v27. Она описывает **legacy** summary и речевой pipeline, но не делает его единственной актуальной архитектурой `main` и не подтверждает, что checkout `main` развёрнут в production. При расхождении с release определяющими остаются его исполняемый код, конфигурация и проверенные артефакты. Контракт Luna Batch приведён выше и в отдельной документации.
 
 ## 1. Назначение системы
 
@@ -520,7 +534,7 @@ Episode boundary объединяет паузу, lexical/entity shift, question
 
 `MeetingStateSchema/v2` остаётся read-only compatibility projection для старых consumers.
 
-## 12. Production summary pipeline v27
+## 12. Legacy summary pipeline v27
 
 ### 12.1 Вход и run identity
 
@@ -973,7 +987,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 `evaluation.semantic_metrics` дополнительно определяет release architecture metrics для propositions, relations, states, corrections, quantities, episodes, threads, rules и open questions.
 
-## 26. Что является production path, а что нет
+## 26. Что являлось production path в архитектуре v27
 
 ### Production
 

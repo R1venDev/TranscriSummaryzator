@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Карточки задач — TranscriSummaryzator</title>
+  <style>
+    :root{color-scheme:dark;font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,sans-serif}
+    *{box-sizing:border-box}body{margin:0;background:#0c0e13;color:#eef1f7}
+    main{width:min(1000px,calc(100% - 32px));margin:30px auto 70px}
+    nav{display:flex;gap:10px;flex-wrap:wrap}nav a,button{border:1px solid #43516d;border-radius:10px;padding:9px 13px;background:#252b37;color:#e5efff;text-decoration:none;cursor:pointer;font:inherit}
+    button.primary{background:#266bd1;border-color:#266bd1;color:#fff;font-weight:700}button:disabled{opacity:.5;cursor:wait}
+    h1{font-size:28px;margin:28px 0 5px}h2{font-size:20px;margin:0 0 14px}p{margin:7px 0}.muted{color:#abb4c5}
+    .banner{padding:12px 16px;border-radius:10px;background:#1a2638;margin:18px 0}.banner.error{background:#48252a;color:#ffdade}
+    .card{background:#171a22;border:1px solid #30394a;border-radius:16px;padding:20px;margin:18px 0}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+    label{display:block;font-weight:600;color:#d2dbea}label.wide{grid-column:1/-1}
+    input,textarea,select{width:100%;margin-top:5px;border:1px solid #44516a;border-radius:8px;background:#0e131b;color:#f5f7fa;padding:9px 11px;font:inherit}
+    textarea{min-height:115px;resize:vertical}.source{margin:15px 0;border:1px solid #374456;border-radius:8px;padding:8px 12px}
+    .source summary{cursor:pointer;color:#b8d8ff}.quote{border-left:3px solid #547bb5;padding-left:10px;margin:8px 0;white-space:pre-wrap}
+    .actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:16px}.status{min-height:24px}.status.error{color:#ffb3bd}.status.success{color:#7de3ad}
+    @media(max-width:650px){.grid{grid-template-columns:1fr}}
+  </style>
+  <script src="/summary-tasks.js" defer></script>
+</head>
+<body>
+  <main>
+    <nav><a id="summaryLink" href="/">← Конспект</a><a id="resultLink" href="/">Стенограмма</a></nav>
+    <h1>Карточки задач</h1>
+    <p class="muted">Сохранённая генерация остаётся неизменной. Ручные правки создают новую ревизию карточки и сразу отражаются в конспекте и экспортах без запроса к модели.</p>
+    <div id="notice" class="banner" role="status">Загружаю выбранную версию…</div>
+    <section id="cards" aria-label="Карточки"></section>
+  </main>
+</body>
+</html>

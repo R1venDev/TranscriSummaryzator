@@ -80,9 +80,9 @@ class QualitySchemaTests(unittest.TestCase):
     def test_structured_time_expression_is_normalized_to_text(self):
         fact = {
             "fact_id": "F00001", "type": "action", "statement": "Сделать отчёт",
-            "speaker_refs": ["@Riven"], "owner_refs": ["@Riven"],
+            "speaker_refs": ["@Alpha"], "owner_refs": ["@Alpha"],
             "evidence_ids": ["U00001"],
-            "evidence": [{"id": "U00001", "speaker": "@Riven", "text": "Я сделаю отчёт"}],
+            "evidence": [{"id": "U00001", "speaker": "@Alpha", "text": "Я сделаю отчёт"}],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record(
@@ -107,16 +107,16 @@ class QualitySchemaTests(unittest.TestCase):
     def test_assignee_requires_known_speaker_and_confirmation(self):
         fact = {
             "fact_id": "F00001", "type": "action", "statement": "Сделать отчёт",
-            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"], "evidence_ids": ["U00001", "U00002"],
-            "evidence": [{"id": "U00001", "speaker": "@Misha"}, {"id": "U00002", "speaker": "@Riven"}],
+            "speaker_refs": ["@Beta"], "owner_refs": ["@Beta"], "evidence_ids": ["U00001", "U00002"],
+            "evidence": [{"id": "U00001", "speaker": "@Beta"}, {"id": "U00002", "speaker": "@Alpha"}],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({
-            "assignees": ["@Misha", "@Invented"],
+            "assignees": ["@Beta", "@Invented"],
             "confirmation_evidence_ids": ["U00002", "U99999"],
             "conditions": [{"text": "после проверки", "evidence_ids": ["U00001"]}],
         }, fact)
-        self.assertEqual(record["assignees"], ["@Misha"])
+        self.assertEqual(record["assignees"], ["@Beta"])
         self.assertEqual(record["confirmation_evidence_ids"], [])
         self.assertEqual(record["confirmation_utterances"], [])
         self.assertEqual(record["assignment_status"], "unconfirmed")
@@ -139,13 +139,13 @@ class QualitySchemaTests(unittest.TestCase):
 
     def test_non_condition_and_non_numeric_quantity_are_rejected(self):
         fact = {
-            "fact_id": "F00001", "type": "observation", "statement": "Есть небольшой имбаланс",
+            "fact_id": "F00001", "type": "observation", "statement": "Есть небольшой аномалия",
             "speaker_refs": ["A"], "evidence_ids": ["U1"],
-            "evidence": [{"id": "U1", "speaker": "A", "text": "Есть небольшой имбаланс"}],
+            "evidence": [{"id": "U1", "speaker": "A", "text": "Есть небольшой аномалия"}],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({
-            "conditions": [{"text": "небольшой имбаланс", "evidence_ids": ["U1"]}],
+            "conditions": [{"text": "небольшой аномалия", "evidence_ids": ["U1"]}],
             "quantities": [{"value": "small", "evidence_ids": ["U1"]}],
             "proposed_by": ["A"],
         }, fact)
@@ -179,43 +179,43 @@ class QualitySchemaTests(unittest.TestCase):
     def test_unconfirmed_assignee_is_visible(self):
         fact = {
             "fact_id": "F00001", "type": "action", "statement": "Сделать отчёт",
-            "speaker_refs": ["@Misha"], "evidence_ids": ["U00001"],
-            "evidence": [{"speaker": "@Misha"}], "uncertainty": {"needs_review": False},
+            "speaker_refs": ["@Beta"], "evidence_ids": ["U00001"],
+            "evidence": [{"speaker": "@Beta"}], "uncertainty": {"needs_review": False},
         }
-        record = quality.normalize_semantic_record({"assignees": ["@Misha"]}, fact)
+        record = quality.normalize_semantic_record({"assignees": ["@Beta"]}, fact)
         self.assertEqual(record["assignees"], [])
         self.assertEqual(record["assignment_status"], "unknown")
         self.assertTrue(record["uncertainty"]["needs_review"])
 
     def test_nearby_speaker_cannot_replace_audited_task_owner(self):
         fact = {
-            "fact_id": "F00126", "type": "action", "statement": "Миша сделает разметчик",
-            "speaker_refs": ["@Misha", "@HoTTaBbicH"], "owner_refs": ["@Misha"],
+            "fact_id": "F00126", "type": "action", "statement": "Помощник сделает разметчик",
+            "speaker_refs": ["@Beta", "@Delta"], "owner_refs": ["@Beta"],
             "evidence_ids": ["U1", "U2"],
-            "evidence": [{"id": "U1", "speaker": "@Misha"}, {"id": "U2", "speaker": "@HoTTaBbicH"}],
+            "evidence": [{"id": "U1", "speaker": "@Beta"}, {"id": "U2", "speaker": "@Delta"}],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({
-            "assignees": ["@HoTTaBbicH"], "confirmation_evidence_ids": ["U2"],
+            "assignees": ["@Delta"], "confirmation_evidence_ids": ["U2"],
         }, fact)
-        self.assertEqual(record["assignees"], ["@Misha"])
+        self.assertEqual(record["assignees"], ["@Beta"])
         self.assertEqual(record["assignment_status"], "unconfirmed")
 
     def test_two_source_actions_survive_one_opaque_model_frame(self):
         fact = {
             "fact_id": "F-order", "type": "action",
             "statement": "Создать разметчик и затем провести эксперименты.",
-            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"],
+            "speaker_refs": ["@Beta"], "owner_refs": ["@Beta"],
             "evidence_ids": ["U1"],
             "evidence": [{
-                "id": "U1", "speaker": "@Misha",
-                "text": "Мне сделать тебе разметчик Order Block и пойти экспериментировать с имбалансами?",
+                "id": "U1", "speaker": "@Beta",
+                "text": "Мне сделать тебе разметчик Event Mark и пойти экспериментировать с аномалиями?",
             }],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({"actions": [{
-            "action_id": "opaque", "actor": "@Misha",
-            "predicate": "create_order_block_marker_tool", "object": None,
+            "action_id": "opaque", "actor": "@Beta",
+            "predicate": "create_event_marker_tool", "object": None,
             "recipient": None, "temporal_state": "planned",
             "commitment_state": "unknown", "evidence_ids": ["U1"],
             "actor_evidence_ids": ["U1"], "predicate_evidence_ids": ["U1"],
@@ -225,23 +225,23 @@ class QualitySchemaTests(unittest.TestCase):
             [item["predicate"].casefold() for item in record["actions"]],
             ["сделать", "экспериментировать"],
         )
-        self.assertTrue(all(item["actor"] == "@Misha" for item in record["actions"]))
+        self.assertTrue(all(item["actor"] == "@Beta" for item in record["actions"]))
 
     def test_single_source_action_replaces_extra_opaque_model_frames(self):
         fact = {
             "fact_id": "F-demo", "type": "action",
             "statement": "Подготовить демонстрацию результата.",
-            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "speaker_refs": ["@Gamma"], "owner_refs": ["@Gamma"],
             "evidence_ids": ["U1"],
             "evidence": [{
-                "id": "U1", "speaker": "@Yachoy",
-                "text": "Я подготовлю это в TradingView.",
+                "id": "U1", "speaker": "@Gamma",
+                "text": "Я подготовлю это в демо-панель.",
             }],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({"actions": [
-            {"predicate": "commit_prepare_tradingview_works", "actor": "@Yachoy", "evidence_ids": ["U1"]},
-            {"predicate": "show_demo_to_team", "actor": "@Yachoy", "evidence_ids": ["U1"]},
+            {"predicate": "commit_prepare_demo_panel", "actor": "@Gamma", "evidence_ids": ["U1"]},
+            {"predicate": "show_demo_to_team", "actor": "@Gamma", "evidence_ids": ["U1"]},
         ]}, fact)
         self.assertEqual(len(record["actions"]), 1)
         self.assertEqual(record["actions"][0]["predicate"].casefold(), "подготовлю")
@@ -250,19 +250,19 @@ class QualitySchemaTests(unittest.TestCase):
         fact = {
             "fact_id": "F-alternative", "type": "action",
             "statement": "Подготовить демонстрацию или передать файл.",
-            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "speaker_refs": ["@Gamma"], "owner_refs": ["@Gamma"],
             "evidence_ids": ["U1"],
             "evidence": [{
-                "id": "U1", "speaker": "@Yachoy",
-                "text": "Я подготовлю в TradingView или отправлю EXE-файл.",
+                "id": "U1", "speaker": "@Gamma",
+                "text": "Я подготовлю в демо-панель или отправлю PDF-файл.",
             }],
             "uncertainty": {"needs_review": False},
         }
         record = quality.normalize_semantic_record({"actions": [{
-            "predicate": "prepare_demo", "actor": "@Yachoy", "evidence_ids": ["U1"],
+            "predicate": "prepare_demo", "actor": "@Gamma", "evidence_ids": ["U1"],
         }]}, fact)
         self.assertEqual(len(record["actions"]), 1)
-        self.assertIn("или отправлю EXE-файл", record["actions"][0]["object"])
+        self.assertIn("или отправлю PDF-файл", record["actions"][0]["object"])
 
     def test_model_action_type_does_not_turn_an_assertion_into_commitment(self):
         fact = {
@@ -391,7 +391,7 @@ class QualitySchemaTests(unittest.TestCase):
         base = {
             "kind": "observation", "polarity": "positive", "modality": "asserted",
             "conditions": [], "quantities": [], "time_expression": None,
-            "attributed_speakers": ["@Misha"], "proposed_by": [], "assignees": [],
+            "attributed_speakers": ["@Beta"], "proposed_by": [], "assignees": [],
             "assignment_status": "not_applicable", "confirmation_evidence_ids": [],
             "confirmation_utterances": [], "question_status": "not_applicable",
             "answer_record_ids": [], "answer_evidence_ids": [], "uncertainty": {},

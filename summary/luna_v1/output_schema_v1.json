@@ -1,0 +1,88 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["luna_summary_v1"]},
+    "meeting": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "topic": {"type": "string"},
+        "project": {"type": ["string", "null"]}
+      },
+      "required": ["topic", "project"]
+    },
+    "main": {"type": "array", "items": {"$ref": "#/$defs/sourced_text"}},
+    "timecodes": {"type": "array", "items": {"$ref": "#/$defs/navigation"}},
+    "tasks": {"type": "array", "items": {"$ref": "#/$defs/task"}},
+    "questions": {"type": "array", "items": {"$ref": "#/$defs/sourced_text"}},
+    "technical": {"type": "array", "items": {"$ref": "#/$defs/sourced_text"}},
+    "ideas": {"type": "array", "items": {"$ref": "#/$defs/sourced_text"}},
+    "verification": {"type": "array", "items": {"$ref": "#/$defs/verification"}},
+    "chapters": {"type": "array", "items": {"$ref": "#/$defs/chapter"}}
+  },
+  "required": ["schema_version", "meeting", "main", "timecodes", "tasks", "questions", "technical", "ideas", "verification", "chapters"],
+  "$defs": {
+    "sourced_text": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"text": {"type": "string"}, "source_ids": {"type": "array", "items": {"type": "string"}}},
+      "required": ["text", "source_ids"]
+    },
+    "navigation": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "topic": {"type": "string"},
+        "start_id": {"type": "string"},
+        "end_id": {"type": ["string", "null"]}
+      },
+      "required": ["topic", "start_id", "end_id"]
+    },
+    "field_sources": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "action": {"type": "array", "items": {"type": "string"}},
+        "assignee": {"type": "array", "items": {"type": "string"}},
+        "due": {"type": "array", "items": {"type": "string"}},
+        "priority": {"type": "array", "items": {"type": "string"}},
+        "recipient": {"type": "array", "items": {"type": "string"}},
+        "discussion_status": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["action", "assignee", "due", "priority", "recipient", "discussion_status"]
+    },
+    "task": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "title": {"type": "string"},
+        "description": {"type": "string"},
+        "discussion_status": {"type": "string", "enum": ["proposed", "committed", "in_progress", "unknown"]},
+        "assignee": {"type": ["string", "null"]},
+        "due": {"type": ["string", "null"]},
+        "priority": {"type": ["string", "null"]},
+        "recipient": {"type": ["string", "null"]},
+        "source_ids": {"type": "array", "items": {"type": "string"}},
+        "field_sources": {"$ref": "#/$defs/field_sources"}
+      },
+      "required": ["title", "description", "discussion_status", "assignee", "due", "priority", "recipient", "source_ids", "field_sources"]
+    },
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string"},
+        "why_unresolved": {"type": "string"},
+        "source_ids": {"type": "array", "items": {"type": "string"}}
+      },
+      "required": ["text", "why_unresolved", "source_ids"]
+    },
+    "chapter": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "topic": {"type": "string"},
+        "start_id": {"type": "string"},
+        "end_id": {"type": ["string", "null"]},
+        "summary": {"type": "string"},
+        "source_ids": {"type": "array", "items": {"type": "string"}},
+        "details": {"type": "array", "items": {"$ref": "#/$defs/sourced_text"}}
+      },
+      "required": ["topic", "start_id", "end_id", "summary", "source_ids", "details"]
+    }
+  }
+}

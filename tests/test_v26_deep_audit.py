@@ -139,10 +139,10 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_single_action_expansion_keeps_reviewed_public_statement(self):
         record = {
-            **rec(1, "action", "@Yachoy подготовит TradingView или отправит EXE-файл в ближайшее время.", "commit", speaker="@Yachoy"),
+            **rec(1, "action", "@Gamma подготовит демо-панель или отправит PDF-файл в ближайшее время.", "commit", speaker="@Gamma"),
             "actions": [{
-                "predicate": "подготовлю", "object": "TradingView, собственно, работы. Чё даю EXE-файл",
-                "actor": "@Yachoy", "temporal_state": "planned",
+                "predicate": "подготовлю", "object": "демо-панель, собственно, работы. Чё даю PDF-файл",
+                "actor": "@Gamma", "temporal_state": "planned",
                 "commitment_state": "explicit_commitment", "evidence_ids": ["U1"],
             }],
         }
@@ -153,15 +153,15 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_deictic_methodology_task_inherits_adjacent_antecedent(self):
         record = {
-            **rec(2, "action", "Потом встрою это в методичку.", "commit"),
+            **rec(2, "action", "Потом встрою это в инструкцию.", "commit"),
             "actions": [{
-                "predicate": "встрою", "object": "это в методичку", "actor": "@A",
+                "predicate": "встрою", "object": "это в инструкцию", "actor": "@A",
                 "temporal_state": "planned", "commitment_state": "explicit_commitment",
                 "evidence_ids": ["U2"],
             }],
             "dialogue_evidence": [
-                {"id": "U1", "speaker": "@A", "start": 1, "text": "Это все типы имбалансов, их четыре.", "source_word_ids": ["W1"]},
-                {"id": "U2", "speaker": "@A", "start": 2, "text": "Ну, не типы, а варианты. Потом встрою это в методичку.", "source_word_ids": ["W2"]},
+                {"id": "U1", "speaker": "@A", "start": 1, "text": "Это все типы аномалий, их четыре.", "source_word_ids": ["W1"]},
+                {"id": "U2", "speaker": "@A", "start": 2, "text": "Ну, не типы, а варианты. Потом встрою это в инструкцию.", "source_word_ids": ["W2"]},
             ],
         }
         expanded = _expand_action_records([record])[0]
@@ -172,26 +172,26 @@ class DeepAuditV26Tests(unittest.TestCase):
     def test_task_surfaces_resolve_real_recording_fragments(self):
         cases = [
             (
-                {"statement": "Потом встрою это в методичку.", "dialogue_evidence": [
-                    {"text": "Это все типы имбалансов, их четыре."},
-                    {"text": "Ну, не типы, а варианты. Потом встрою это в методичку."},
+                {"statement": "Потом встрою это в инструкцию.", "dialogue_evidence": [
+                    {"text": "Это все типы аномалий, их четыре."},
+                    {"text": "Ну, не типы, а варианты. Потом встрою это в инструкцию."},
                 ]},
-                {"deliverable": "Потом встрою это в методичку."},
-                "Встроить в методичку: варианты имбалансов; их четыре",
+                {"deliverable": "Потом встрою это в инструкцию."},
+                "Встроить в инструкцию: варианты аномалий; их четыре",
             ),
             (
-                {"statement": "@Yachoy подготовит TradingView или отправит EXE-файл.", "dialogue_evidence": [
-                    {"text": "Я подготовлю TradingView, собственно, работы. Чё даю EXE-файл."},
+                {"statement": "@Gamma подготовит демо-панель или отправит PDF-файл.", "dialogue_evidence": [
+                    {"text": "Я подготовлю демо-панель, собственно, работы. Чё даю PDF-файл."},
                 ]},
-                {"assignee": "@Yachoy", "deliverable": "@Yachoy подготовит TradingView или отправит EXE-файл."},
-                "Подготовить TradingView или передать EXE-файл",
+                {"assignee": "@Gamma", "deliverable": "@Gamma подготовит демо-панель или отправит PDF-файл."},
+                "Подготовить демо-панель или передать PDF-файл",
             ),
             (
-                {"statement": "Я Bitcoin 2021 года тебе дам.", "dialogue_evidence": [
-                    {"text": "Я Bitcoin 2021 года тебе дам."}, {"text": "Там достаточно месяца."},
+                {"statement": "Я Atlas 2029 года тебе дам.", "dialogue_evidence": [
+                    {"text": "Я Atlas 2029 года тебе дам."}, {"text": "Там достаточно месяца."},
                 ]},
-                {"deliverable": "Предоставлю данные Bitcoin 2021 года, достаточно месяца."},
-                "Предоставить данные Bitcoin; период источника — 2021 год, объём выборки — 1 месяц",
+                {"deliverable": "Предоставлю данные Atlas 2029 года, достаточно месяца."},
+                "Предоставить данные Atlas; период источника — 2029 год, объём выборки — 1 месяц",
             ),
         ]
         for claim, state, expected in cases:
@@ -200,16 +200,16 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_second_person_marker_and_imbalance_experiment_remain_separate_tasks(self):
         claim = {
-            "statement": "Мне сделать тебе разметчик Order Block и пойти экспериментировать с имбалансами?",
-            "dialogue_evidence": [{"text": "Мне сделать тебе разметчик Order Block?"}],
+            "statement": "Мне сделать тебе разметчик Event Mark и пойти экспериментировать с аномалиями?",
+            "dialogue_evidence": [{"text": "Мне сделать тебе разметчик Event Mark?"}],
         }
         marker = task_surface_text(claim, {
-            "deliverable": "Сделать тебе разметчик Order Block",
-            "action_frame": {"explicit_acceptance_actor": "@HoTTaBbicH"},
+            "deliverable": "Сделать тебе разметчик Event Mark",
+            "action_frame": {"explicit_acceptance_actor": "@Delta"},
         })
-        experiment = task_surface_text(claim, {"deliverable": "Пойти экспериментировать с имбалансами"})
-        self.assertEqual(marker, "Сделать разметчик Order Block для @HoTTaBbicH")
-        self.assertEqual(experiment, "Экспериментировать с имбалансами")
+        experiment = task_surface_text(claim, {"deliverable": "Пойти экспериментировать с аномалиями"})
+        self.assertEqual(marker, "Сделать разметчик Event Mark для @Delta")
+        self.assertEqual(experiment, "Экспериментировать с аномалиями")
 
     def test_task_surface_rules_generalize_to_unrelated_entities_and_artifacts(self):
         documentation = task_surface_text({
@@ -282,32 +282,32 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_post_render_verifier_accepts_task_projection_in_every_view(self):
         claim = {
-            "claim_id": "C1", "statement": "@Misha сделать разметчик тебе Order Block",
-            "evidence_ids": ["U1", "U2"], "speaker_refs": ["@Misha"],
+            "claim_id": "C1", "statement": "@Beta сделать разметчик тебе Event Mark",
+            "evidence_ids": ["U1", "U2"], "speaker_refs": ["@Beta"],
             "canonical_task_state_id": "T1", "lifecycle": "active",
             "dialogue_evidence": [
-                {"id": "U1", "speaker": "@Misha", "text": "Мне сделать тебе разметчик Order Block?"},
+                {"id": "U1", "speaker": "@Beta", "text": "Мне сделать тебе разметчик Event Mark?"},
                 {"id": "U2", "speaker": "@Reviewer", "text": "Да, сделай."},
             ],
         }
         state = {
-            "task_id": "T1", "assignee": "@Misha",
-            "description": "Сделать тебе разметчик Order Block",
-            "deliverable": "Сделать тебе разметчик Order Block",
+            "task_id": "T1", "assignee": "@Beta",
+            "description": "Сделать тебе разметчик Event Mark",
+            "deliverable": "Сделать тебе разметчик Event Mark",
             "status": "accepted", "evidence_ids": ["U1", "U2"],
             "acceptance_evidence_ids": ["U2"],
             "action_frame": {"explicit_acceptance_actor": "@Reviewer"},
             "field_support": {"actor": ["U1"], "predicate": ["U1"], "object": ["U1"]},
         }
-        text = "Сделать разметчик Order Block для @Reviewer"
+        text = "Сделать разметчик Event Mark для @Reviewer"
         plan = {
             "claim_ids": ["C1"], "relation_ids": [], "allowed_numbers": [],
-            "allowed_relation_markers": [], "allowed_speakers": ["@Misha"],
-            "allowed_assignees": ["@Misha"], "polarity": [], "modality": [],
+            "allowed_relation_markers": [], "allowed_speakers": ["@Beta"],
+            "allowed_assignees": ["@Beta"], "polarity": [], "modality": [],
             "conditions": [], "time_scope": [],
         }
         for section in ("overview", "tasks", "minutes"):
-            suffix = " — исполнитель: @Misha — статус: согласовано" if section == "tasks" else ""
+            suffix = " — исполнитель: @Beta — статус: согласовано" if section == "tasks" else ""
             item = {
                 "section": section, "text": text + suffix, "claim_ids": ["C1"],
                 "evidence_ids": ["U1", "U2"], "task_state_id": "T1",
@@ -318,29 +318,29 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_structured_resource_field_labels_do_not_create_added_clause(self):
         text = (
-            "Предоставить данные Bitcoin; период источника — 2021 год, "
+            "Предоставить данные Atlas; период источника — 2029 год, "
             "объём выборки — 1 месяц — исполнитель: @Owner — "
             "статус: участник взял на себя"
         )
         claim = {
-            "claim_id": "C1", "statement": "Готов предоставить данные Bitcoin.",
+            "claim_id": "C1", "statement": "Готов предоставить данные Atlas.",
             "evidence_ids": ["U1", "U2"], "speaker_refs": ["@Owner"],
             "canonical_task_state_id": "T1", "lifecycle": "active",
             "dialogue_evidence": [
-                {"id": "U1", "text": "Я Bitcoin 2021 года тебе дам."},
+                {"id": "U1", "text": "Я Atlas 2029 года тебе дам."},
                 {"id": "U2", "text": "Там достаточно 1 месяца."},
             ],
         }
         state = {
             "task_id": "T1", "assignee": "@Owner", "status": "self_committed",
-            "description": "Предоставить данные Bitcoin",
-            "deliverable": "Предоставить данные Bitcoin",
-            "current_scope": "1 месяц", "data_origin": "2021 год",
+            "description": "Предоставить данные Atlas",
+            "deliverable": "Предоставить данные Atlas",
+            "current_scope": "1 месяц", "data_origin": "2029 год",
             "evidence_ids": ["U1", "U2"], "action_frame": {},
         }
         plan = {
             "claim_ids": ["C1"], "relation_ids": [],
-            "allowed_numbers": ["2021", "1"], "allowed_relation_markers": [],
+            "allowed_numbers": ["2029", "1"], "allowed_relation_markers": [],
             "allowed_speakers": ["@Owner"], "allowed_assignees": ["@Owner"],
             "polarity": [], "modality": [], "conditions": [],
             "time_scope": ["1 месяц"],
@@ -629,9 +629,9 @@ class DeepAuditV26Tests(unittest.TestCase):
         fact = {
             "fact_id": "F-timeframe", "type": "action",
             "statement": "Подключить другие таймфреймы и анализировать последние свинги.",
-            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "speaker_refs": ["@Gamma"], "owner_refs": ["@Gamma"],
             "evidence_ids": ["U1"], "source_word_ids": ["W1"],
-            "evidence": [{"id": "U1", "speaker": "@Yachoy", "start": 1,
+            "evidence": [{"id": "U1", "speaker": "@Gamma", "start": 1,
                           "text": "Я ещё попробую подключить другие таймфреймы, не только минутный."}],
             "uncertainty": {"needs_review": False}, "verification_status": "supported",
         }
@@ -639,24 +639,24 @@ class DeepAuditV26Tests(unittest.TestCase):
         states = build_meeting_graph([record])["task_states"]
         self.assertEqual(len(states), 1)
         self.assertEqual(states[0]["status"], "intent_to_attempt")
-        self.assertEqual(states[0]["owner"], "@Yachoy")
+        self.assertEqual(states[0]["owner"], "@Gamma")
 
     def test_one_acceptance_applies_to_both_actions_in_the_same_turn(self):
         fact = {
             "fact_id": "F-marker", "type": "action",
-            "statement": "Создать разметчик Order Block и экспериментировать с имбалансами.",
-            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"],
+            "statement": "Создать разметчик Event Mark и экспериментировать с аномалиями.",
+            "speaker_refs": ["@Beta"], "owner_refs": ["@Beta"],
             "evidence_ids": ["U1", "U2"], "source_word_ids": ["W1"],
             "evidence": [
-                {"id": "U1", "speaker": "@Misha", "start": 1,
-                 "text": "Мне сделать тебе разметчик Order Block и пойти экспериментировать с имбалансами?"},
+                {"id": "U1", "speaker": "@Beta", "start": 1,
+                 "text": "Мне сделать тебе разметчик Event Mark и пойти экспериментировать с аномалиями?"},
                 {"id": "U2", "speaker": "@Recipient", "start": 2,
                  "text": "Да-да-да. Дальше этап апробации."},
             ],
             "uncertainty": {"needs_review": False}, "verification_status": "supported",
         }
         record = normalize_semantic_record({"actions": [{
-            "predicate": "create_order_block_marker_tool", "actor": "@Misha",
+            "predicate": "create_event_marker_tool", "actor": "@Beta",
             "temporal_state": "planned", "commitment_state": "unknown",
             "evidence_ids": ["U1", "U2"],
         }]}, fact)
@@ -666,36 +666,36 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_context_record_cannot_steal_acknowledgement_from_direct_proposal(self):
         proposal_turn = {
-            "id": "U2", "speaker": "@Misha", "start": 2,
-            "text": "Мне сделать разметчик Order Block и пойти экспериментировать с имбалансами?",
+            "id": "U2", "speaker": "@Beta", "start": 2,
+            "text": "Мне сделать разметчик Event Mark и пойти экспериментировать с аномалиями?",
         }
         acceptance_turn = {
             "id": "U3", "speaker": "@Recipient", "start": 3,
             "text": "Да-да-да. Дальше этап апробации.",
         }
         broad_context_record = {
-            **rec(1, "observation", "Имбалансов пока достаточно.", "assert", speaker="@Misha"),
+            **rec(1, "observation", "Аномалий пока достаточно.", "assert", speaker="@Beta"),
             "actions": [{
-                "predicate": "обсуждать имбалансы", "actor": "@Misha",
+                "predicate": "обсуждать аномалии", "actor": "@Beta",
                 "temporal_state": "unknown", "commitment_state": "unknown",
                 "evidence_ids": ["U1"],
             }],
             "dialogue_evidence": [
-                {"id": "U1", "speaker": "@Misha", "start": 1, "text": "Имбалансов пока достаточно."},
+                {"id": "U1", "speaker": "@Beta", "start": 1, "text": "Аномалий пока достаточно."},
                 proposal_turn, acceptance_turn,
             ],
         }
         fact = {
             "fact_id": "F2", "type": "action",
-            "statement": "Создать разметчик Order Block и экспериментировать с имбалансами.",
-            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"],
+            "statement": "Создать разметчик Event Mark и экспериментировать с аномалиями.",
+            "speaker_refs": ["@Beta"], "owner_refs": ["@Beta"],
             "evidence_ids": ["U2", "U3"], "source_word_ids": ["W2"],
             "evidence": [proposal_turn, acceptance_turn],
             "dialogue_evidence": [proposal_turn, acceptance_turn],
             "uncertainty": {"needs_review": False}, "verification_status": "supported",
         }
         proposal_record = normalize_semantic_record({"actions": [{
-            "predicate": "create_order_block_marker_tool", "actor": "@Misha",
+            "predicate": "create_event_marker_tool", "actor": "@Beta",
             "temporal_state": "planned", "commitment_state": "unknown",
             "evidence_ids": ["U2"],
         }]}, fact)
@@ -708,8 +708,8 @@ class DeepAuditV26Tests(unittest.TestCase):
 
     def test_same_timestamp_fact_cannot_steal_compound_proposal_acceptance(self):
         proposal_turn = {
-            "id": "U1", "speaker": "@Misha", "start": 1,
-            "text": "Мне сделать разметчик Order Block и пойти экспериментировать с имбалансами?",
+            "id": "U1", "speaker": "@Beta", "start": 1,
+            "text": "Мне сделать разметчик Event Mark и пойти экспериментировать с аномалиями?",
         }
         acceptance_turn = {
             "id": "U2", "speaker": "@Recipient", "start": 2,
@@ -717,16 +717,16 @@ class DeepAuditV26Tests(unittest.TestCase):
         }
         fact = {
             "fact_id": "F-work", "type": "proposal",
-            "statement": "Создать разметчик Order Block и экспериментировать с имбалансами.",
-            "speaker_refs": ["@Misha"], "owner_refs": ["@Misha"],
+            "statement": "Создать разметчик Event Mark и экспериментировать с аномалиями.",
+            "speaker_refs": ["@Beta"], "owner_refs": ["@Beta"],
             "evidence_ids": ["U1"], "source_word_ids": ["W1"],
             "evidence": [proposal_turn], "dialogue_evidence": [proposal_turn, acceptance_turn],
             "uncertainty": {"needs_review": False}, "verification_status": "supported",
         }
         proposal = normalize_semantic_record({"speech_act": "propose", "actions": [
-            {"predicate": "создать", "object": "разметчик Order Block", "actor": "@Misha",
+            {"predicate": "создать", "object": "разметчик Event Mark", "actor": "@Beta",
              "temporal_state": "planned", "commitment_state": "unknown", "evidence_ids": ["U1"]},
-            {"predicate": "экспериментировать", "object": "с имбалансами", "actor": "@Misha",
+            {"predicate": "экспериментировать", "object": "с аномалиями", "actor": "@Beta",
              "temporal_state": "planned", "commitment_state": "unknown", "evidence_ids": ["U1"]},
         ]}, fact)
         competing = rec(2, "proposal", "Следующий этап работы — апробация.", "propose", speaker="@Recipient")
@@ -770,7 +770,7 @@ class DeepAuditV26Tests(unittest.TestCase):
                 },
                 {
                     "claim_id": "C-action", "content_kind": "action",
-                    "statement": "@HoTTaBbicH провести дополнительный бэктест для анализа причин проигрышных сделок",
+                    "statement": "@Delta провести дополнительный бэктест для анализа причин проигрышных сделок",
                     "evidence_ids": ["U1"], "source_word_ids": ["W1"],
                     "verification_status": "supported", "lifecycle": "active",
                     "social_state": "accepted", "episode_id": "E1",
@@ -825,7 +825,7 @@ class DeepAuditV26Tests(unittest.TestCase):
         for index, (kind, section, text) in enumerate([
             ("constraint", "technical", "Разметка имеет задержку в две свечи"),
             ("observation", "experiments", "Определить теоретические сроки его появления"),
-            ("experimental_result", "experiments", "Имбалансы подсвечиваются после закрытия свечи"),
+            ("experimental_result", "experiments", "Аномалии подсвечиваются после закрытия свечи"),
         ], 1):
             items.append({
                 "public_id": f"PI{index}", "section": section, "text": text,
@@ -843,8 +843,8 @@ class DeepAuditV26Tests(unittest.TestCase):
         items = []
         for index, (kind, section, text) in enumerate([
             ("constraint", "technical", "Разметка имеет задержку в две свечи"),
-            ("observation", "overview", "Имбалансы подсвечиваются на постобработке"),
-            ("action", "tasks", "@Misha сделать разметчик Order Block"),
+            ("observation", "overview", "Аномалии подсвечиваются на постобработке"),
+            ("action", "tasks", "@Beta сделать разметчик Event Mark"),
         ], 1):
             items.append({
                 "public_id": f"PI{index}", "section": section, "text": text,
@@ -868,7 +868,7 @@ class DeepAuditV26Tests(unittest.TestCase):
         }
         candidates = _title_repair_candidates(document, audit, items)
         self.assertTrue(candidates)
-        self.assertNotIn("@Misha", candidates[0]["text"])
+        self.assertNotIn("@Beta", candidates[0]["text"])
         self.assertEqual(set(candidates[0]["claim_ids"]), {"C1", "C2"})
         repaired, reconciled = reconcile_final_document_audit(document, audit, items)
         self.assertEqual(repaired["title"], candidates[0])
@@ -920,16 +920,16 @@ class DeepAuditV26Tests(unittest.TestCase):
         fact = {
             "fact_id": "F-capability", "type": "action",
             "statement": "Добавить дополнительные инструменты.",
-            "speaker_refs": ["@Yachoy"], "owner_refs": ["@Yachoy"],
+            "speaker_refs": ["@Gamma"], "owner_refs": ["@Gamma"],
             "evidence_ids": ["U1"], "source_word_ids": ["W1"],
             "evidence": [{
-                "id": "U1", "speaker": "@Yachoy", "start": 1,
+                "id": "U1", "speaker": "@Gamma", "start": 1,
                 "text": "Я думаю, что могу добавить дополнительные инструменты.",
             }],
             "uncertainty": {"needs_review": False}, "verification_status": "supported",
         }
         record = normalize_semantic_record({"speech_act": "commit", "actions": [{
-            "predicate": "добавить", "actor": "@Yachoy",
+            "predicate": "добавить", "actor": "@Gamma",
             "temporal_state": "in_progress", "commitment_state": "explicit_commitment",
             "evidence_ids": ["U1"],
         }]}, fact)
@@ -998,15 +998,15 @@ class DeepAuditV26Tests(unittest.TestCase):
     def test_internal_action_identifier_keeps_human_task_and_counterparty_acceptance(self):
         graph = build_meeting_graph([rec(
             1, "action",
-            "Создать разметчик для Order Block, чтобы участник мог экспериментировать с имбалансами.",
-            "commit", "@Misha", origin_id="OR-order-block", assignees=["@Misha"],
+            "Создать разметчик для Event Mark, чтобы участник мог экспериментировать с аномалиями.",
+            "commit", "@Beta", origin_id="OR-event-marker", assignees=["@Beta"],
             dialogue_evidence=[
-                {"id": "U1", "start": 1, "speaker": "@Misha", "text": "Мне сделать тебе разметчик Order Block?"},
+                {"id": "U1", "start": 1, "speaker": "@Beta", "text": "Мне сделать тебе разметчик Event Mark?"},
                 {"id": "U2", "start": 2, "speaker": "@Recipient", "text": "Да-да-да. Дальше этап апробации."},
             ],
             actions=[{
-                "action_id": "A01", "actor": "@Misha",
-                "predicate": "create_order_block_marker_tool", "object": None,
+                "action_id": "A01", "actor": "@Beta",
+                "predicate": "create_event_marker_tool", "object": None,
                 "recipient": "@Recipient", "temporal_state": "planned",
                 "commitment_state": "unknown", "evidence_ids": ["U1", "U2"],
                 "field_evidence": {"actor": ["U1"], "predicate": ["U1"], "recipient": ["U1"]},
@@ -1014,9 +1014,9 @@ class DeepAuditV26Tests(unittest.TestCase):
         )])
         self.assertEqual(len(graph["task_states"]), 1)
         task = graph["task_states"][0]
-        self.assertNotIn("create_order_block_marker_tool", task["description"])
+        self.assertNotIn("create_event_marker_tool", task["description"])
         self.assertIn("Создать разметчик", task["description"])
-        self.assertEqual(task["assignee"], "@Misha")
+        self.assertEqual(task["assignee"], "@Beta")
         self.assertEqual(task["status"], "accepted")
 
     def test_semantic_equivalence_preserves_polarity_numbers_conditions_and_actor(self):
