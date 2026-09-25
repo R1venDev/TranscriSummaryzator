@@ -7,60 +7,67 @@
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif}
     *{box-sizing:border-box}
     body{margin:0;min-height:100vh;background:#0c0e13;color:#f5f7fb}
-    main{width:min(980px,calc(100% - 32px));margin:40px auto}
+    main{width:min(1600px,calc(100% - 48px));margin:48px auto}
     .page-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px}
-    h1{font-size:30px;margin:0 0 24px;letter-spacing:-.03em}
+    h1{font-size:34px;margin:0 0 24px;letter-spacing:-.03em}
     .page-head h1{margin:0}
     .nav-link{color:#b8d9ff;text-decoration:none;font-size:14px;font-weight:650;white-space:nowrap}
     .nav-link:hover{color:white}
-    h2{font-size:16px;margin:28px 0 12px;color:#aeb6c6}
-    .card{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}
+    h2{font-size:18px;margin:34px 0 14px;color:#aeb6c6}
+    .card{background:#171a22;border:1px solid #292e3b;border-radius:22px;padding:30px;box-shadow:0 16px 50px #0005}
     .upload{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:24px;border:1px dashed #46526a;transition:border-color .2s,background .2s}
     .upload.drag{border-color:#72d5ff;background:#172333}
     .upload-copy,.top>div:first-child,.job-main{min-width:0}
-    .upload-title{font-size:19px;font-weight:650}
-    .upload-help{margin-top:6px;color:#929db0;font-size:14px;line-height:1.45}
-    .upload-controls,.job-controls{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}
+    .upload-title{font-size:21px;font-weight:650}
+    .upload-help{margin-top:6px;max-width:68ch;color:#929db0;font-size:16px;line-height:1.5}
+    .upload-controls,.job-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
     .upload-controls{justify-content:flex-end}
     .upload-state{margin-top:16px}
     .hidden{display:none}
-    .field{display:grid;gap:5px;color:#929db0;font-size:12px;white-space:nowrap}
-    select{height:42px;min-width:116px;border:1px solid #3a4353;border-radius:10px;padding:0 32px 0 11px;background:#202530;color:#f5f7fb;font:600 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;cursor:pointer}
+    .field{display:grid;gap:6px;color:#929db0;font-size:13px;white-space:nowrap}
+    select{height:46px;min-width:116px;border:1px solid #3a4353;border-radius:10px;padding:0 32px 0 11px;background:#202530;color:#f5f7fb;font:600 15px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;cursor:pointer}
     select:focus-visible,.action:focus-visible{outline:2px solid #72d5ff;outline-offset:2px}
     select:disabled{opacity:.5;cursor:not-allowed}
     .top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
     .name,.job-name{font-weight:650;overflow-wrap:anywhere;word-break:break-word}
     .name{font-size:19px}
-    .job-name{font-size:15px;line-height:1.35}
+    .job-name{font-size:17px;line-height:1.4}
     .percent{flex:0 0 auto;font-size:28px;font-weight:750;color:#a9d2ff;font-variant-numeric:tabular-nums}
     .track{height:15px;margin:20px 0 14px;border-radius:99px;overflow:hidden;background:#292e3b}
     .bar{height:100%;width:0;border-radius:inherit;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .35s ease;position:relative}
     .bar.running::after{content:"";position:absolute;inset:0;background:linear-gradient(100deg,transparent 25%,#fff5 50%,transparent 75%);animation:shine 1.5s infinite}
     @keyframes shine{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
     .detail{font-size:16px;color:#cbd2df}
-    .meta{margin-top:8px;color:#858fa2;font-size:14px}
+    .meta{margin-top:8px;color:#858fa2;font-size:15px}
     .ready{color:#62d69a}.failed{color:#ff7d86}
-    .job{display:grid;grid-template-columns:54px minmax(0,1fr) auto;gap:14px;padding:16px 4px;border-top:1px solid #292e3b;align-items:center}
+    .job{display:grid;grid-template-columns:60px minmax(0,1fr);grid-template-areas:"badge main" ". controls";gap:18px;padding:22px 4px;border-top:1px solid #292e3b;align-items:start}
     .job:first-child{border-top:0}
-    .badge{padding:5px 8px;border-radius:99px;background:#252a35;font-size:12px;text-align:center;font-variant-numeric:tabular-nums}
-    .small{color:#8e98aa;font-size:13px;line-height:1.4;margin-top:4px}
-    .job-controls{justify-content:flex-end;flex:0 0 auto}
+    .badge{grid-area:badge;padding:6px 8px;border-radius:99px;background:#252a35;font-size:13px;text-align:center;font-variant-numeric:tabular-nums}
+    .job-main{grid-area:main}
+    .small{color:#8e98aa;font-size:14px;line-height:1.45;margin-top:6px}
+    .job-controls{grid-area:controls;justify-content:flex-start;min-width:0}
     .job-controls select{min-width:92px}
-    .action{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:0;border-radius:10px;padding:10px 14px;background:#2d75e8;color:white;cursor:pointer;font:600 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;text-decoration:none;white-space:nowrap;flex:0 0 auto}
+    .action{display:inline-flex;align-items:center;justify-content:center;min-height:46px;border:0;border-radius:10px;padding:12px 16px;background:#2d75e8;color:white;cursor:pointer;font:600 15px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;text-decoration:none;white-space:nowrap;flex:0 0 auto}
     .action.secondary{background:#252b37;color:#dce8f8;border:1px solid #394354}
+    .action.danger{background:#572733;color:#ffe5e9;border:1px solid #9a4c5c}
+    .action.danger:hover{background:#783442}
     .action:hover{background:#3983f7}.action.secondary:hover{background:#303949}
     .action:active{transform:translateY(1px)}.action:disabled{opacity:.5;cursor:wait;transform:none}
     .empty{color:#8e98aa;padding:12px 0}
     footer{margin:18px 4px;color:#656e7e;font-size:13px}
     iframe{display:none}
+    @media(min-width:1680px){
+      .job{grid-template-columns:60px minmax(0,1fr) 720px;grid-template-areas:"badge main controls";align-items:center}
+      .job-controls{justify-content:flex-end}
+    }
     @media(max-width:780px){
-      main{margin:24px auto}.upload{grid-template-columns:1fr;align-items:stretch}.upload-controls{justify-content:flex-start}
-      .job{grid-template-columns:48px minmax(0,1fr)}.job-controls{grid-column:2;justify-content:flex-start}
+      main{width:calc(100% - 32px);margin:24px auto}.upload{grid-template-columns:1fr;align-items:stretch}.upload-controls{justify-content:flex-start}
+      .job{grid-template-columns:48px minmax(0,1fr)}
     }
     @media(max-width:520px){
-      .card{padding:18px}.upload-controls{display:grid;grid-template-columns:1fr}.upload-controls .field,.upload-controls select,.upload-controls .action{width:100%}
-      .job{grid-template-columns:1fr}.badge{justify-self:start}.job-controls{grid-column:1;display:grid;grid-template-columns:1fr 1fr;width:100%}.job-controls .field{grid-column:1/-1}.job-controls select{width:100%}
-      .top{gap:10px}.percent{font-size:24px}
+      .page-head{flex-wrap:wrap}.card{padding:18px}.upload-controls{display:grid;grid-template-columns:1fr}.upload-controls .field,.upload-controls select,.upload-controls .action{width:100%}
+      .job{grid-template-columns:1fr;grid-template-areas:"badge" "main" "controls"}.badge{justify-self:start}.job-controls{display:grid;grid-template-columns:1fr;width:100%}.job-controls select,.job-controls .action{width:100%}.job-controls .action{white-space:normal}
+      .top{flex-direction:column;align-items:stretch;gap:10px}.percent{font-size:24px;align-self:flex-end}
     }
   </style>
 </head>
@@ -100,7 +107,33 @@ async function rerunSpeakers(button){
     button.textContent='В очереди';lastKey='';await refresh();
   }catch(error){button.textContent='Ошибка';button.title=error.message;select.disabled=false;setTimeout(()=>{button.textContent=previous;button.disabled=false;button.title=''},2500)}
 }
-history.addEventListener('click',event=>{const retry=event.target.closest('[data-rerun-speakers]');if(retry)rerunSpeakers(retry)});
+async function deleteRecord(button){
+  const id=Number(button.dataset.id),name=button.dataset.name,created_at=button.dataset.createdAt;
+  if(!Number.isSafeInteger(id)||id<1||!name||!created_at)return;
+  if(!confirm('Удалить запись «'+name+'»? Исходный файл, результаты и рабочие файлы будут удалены.'))return;
+  let password=prompt('Пароль администратора для удаления записи:');
+  if(password===null)return;
+  const bytes=new TextEncoder().encode('admin:'+password);
+  const authorization='Basic '+btoa(Array.from(bytes,b=>String.fromCharCode(b)).join(''));
+  password='';
+  button.disabled=true;
+  try{
+    const response=await fetch('/api/jobs/delete',{method:'POST',headers:{
+      'Authorization':authorization,'X-Requested-With':'TranscriSummaryzator-Admin',
+      'Content-Type':'application/json'
+    },body:JSON.stringify({id,name,created_at})});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||'Не удалось удалить запись');
+    lastKey='';
+    await refresh();
+  }catch(error){button.disabled=false;alert(error.message)}
+}
+history.addEventListener('click',event=>{
+  const retry=event.target.closest('[data-rerun-speakers]');
+  if(retry){rerunSpeakers(retry);return}
+  const removal=event.target.closest('[data-delete-job]');
+  if(removal)deleteRecord(removal);
+});
 async function refresh(){try{
   const d=await fetch('/api/status',{cache:'no-store'}).then(r=>r.json()),jobs=d.jobs||[],uploads=d.uploads||[];
   const key=JSON.stringify([d.processing_enabled,uploads,jobs.map(j=>[j.id,j.status,j.stage,j.progress,j.detail,j.error,j.output_dir,j.speaker_count,j.summary_status,j.summary_progress,j.summary_detail,j.summary_error])]);
@@ -115,7 +148,7 @@ async function refresh(){try{
     const p=Math.max(0,Math.min(100,Number(a.progress)||0)),cls=a.status==='done'?'ready':a.status==='failed'?'failed':'';
     document.querySelector('#current').innerHTML=`<div class="top"><div><div class="name">${esc(a.original_name)}</div><div class="meta">Задание №${a.id} · спикеров: ${speakerLabel(a.speaker_count)} · ${elapsed(a)}</div></div><div class="percent ${cls}">${Math.round(p)}%</div></div><div class="track"><div class="bar ${a.status==='running'?'running':''}" style="width:${p}%"></div></div><div class="detail ${cls}">${esc(a.detail||labels[a.stage]||a.stage)}${a.error?' — '+esc(a.error):''}</div>`;
   }
-  history.innerHTML=jobs.length?jobs.slice(0,12).map(j=>{const busy=j.status==='running'||j.status==='queued',summaryActive=j.summary_status==='running'||j.summary_status==='queued'||j.summary_status==='queued_force',summaryText=j.summary_status==='done'?'Саммари готово':summaryActive?`${esc(j.summary_detail||'Создаю саммари')} · ${Math.round(Number(j.summary_progress)||0)}%`:j.summary_status==='failed'?`Ошибка саммари: ${esc(j.summary_error||'неизвестная ошибка')}`:'Саммари ещё не создано';return `<div class="job"><div class="badge">${Math.round(Number(j.progress)||0)}%</div><div class="job-main"><div class="job-name">${esc(j.original_name)}</div><div class="small">${esc(j.detail||labels[j.stage]||j.stage)} · ${elapsed(j)}</div><div class="small ${j.summary_status==='failed'?'failed':''}">${summaryText}</div></div><div class="job-controls"><label class="field" for="speakers-${j.id}"><span>Спикеров</span><select id="speakers-${j.id}" ${busy?'disabled':''}>${speakerOptions(j.speaker_count)}</select></label><button class="action secondary" type="button" data-rerun-speakers data-id="${j.id}" ${busy?'disabled':''}>Переразметить</button>${j.output_dir?`<a class="action secondary" href="/summary?id=${j.id}">Саммари</a><a class="action" href="/result?id=${j.id}">Расшифровка</a>`:''}</div></div>`}).join(''):'<div class="empty">Пока нет записей.</div>';
+  history.innerHTML=jobs.length?jobs.map(j=>{const busy=j.status==='running'||j.status==='queued',summaryActive=j.summary_status==='running'||j.summary_status==='queued'||j.summary_status==='queued_force',summaryText=j.summary_status==='done'?'Саммари готово':summaryActive?`${esc(j.summary_detail||'Создаю саммари')} · ${Math.round(Number(j.summary_progress)||0)}%`:j.summary_status==='failed'?`Ошибка саммари: ${esc(j.summary_error||'неизвестная ошибка')}`:'Саммари ещё не создано';return `<div class="job"><div class="badge">${Math.round(Number(j.progress)||0)}%</div><div class="job-main"><div class="job-name">${esc(j.original_name)}</div><div class="small">${esc(j.detail||labels[j.stage]||j.stage)} · ${elapsed(j)}</div><div class="small ${j.summary_status==='failed'?'failed':''}">${summaryText}</div></div><div class="job-controls"><label class="field" for="speakers-${j.id}"><span>Спикеров</span><select id="speakers-${j.id}" ${busy?'disabled':''}>${speakerOptions(j.speaker_count)}</select></label><button class="action secondary" type="button" data-rerun-speakers data-id="${j.id}" ${busy?'disabled':''}>Переразметить</button>${j.output_dir?`<a class="action secondary" href="/summary?id=${j.id}">Саммари</a><a class="action" href="/result?id=${j.id}">Расшифровка</a>`:''}<button class="action danger" type="button" data-delete-job data-id="${j.id}" data-name="${esc(j.original_name)}" data-created-at="${esc(j.created_at)}" ${busy||['running','queued','queued_force','pending_batch','submission_unknown','credential_required'].includes(j.summary_status)?'disabled':''}>Удалить</button></div></div>`}).join(''):'<div class="empty">Пока нет записей.</div>';
 }catch(e){document.querySelector('#current').innerHTML='<div class="empty">Нет связи с сервером. Проверьте Tailscale.</div>'}}
 refresh();setInterval(refresh,2000);
 </script></body></html>
