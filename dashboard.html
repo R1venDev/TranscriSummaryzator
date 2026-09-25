@@ -40,11 +40,12 @@
     .detail{font-size:16px;color:#cbd2df}
     .meta{margin-top:8px;color:#858fa2;font-size:14px}
     .ready{color:#62d69a}.failed{color:#ff7d86}
-    .job{display:grid;grid-template-columns:54px minmax(0,1fr) auto;gap:14px;padding:16px 4px;border-top:1px solid #292e3b;align-items:center}
+    .job{display:grid;grid-template-columns:54px minmax(0,1fr);grid-template-areas:"badge main" ". controls";gap:14px;padding:16px 4px;border-top:1px solid #292e3b;align-items:start}
     .job:first-child{border-top:0}
-    .badge{padding:5px 8px;border-radius:99px;background:#252a35;font-size:12px;text-align:center;font-variant-numeric:tabular-nums}
+    .badge{grid-area:badge;padding:5px 8px;border-radius:99px;background:#252a35;font-size:12px;text-align:center;font-variant-numeric:tabular-nums}
+    .job-main{grid-area:main}
     .small{color:#8e98aa;font-size:13px;line-height:1.4;margin-top:4px}
-    .job-controls{justify-content:flex-end;flex:0 0 auto}
+    .job-controls{grid-area:controls;justify-content:flex-start;min-width:0}
     .job-controls select{min-width:92px}
     .action{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:0;border-radius:10px;padding:10px 14px;background:#2d75e8;color:white;cursor:pointer;font:600 14px/1 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;text-decoration:none;white-space:nowrap;flex:0 0 auto}
     .action.secondary{background:#252b37;color:#dce8f8;border:1px solid #394354}
@@ -57,11 +58,11 @@
     iframe{display:none}
     @media(max-width:780px){
       main{margin:24px auto}.upload{grid-template-columns:1fr;align-items:stretch}.upload-controls{justify-content:flex-start}
-      .job{grid-template-columns:48px minmax(0,1fr)}.job-controls{grid-column:2;justify-content:flex-start}
+      .job{grid-template-columns:48px minmax(0,1fr)}
     }
     @media(max-width:520px){
-      .card{padding:18px}.upload-controls{display:grid;grid-template-columns:1fr}.upload-controls .field,.upload-controls select,.upload-controls .action{width:100%}
-      .job{grid-template-columns:1fr}.badge{justify-self:start}.job-controls{grid-column:1;display:grid;grid-template-columns:1fr 1fr;width:100%}.job-controls .field{grid-column:1/-1}.job-controls select{width:100%}
+      .page-head{flex-wrap:wrap}.card{padding:18px}.upload-controls{display:grid;grid-template-columns:1fr}.upload-controls .field,.upload-controls select,.upload-controls .action{width:100%}
+      .job{grid-template-columns:1fr;grid-template-areas:"badge" "main" "controls"}.badge{justify-self:start}.job-controls{display:grid;grid-template-columns:1fr;width:100%}.job-controls select,.job-controls .action{width:100%}.job-controls .action{white-space:normal}
       .top{gap:10px}.percent{font-size:24px}
     }
   </style>
