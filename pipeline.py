@@ -105,7 +105,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "e38ea5edc6696cc431baa69debbcf128c65885ad61f34a5e0777bc008024d50e"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "c3f153665ecc373626884dadc91f5a02d7e4b0b60114bfcb1182f437ca44c128"
 
 
 def _stage_pipeline_sha256(source):
@@ -2307,6 +2307,47 @@ def _luna_output_has_active_batch(output_dir):
         return True  # unknown ledger means no new paid dispatch
 
 
+def reconcile_luna_accepted_attempt(output_dir, queue_job_id, attempt_id, ledger_job):
+    """Refresh only the mutable attempt display for a verified accepted Luna generation.
+
+    Safe to use for an already-done queue row during one-time recovery.  It
+    neither changes the queue nor submits or polls a remote request.
+    """
+    output_dir = Path(output_dir)
+    package = current_summary_output(output_dir)
+    if not package or ledger_job["status"] != "accepted" or not ledger_job["remote_id"]:
+        return False
+    try:
+        run = load_json(package / "run_manifest.json")
+        sealed = load_json(package / "generation_manifest.json")
+        source_sha = hashlib.sha256((output_dir / "transcript.json").read_bytes()).hexdigest()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(run, dict) or not isinstance(sealed, dict):
+        return False
+    expected = {
+        "contract_version": "luna_summary_v1",
+        "job_id": ledger_job["id"],
+        "semantic_key": ledger_job["semantic_key"],
+        "source_sha256": ledger_job["source_sha256"],
+        "remote_batch_id": ledger_job["remote_id"],
+    }
+    if (any(run.get(key) != value for key, value in expected.items())
+            or sealed.get("contract_version") != "luna_summary_v1"
+            or sealed.get("source_sha256") != ledger_job["source_sha256"]
+            or source_sha != ledger_job["source_sha256"]
+            or current_summary_generation_id(output_dir) != package.name):
+        return False
+    write_json(output_dir / "summary_attempt.json", {
+        "schema_version": 2, "job_id": queue_job_id, "attempt_id": attempt_id,
+        "attempt_status": "accepted", "luna_job_id": ledger_job["id"],
+        "remote_batch_id": ledger_job["remote_id"],
+        "privacy_mode": "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized",
+        "displayed_generation_id": package.name,
+    })
+    return True
+
+
 def reconcile_luna_summary_queue():
     """Recover queue display from the durable external-job ledger, never POST."""
     db = connect()
@@ -2374,9 +2415,9 @@ def reconcile_luna_summary_queue():
                                summary_finished_at=now())
                     changed += 1
                     continue
-                package = current_summary_output(output_dir)
-                manifest = load_json(package / "run_manifest.json") if package else {}
-                if manifest.get("job_id") == ledger_job["id"]:
+                if reconcile_luna_accepted_attempt(output_dir, row["id"], row["summary_attempt_id"], ledger_job):
+                    # Save the display before queue done so a crash remains
+                    # recoverable by this same identity check.
                     update_job(db, row["id"], summary_status="done", summary_stage="summary_done", summary_progress=100,
                                summary_detail="Саммари готово", summary_error=None, summary_finished_at=now())
                 else:

@@ -66,6 +66,29 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
             item.stop()
         self.temp.cleanup()
 
+    def _seal_luna_generation(self, *, job_id, source_sha, semantic_key, remote_batch_id):
+        generation = "20260925-000000-" + "e" * 12
+        package = self.output / "summary_generations" / generation
+        package.mkdir(parents=True)
+        digests = {}
+        for name in pipeline.LUNA_GENERATION_FILES:
+            payload = (json.dumps({
+                "contract_version": "luna_summary_v1", "job_id": job_id,
+                "source_sha256": source_sha, "semantic_key": semantic_key,
+                "remote_batch_id": remote_batch_id,
+            }) + "\n").encode() if name == "run_manifest.json" else name.encode()
+            (package / name).write_bytes(payload)
+            digests[name] = hashlib.sha256(payload).hexdigest()
+        pipeline.write_json(package / "generation_manifest.json", {
+            "contract_version": "luna_summary_v1", "generation_id": generation,
+            "source_sha256": source_sha, "artifact_sha256": digests,
+            "verified_artifact_sha256": digests["summary.md"],
+        })
+        pipeline.write_json(self.output / "summary_current.json", {
+            "generation_id": generation, "verified_artifact_sha256": digests["summary.md"],
+        })
+        return generation, package
+
     def test_protected_stage_keys_keep_legacy_identity_only_for_reviewed_source(self):
         source = (pipeline.ROOT / "pipeline.py").read_bytes()
         legacy = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
@@ -201,34 +224,124 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(second["summary_status"], "queued_force")
 
     def test_second_consumer_recovers_from_ledger_without_attempt_file(self):
+        source_sha = hashlib.sha256((self.output / "transcript.json").read_bytes()).hexdigest()
         ledger = Ledger(self.state / "summary_private")
-        first = ledger.reserve(semantic_key="c" * 64, source_sha256="d" * 64,
+        first = ledger.reserve(semantic_key="c" * 64, source_sha256=source_sha,
             output_dir=self.root / "first-output", credential_id="key-synthetic",
             credential_version=1, workspace_id="workspace-synthetic", max_cost_microusd=1000)
         db = pipeline.connect()
         job_id = _job(db, self.output, self.work, summary_status="pending_batch", attempt_id="second-attempt")
         db.close()
-        attached = ledger.attach_consumer("c" * 64, "d" * 64, self.output)
+        attached = ledger.attach_consumer("c" * 64, source_sha, self.output)
         self.assertEqual(attached["id"], first.job_id)
+        ledger.mark_submitting(first.job_id)
+        ledger.submission_result(first.job_id, remote_id="batch_synthetic")
         ledger.db.execute("UPDATE jobs SET status='accepted' WHERE id=?", (first.job_id,))
         ledger.close()
-        generation = "20260925-000000-" + "e" * 12
-        package = self.output / "summary_generations" / generation
-        package.mkdir(parents=True)
-        digests = {}
-        for name in pipeline.LUNA_GENERATION_FILES:
-            payload = (json.dumps({"job_id": first.job_id}) + "\n").encode() if name == "run_manifest.json" else name.encode()
-            (package / name).write_bytes(payload)
-            digests[name] = hashlib.sha256(payload).hexdigest()
-        pipeline.write_json(package / "generation_manifest.json", {
-            "contract_version": "luna_summary_v1", "generation_id": generation,
-            "artifact_sha256": digests, "verified_artifact_sha256": digests["summary.md"],
-        })
-        pipeline.write_json(self.output / "summary_current.json", {"generation_id": generation,
-                            "verified_artifact_sha256": digests["summary.md"]})
+        self._seal_luna_generation(job_id=first.job_id, source_sha=source_sha,
+                                   semantic_key="c" * 64, remote_batch_id="batch_synthetic")
         self.assertEqual(pipeline.reconcile_luna_summary_queue(), 1)
         row = pipeline.connect().execute("SELECT summary_status FROM jobs WHERE id=?", (job_id,)).fetchone()
         self.assertEqual(row["summary_status"], "done")
+
+    def test_accepted_ledger_reconciles_stale_attempt_display_without_dispatch(self):
+        db = pipeline.connect()
+        job_id = _job(db, self.output, self.work, summary_status="submission_unknown", attempt_id="attempt-synthetic")
+        db.close()
+        source_sha = hashlib.sha256((self.output / "transcript.json").read_bytes()).hexdigest()
+        ledger = Ledger(self.state / "summary_private")
+        decision = ledger.reserve(semantic_key="c" * 64, source_sha256=source_sha,
+                                  output_dir=self.output, credential_id="key-synthetic",
+                                  credential_version=1, workspace_id="workspace-synthetic",
+                                  max_cost_microusd=1000)
+        ledger.mark_submitting(decision.job_id)
+        ledger.submission_result(decision.job_id, remote_id="batch_synthetic")
+        ledger.db.execute("UPDATE jobs SET status='accepted' WHERE id=?", (decision.job_id,))
+        ledger.close()
+        raw_attempt = {"status": "submission_unknown", "job_id": decision.job_id}
+        pipeline.write_json(self.output / "summary_luna_attempt.json", raw_attempt)
+        pipeline.write_json(self.output / "summary_attempt.json", {
+            "schema_version": 2, "job_id": job_id, "attempt_id": "attempt-synthetic",
+            "attempt_status": "submission_unknown", "luna_job_id": decision.job_id,
+            "remote_batch_id": None, "displayed_generation_id": None,
+        })
+        generation, _ = self._seal_luna_generation(job_id=decision.job_id, source_sha=source_sha,
+            semantic_key="c" * 64, remote_batch_id="batch_synthetic")
+
+        with patch.object(pipeline, "run_command", side_effect=AssertionError("new external call")):
+            self.assertEqual(pipeline.reconcile_luna_summary_queue(), 1)
+            self.assertEqual(pipeline.reconcile_luna_summary_queue(), 0)
+        row = pipeline.connect().execute("SELECT summary_status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        self.assertEqual(row["summary_status"], "done")
+        display = pipeline.load_json(self.output / "summary_attempt.json")
+        self.assertEqual(display["attempt_status"], "accepted")
+        self.assertEqual(display["luna_job_id"], decision.job_id)
+        self.assertEqual(display["remote_batch_id"], "batch_synthetic")
+        self.assertEqual(display["displayed_generation_id"], generation)
+        self.assertEqual(pipeline.load_json(self.output / "summary_luna_attempt.json"), raw_attempt)
+
+        # A finished queue row can repair its mutable display directly; this
+        # never reopens the queue or calls the provider.
+        display["attempt_status"] = "submission_unknown"
+        pipeline.write_json(self.output / "summary_attempt.json", display)
+        ledger = Ledger(self.state / "summary_private")
+        accepted = ledger.get(decision.job_id)
+        ledger.close()
+        with patch.object(pipeline, "run_command", side_effect=AssertionError("new external call")):
+            self.assertTrue(pipeline.reconcile_luna_accepted_attempt(
+                self.output, job_id, "attempt-synthetic", accepted))
+        self.assertEqual(pipeline.load_json(self.output / "summary_attempt.json")["attempt_status"], "accepted")
+        self.assertEqual(pipeline.connect().execute(
+            "SELECT summary_status FROM jobs WHERE id=?", (job_id,)).fetchone()[0], "done")
+
+    def test_accepted_identity_mismatch_stays_recoverable_without_dispatch(self):
+        db = pipeline.connect()
+        job_id = _job(db, self.output, self.work, summary_status="submission_unknown", attempt_id="attempt-synthetic")
+        db.close()
+        source = (self.output / "transcript.json").read_bytes()
+        source_sha = hashlib.sha256(source).hexdigest()
+        ledger = Ledger(self.state / "summary_private")
+        decision = ledger.reserve(semantic_key="c" * 64, source_sha256=source_sha,
+                                  output_dir=self.output, credential_id="key-synthetic",
+                                  credential_version=1, workspace_id="workspace-synthetic",
+                                  max_cost_microusd=1000)
+        ledger.mark_submitting(decision.job_id)
+        ledger.submission_result(decision.job_id, remote_id="batch_synthetic")
+        ledger.db.execute("UPDATE jobs SET status='accepted' WHERE id=?", (decision.job_id,))
+        accepted = ledger.get(decision.job_id)
+        ledger.close()
+        pipeline.write_json(self.output / "summary_luna_attempt.json", {
+            "status": "submission_unknown", "job_id": decision.job_id,
+        })
+        stale = {"attempt_id": "attempt-synthetic", "attempt_status": "submission_unknown"}
+        pipeline.write_json(self.output / "summary_attempt.json", stale)
+        _, package = self._seal_luna_generation(job_id=decision.job_id, source_sha=source_sha,
+            semantic_key="c" * 64, remote_batch_id="batch_synthetic")
+
+        run_path = package / "run_manifest.json"
+        valid_run = pipeline.load_json(run_path)
+        wrong_run = dict(valid_run, semantic_key="f" * 64)
+        pipeline.write_json(run_path, wrong_run)
+        sealed_path = package / "generation_manifest.json"
+        sealed = pipeline.load_json(sealed_path)
+        sealed["artifact_sha256"]["run_manifest.json"] = hashlib.sha256(run_path.read_bytes()).hexdigest()
+        pipeline.write_json(sealed_path, sealed)
+        self.assertIsNotNone(pipeline.current_summary_output(self.output))
+        with patch.object(pipeline, "run_command", side_effect=AssertionError("new external call")):
+            self.assertEqual(pipeline.reconcile_luna_summary_queue(), 1)
+        self.assertEqual(pipeline.connect().execute(
+            "SELECT summary_status FROM jobs WHERE id=?", (job_id,)).fetchone()[0], "submission_unknown")
+        self.assertEqual(pipeline.load_json(self.output / "summary_attempt.json"), stale)
+
+        # Even a correct sealed run must not be accepted for changed source bytes.
+        pipeline.write_json(run_path, valid_run)
+        sealed["artifact_sha256"]["run_manifest.json"] = hashlib.sha256(run_path.read_bytes()).hexdigest()
+        pipeline.write_json(sealed_path, sealed)
+        (self.output / "transcript.json").write_bytes(source + b" ")
+        self.assertIsNotNone(pipeline.current_summary_output(self.output))
+        self.assertFalse(pipeline.reconcile_luna_accepted_attempt(
+            self.output, job_id, "attempt-synthetic", accepted))
+        self.assertEqual(pipeline.load_json(self.output / "summary_attempt.json"), stale)
 
     def test_watcher_restart_does_not_requeue_luna_summary(self):
         db = pipeline.connect()
