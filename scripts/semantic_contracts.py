@@ -85,7 +85,7 @@ class FinalDocumentNodeReview(StrictModel):
     relation_supported: Optional[bool] = None
     actor_supported: Optional[bool] = None
     modality_supported: Optional[bool] = None
-    reason: str = ""
+    reason: str = Field(default="", max_length=480)
 
 
 class FinalDocumentAuditResponse(StrictModel):
@@ -97,9 +97,21 @@ class BoundedTextNode(StrictModel):
     claim_ids: list[str] = Field(min_length=1)
 
 
+class BoundedSectionEdit(BoundedTextNode):
+    node_id: str = Field(min_length=1)
+
+
+class BoundedChapterEdit(StrictModel):
+    chapter_id: str = Field(min_length=1)
+    label: BoundedTextNode
+    summary: list[BoundedTextNode] = Field(min_length=1, max_length=3)
+
+
 class BoundedDocumentEditResponse(StrictModel):
     title: BoundedTextNode
     overview: list[BoundedTextNode] = Field(min_length=1, max_length=4)
+    section_edits: list[BoundedSectionEdit] = Field(default_factory=list, max_length=40)
+    chapter_edits: list[BoundedChapterEdit] = Field(default_factory=list, max_length=16)
 
 
 CONTRACTS = {

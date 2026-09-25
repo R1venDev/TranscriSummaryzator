@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 
 from semantics.questions import normalize_slot, verify_slot_entailment
-from summary.verifier import has_english_prose, partition_verified_public_items, public_context_duplicate, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items
-from scripts.summary_worker import build_public_document
+from summary.verifier import has_english_prose, partition_verified_public_items, public_context_duplicate, public_surface_text, publication_audit, sanitize_public_surface, substantive_unverified_surface, verify_generated_items, verify_public_document
+from scripts.summary_worker import build_public_document, render_public_document
 from scripts.diagnostics import _safe, summarize
 
 
@@ -45,6 +45,17 @@ class LatestAuditRegressionTests(unittest.TestCase):
         self.assertEqual(sanitize_public_surface("Mиша подготовил отчёт."), "Миша подготовил отчёт.")
         self.assertEqual(sanitize_public_surface("таймframe требует проверки"), "таймframe требует проверки")
 
+    def test_public_surface_removes_only_leading_dialogue_filler(self):
+        self.assertEqual(
+            sanitize_public_surface("Угу. Есть такой инструмент ТПО."),
+            "Есть такой инструмент ТПО.",
+        )
+        self.assertEqual(
+            sanitize_public_surface("Ну, как сказать? Система пока работает на постобработке."),
+            "Система пока работает на постобработке.",
+        )
+        self.assertEqual(sanitize_public_surface("Нет, система не готова."), "Нет, система не готова.")
+
     def test_context_repetition_uses_one_identity_neutral_contract(self):
         task = (
             "Отчёта на первое время хватит, поэтому @Analyst будет параллельно "
@@ -59,6 +70,61 @@ class LatestAuditRegressionTests(unittest.TestCase):
                 "@Analyst проверит доступность резервного сервера.",
             )
         )
+
+    def test_title_ignores_participant_handles_and_uses_supported_outcome(self):
+        item = {
+            "public_id": "PI1", "section": "overview",
+            "text": "Остаётся задержка обработки старших таймфреймов.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "problem", "social_state": "asserted", "start": 1,
+            "topic_entities": ["@A", "@B", "задержка старших таймфреймов"],
+        }
+        document = build_public_document([item], {"participants": ["@A", "@B"]})
+        self.assertEqual(document["title"]["text"], "Остаётся задержка обработки старших таймфреймов")
+
+    def test_utility_gate_rejects_editorially_bad_public_surface(self):
+        items = [
+            {"section": "decisions", "text": "Предлагается изменить алгоритм.", "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"], "content_kind": "proposal", "social_state": "accepted"},
+            {"section": "tasks", "text": "Обсуждение результата.", "claim_ids": ["C2"], "evidence_ids": ["U2"], "source_word_ids": ["W2"], "content_kind": "observation", "social_state": "in_progress", "task_state_id": "T2", "task_state": {"status": "in_progress", "deliverable": "Обсуждение результата"}},
+        ]
+        report = {"audits": [{"passed": True, "errors": []}] * len(items)}
+        audit = publication_audit(report, "# Встреча — @A; @B\n", items, {}, document={"metadata": {}, "sections": {}})
+        self.assertEqual(audit["participant_only_title"], 1)
+        self.assertEqual(audit["tentative_decision_surfaces"], 1)
+        self.assertEqual(audit["non_action_task_surfaces"], 1)
+        self.assertEqual(audit["reports"]["utility"]["status"], "failed")
+
+    def test_utility_gate_rejects_action_or_dangling_title_fragments(self):
+        base = {"metadata": {}, "sections": {}, "overview": [], "chronology": []}
+        action = publication_audit(
+            {"audits": []}, "# Попробовать обновить модель; Проверить данные\n", [], {},
+            document=base,
+        )
+        dangling = publication_audit(
+            {"audits": []}, "# Разметка трёх свечных\n", [], {},
+            document=base,
+        )
+        self.assertEqual(action["title_action_fragment"], 1)
+        self.assertEqual(dangling["title_dangling_fragment"], 1)
+        self.assertEqual(action["reports"]["utility"]["status"], "failed")
+        self.assertEqual(dangling["reports"]["utility"]["status"], "failed")
+
+    def test_independently_supported_overview_paraphrase_passes_lexical_guard(self):
+        item = {
+            "public_id": "PI1", "section": "overview", "text": "Система обработки работает стабильно.",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "current_state", "social_state": "asserted", "start": 1,
+            "topic_entities": ["система обработки"],
+        }
+        document = build_public_document([item])
+        document["outcome_cards"] = []
+        document["overview"][0]["text"] = "Подтверждена стабильная эксплуатация вычислительного контура."
+        artifact = render_public_document(document)
+        self.assertIn("overview_semantic_drift", verify_public_document(document, artifact, [item])["errors"])
+        document["semantic_audit"] = {
+            "reviews": [{"node_id": "overview:1", "verdict": "supported"}],
+        }
+        self.assertTrue(verify_public_document(document, artifact, [item])["passed"])
 
     def test_internal_labels_and_bare_acknowledgements_are_not_public_surfaces(self):
         claim = {"statement": "@A link_stop_loss_to_projection_extremes", "evidence_ids": []}

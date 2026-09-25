@@ -5,6 +5,7 @@ import hashlib
 import re
 from semantics.graph import cross_episode_allowed
 from semantics.equivalence import equivalent
+from semantics.relation_resolver import is_explicit_acceptance_reply, is_weak_backchannel
 from summary.policy import RULE_KINDS, TECHNICAL_KINDS
 
 CAUSAL_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|привел[оа]? к|в результате|для этого)\b")
@@ -31,6 +32,46 @@ GENERIC_QUESTION_RESIDUAL_RE = re.compile(
     r"проверить\s+объяснение|подтвердить\s+ответ|"
     r"уточнить\s+недостающ(?:ий\s+аспект|ий\s+результат))\s*[.?!]*\s*$"
 )
+QUESTION_SIGNAL_RE = re.compile(
+    r"(?iu)(?:\?|\b(?:кто|что|где|куда|откуда|когда|почему|зачем|как|какой|"
+    r"какая|какие|сколько|ли|вопрос|уточнить|подтвердить)\b)"
+)
+WORK_ACTION_SURFACE_RE = re.compile(
+    r"(?iu)\b(?:сдела\w*|созда\w*|подготов\w*|переда\w*|отправ\w*|"
+    r"предостав\w*|разме[тч]\w*|встраива\w*|встро\w*|внес\w*|перенес\w*|провер\w*|"
+    r"исправ\w*|продолж\w*|эксперимент\w*|разработ\w*|реализ\w*|"
+    r"обработ\w*|собра\w*|запуст\w*|добав\w*|подключ\w*|скин\w*|выгруз\w*|покаж\w*|"
+    r"проанализ\w*|исслед\w*|настро\w*|обнов\w*|заверш\w*|выполн\w*)\b"
+)
+PROPOSAL_SURFACE_RE = re.compile(
+    r"(?iu)\b(?:предлага(?:ется|ет|лось)|можно|возможно|рассматрива\w+\s+возможност|"
+    r"рассматрива(?:ется|ют|лся|лась|лись)|обсуждалась\s+необходимость|"
+    r"стоит\s+попробовать|планируется)\b"
+)
+TITLE_ACTION_FRAGMENT_RE = re.compile(
+    r"(?iu)^\s*(?:попробовать|пытаться|предлагается|предложено|нужно|надо|следует|"
+    r"сделать|создать|подготовить|передать|предоставить|проверить|провести|"
+    r"разметить|размечать|реализовать|встроить|подключить|исправить|продолжить)\b"
+)
+TITLE_DANGLING_RE = re.compile(
+    r"(?iu)(?:\b(?:и|или|что|чтобы|из-за|после|для|при|по|с|без)|"
+    r"\b(?:\d+|один|одна|два|две|три|тр[её]х|четыре|пять|несколько)\s+"
+    r"[а-яё]{4,}(?:ых|их|ого|его|ой|ую|юю))\s*$"
+)
+PUBLIC_SECTION_LIMITS = {
+    "overview": 4,
+    "decisions": 6,
+    "rules": 6,
+    "tasks": 10,
+    "questions": 5,
+    "technical": 6,
+    "experiments": 5,
+    "requires_verification": 8,
+}
+PROTECTED_TASK_STATES = {
+    "self_committed", "explicit_self_commitment", "assigned", "accepted",
+    "in_progress", "blocked", "completed",
+}
 CONTEXT_STOPWORDS = {
     "участник", "говорящий", "который", "которая", "можно", "нужно", "будет",
 }
@@ -105,10 +146,40 @@ def has_english_prose(text):
 
 def sanitize_public_surface(text):
     value = str(text or "").strip()
+    # Dialogue acknowledgements and hesitation prefaces are not part of the
+    # proposition that follows them. Remove only a closed set of leading
+    # discourse markers; never strip a negative answer such as ``Нет``.
+    value = re.sub(
+        r"(?iu)^\s*(?:(?:угу|ага|ладно|ок(?:ей)?|хорошо)\s*[,.!?;:—-]+\s*|"
+        r"ну\s*,?\s*как\s+сказать\s*[?!.]+\s*)+",
+        "", value,
+    )
+    value = re.sub(
+        r"(?iu)^\s*просто\s+объясняю\s*,?\s*объясняю\s*,?\s*почему\s+",
+        "", value,
+    )
+    value = re.sub(r"(?iu),?\s*понимаешь\s*\?", ".", value)
+    value = re.sub(r"(?iu)(?<!\w)(?:э(?:-э)+|х+м+)(?!\w)[,.;:]?\s*", "", value)
     # Domain translations belong in a configured vocabulary profile.  Core
     # sanitization is deliberately limited to typography/known morphology and
     # never rewrites a meeting-specific proposition.
     value = re.sub(r"(?iu)\bсвичных\b", "свечных", value)
+    # A self-correction can survive inside an otherwise useful action (for
+    # example, ``сделать А, ну то есть макет``).  It is dialogue scaffolding,
+    # not part of the deliverable, and may appear in overview or chronology as
+    # well as in the canonical task card.
+    value = re.sub(
+        r"(?iu)(\b[а-яё-]+(?:ть|ться))\s+(?:[аa]\s*,?\s*)?ну\s+то\s+есть\s+",
+        r"\1 ", value,
+    )
+    # Editorial models sometimes repeat a task status both as a structured
+    # suffix and as a parenthetical gloss.  Collapse only an exact repeated
+    # label; differing statuses must remain visible for the conflict gate.
+    value = re.sub(
+        r"(?iu)(—\s*статус:\s*(?P<label>[^()\n.;]+?))\s*"
+        r"\(\s*статус:\s*(?P=label)\s*\)",
+        r"\1", value,
+    )
     # ASR/model output can mix a single visually identical Cyrillic letter
     # into a Latin name ("Мisha") or vice versa. Repairing only confusables in
     # the minority script is typographic normalization, not translation.
@@ -121,9 +192,260 @@ def sanitize_public_surface(text):
     return value
 
 
+def unresolved_public_reference(text):
+    """Detect a public fragment whose grammatical referent is outside it."""
+    return bool(re.match(
+        r"(?iu)^\s*(?:пока\s+что\s+)?(?:я|мы|ты|вы|он|она|оно|они|это|этот|эта|эти|тот|та|те)\b",
+        sanitize_public_surface(text),
+    ))
+
+
+RAW_DIALOGUE_RE = re.compile(
+    r"(?iu)(?:\bч[её]\b|\bну\s*,|\bну\s+то\s+есть\b|\bтипа\b|\bсобственно\b|"
+    r"\bчто\s+даю\b|\bдавай\b.{0,32}\b(?:кин|скин)\w*|"
+    r"(?:^|[.!?]\s*)(?:угу|ага|ок(?:ей)?|хорошо)(?:\W|$))"
+)
+TITLE_LOW_INFORMATION_RE = re.compile(
+    r"(?iu)(?:^|;)\s*(?:есть|имеется|существует|бывает|происходит)\b"
+)
+INCOMPLETE_PUBLIC_FRAGMENT_RE = re.compile(
+    r"(?iu)(?:\.{3}|…)$|\b(?:и|или|что|чтобы|из-за|после)\s*$"
+)
+NAVIGATION_PERSON_LED_RE = re.compile(
+    r"(?iu)^\s*(?:@[\w.-]+|[А-ЯЁ][а-яё-]{1,30}(?:\s+(?:и|/)\s+"
+    r"[А-ЯЁ][а-яё-]{1,30})?)\s+(?:пытал\w*|решил\w*|говор\w*|"
+    r"сказал\w*|отмеча\w*|указыва\w*|предлага\w*|попросил\w*)\b"
+)
+NAVIGATION_MODAL_RE = re.compile(
+    r"(?iu)^\s*(?:необходимо|нужно|надо|следует|стоит)\b|"
+    r"^\s*.{0,48}\b(?:необходимо|нужно|надо|следует)\b"
+)
+NAVIGATION_TOPICLESS_STATE_RE = re.compile(
+    r"(?iu)^\s*(?:изменения|правки|обновления|корректировки)\s+"
+    r"(?:не\s+)?(?:были\s+)?(?:внесены|сделаны|применены|добавлены)\b"
+)
+
+
+def navigation_label_needs_repair(value):
+    """Return whether a grounded chapter label is still poor navigation."""
+    # Evaluate the reader-visible label.  ``_public_text`` may add Markdown
+    # emphasis around a participant handle, while ``_chapter_label`` removes
+    # that formatting before publication.  Looking at the pre-render form
+    # made ``**@Alice** says ...`` evade the person-led-label guard and then
+    # fail only after an expensive full production run.
+    text = re.sub(r"\[([^]]+)\]\([^)]+\)", r"\1", str(value or ""))
+    text = re.sub(r"[*_`]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = re.findall(r"(?iu)[a-zа-яё0-9]+", text)
+    return bool(
+        not text
+        or len(text) > 160
+        or len(words) < 2
+        or "?" in text
+        or unresolved_public_reference(text)
+        or RAW_DIALOGUE_RE.search(text)
+        or TITLE_LOW_INFORMATION_RE.search(text)
+        or INCOMPLETE_PUBLIC_FRAGMENT_RE.search(text)
+        or NAVIGATION_PERSON_LED_RE.search(text)
+        or NAVIGATION_MODAL_RE.search(text)
+        or NAVIGATION_TOPICLESS_STATE_RE.search(text)
+        or re.match(r"(?iu)^\s*(?:спрашивается|возникает\s+вопрос)\b", text)
+    )
+
+
+TASK_REFERENCE_RE = re.compile(r"(?iu)\b(?:это|этот|эта|эти|его|е[её]|их|тебе|вам)\b")
+TASK_RESOURCE_RE = re.compile(r"(?iu)\b(?:данн\w*|выгрузк\w*|выборк\w*|файл\w*|запис\w*|образц\w*)\b")
+
+
+def _task_candidate_score(text):
+    value = sanitize_public_surface(text)
+    return (
+        100 * bool(RAW_DIALOGUE_RE.search(value))
+        + 80 * unresolved_public_reference(value)
+        + 40 * bool(INTERNAL_LABEL_RE.search(value) or has_english_prose(value))
+        + 20 * bool(len(value) > 220)
+        + 5 * len(TASK_REFERENCE_RE.findall(value))
+    )
+
+
+def _resolve_task_reference(value, dialogue):
+    """Resolve a local ``это`` only from an explicit adjacent antecedent.
+
+    The rule is grammatical rather than domain-specific: a correction of a
+    category (``не типы, а варианты``), its noun complement and an optional
+    count are carried into the action.  If those pieces are not all present,
+    the fragment remains unresolved and the publication gate abstains.
+    """
+    action = re.match(
+        r"(?iu)^\s*(?P<verb>встро\w*|внес\w*|добав\w*|перенес\w*)\s+это\s+"
+        r"(?P<target>(?:в|на|к)\s+.+?)\s*$",
+        value,
+    )
+    if not action:
+        action = re.match(
+            r"(?iu)^\s*.+?\s+(?:нужно|надо|следует)(?:\s+будет)?\s+"
+            r"(?P<verb>встро\w*|внес\w*|добав\w*|перенес\w*)\s+"
+            r"(?P<target>(?:в|на|к)\s+.+?)\s*$",
+            value,
+        )
+    if not action:
+        return value
+    correction = re.search(r"(?iu)\bне\s+([а-яё-]+)\w*\s*,?\s*а\s+([а-яё-]+)\w*", dialogue)
+    complement = re.search(
+        r"(?iu)\b(?:тип\w*|вид\w*|вариант\w*|категори\w*|форм\w*)\s+"
+        r"([a-zа-яё][a-zа-яё0-9_-]*(?:\s+[a-zа-яё][a-zа-яё0-9_-]*){0,2})",
+        dialogue,
+    )
+    if not correction or not complement:
+        return value
+    corrected_category = correction.group(2)
+    referent = re.split(r"(?iu)\b(?:их|не|потом|затем|дальше)\b", complement.group(1))[0].strip(" ,.;:—-")
+    if not referent:
+        return value
+    count = re.search(r"(?iu)\bих\s+(\d+|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять)\b", dialogue)
+    # Keep the resolved surface extractive.  Labels such as ``внешний вид``
+    # or ``количество`` may be reasonable editorial paraphrases, but they are
+    # not present in the cited turns and therefore make the post-render
+    # entailment gate reject an otherwise valid canonical task.
+    quantity = f"; их {count.group(1)}" if count else ""
+    source_verb = action.group("verb").casefold()
+    verb = next(
+        rendered for stem, rendered in (
+            ("встро", "Встроить"), ("внес", "Внести"),
+            ("добав", "Добавить"), ("перенес", "Перенести"),
+        ) if source_verb.startswith(stem)
+    )
+    target = action.group("target").strip(" ,.;:—-")
+    return f"{verb} {target}: {corrected_category} {referent}{quantity}"
+
+
+def _duration_surface(text):
+    match = re.search(
+        r"(?iu)\b(?:(\d+|один|одна|два|две|три|четыре|пять|пара|несколько)\s+)?"
+        r"(месяц\w*|недел\w*|д(?:ень|ня|ней)|час\w*|минут\w*)\b",
+        text,
+    )
+    if not match:
+        return None
+    amount, unit = match.groups()
+    if amount:
+        return f"{amount} {unit}"
+    roots = (("месяц", "1 месяц"), ("недел", "1 неделя"), ("д", "1 день"),
+             ("час", "1 час"), ("минут", "1 минута"))
+    return next((surface for root, surface in roots if unit.casefold().startswith(root)), unit)
+
+
+def _compose_resource_scope(value, dialogue):
+    """Add source period and sample length to a resource-delivery task.
+
+    The composition is based on generic temporal dimensions and a nearby
+    named resource, not on a product, market or recording-specific lexicon.
+    """
+    combined = f"{value} {dialogue}"
+    if not TASK_RESOURCE_RE.search(combined):
+        return value
+    year = re.search(r"(?<!\d)(19\d{2}|20\d{2}|21\d{2})(?!\d)", combined)
+    duration = _duration_surface(combined)
+    if not year or not duration:
+        return value
+    year_context = next((part for part in re.split(r"[.!?]", dialogue) if year.group(1) in part), "")
+    candidates = [token for token in re.findall(r"(?u)\b[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9._-]{1,30}\b", year_context)
+                  if token.casefold() not in {"я", "мы", "данные", "год", "года"}]
+    resource = candidates[-1] if candidates else None
+    base = value
+    if re.match(r"(?iu)^готов\w*\s+предоставить", base):
+        base = re.sub(r"(?iu)^готов\w*\s+предоставить", "Предоставить", base)
+    if resource and resource.casefold() not in base.casefold():
+        base = re.sub(r"(?iu)\bданн\w*\b", lambda match: f"{match.group(0)} {resource}", base, count=1)
+    base = re.sub(
+        r"(?iu)[,;]?\s*(?:(?:достаточно|объ[её]м(?:ом)?|длительност\w*)\s+)?"
+        r"(?:за\s+)?(?:\d+|один|одна|два|две|три|четыре|пять|пара|несколько)?\s*"
+        r"(?:месяц\w*|недел\w*|д(?:ень|ня|ней)|час\w*|минут\w*)\b",
+        "", base,
+    )
+    base = re.sub(r"(?iu)\s+(?:за\s+)?(?:19\d{2}|20\d{2}|21\d{2})\s+год\w*\b", "", base).strip(" ,.;:—-")
+    return f"{base}; период источника — {year.group(1)} год, объём выборки — {duration}"
+
+
+def task_surface_text(claim, state):
+    """Render a task as an independent action rather than a dialogue quote.
+
+    The transformation is deliberately bounded by the structured task frame
+    and its cited dialogue window.  It removes person/tense duplication (the
+    assignee is rendered in a separate field), resolves only explicit local
+    alternatives, and otherwise keeps the reviewed semantic statement.
+    """
+    candidates = [
+        state.get("deliverable"), state.get("description"),
+        claim.get("statement"), claim.get("source_statement"),
+    ]
+    candidates = [sanitize_public_surface(candidate) for candidate in candidates if candidate]
+    value = min(candidates, key=lambda candidate: (_task_candidate_score(candidate), len(candidate))) if candidates else ""
+    value = re.sub(r"^\*\*(?=@)", "", value)
+    value = re.sub(r"(?<=\w)\*\*", "", value)
+    assignee = str(state.get("assignee") or "").strip()
+    if assignee:
+        value = re.sub(rf"(?iu)^\s*{re.escape(assignee)}\s+", "", value)
+    value = re.sub(r"(?iu)^\s*мне\s+", "", value)
+    value = re.sub(r"(?iu)^\s*(?:потом|затем|дальше)\s+", "", value)
+    value = re.sub(r"(?iu)^\s*пойти\s+(?=[а-яё-]+(?:ть|ться)\b)", "", value)
+
+    dialogue = " ".join(
+        sanitize_public_surface(turn.get("text"))
+        for turn in claim.get("dialogue_evidence", [])
+        if isinstance(turn, dict)
+    )
+    combined = f"{value} {dialogue}"
+
+    replacements = (
+        (r"(?iu)^готов\w*\s+предоставить\b", "Предоставить"),
+        (r"(?iu)^(?:я\s+)?подготов(?:лю|ит)\b", "Подготовить"),
+        (r"(?iu)^(?:я\s+)?(?:предоставлю|предоставит|дам)\b", "Предоставить"),
+        (r"(?iu)^(?:я\s+)?(?:отправлю|отправит|скину|передам|передаст)\b", "Передать"),
+        (r"(?iu)^(?:я\s+)?встро(?:ю|ит)\b", "Встроить"),
+        (r"(?iu)^(?:я\s+)?буду\s+размечивать\b", "Размечать"),
+        (r"(?iu)^(?:я\s+)?попробую\b", "Попробовать"),
+        (r"(?iu)^(?:я\s+)?сдела(?:ю|ет)\b", "Сделать"),
+    )
+    for pattern, replacement in replacements:
+        value = re.sub(pattern, replacement, value)
+    # Remove a self-correction filler only when it occurs directly between an
+    # action infinitive and its object.  Content elsewhere is left untouched.
+    value = re.sub(
+        r"(?iu)^(\s*[a-яё-]+(?:ть|ться))\s+(?:[аa]\s*,?\s*)?ну\s+то\s+есть\s+",
+        r"\1 ", value,
+    )
+    value = re.sub(
+        r"(?iu)\b(или|либо)\s+(?:я\s+)?(?:отправлю|отправит|скину|передам|передаст)\b",
+        lambda match: match.group(1) + " передать",
+        value,
+    )
+    value = _resolve_task_reference(value, dialogue)
+    value = _compose_resource_scope(value, dialogue)
+    recipient = (state.get("action_frame", {}).get("explicit_acceptance_actor")
+                 or state.get("action_frame", {}).get("recipient"))
+    if recipient and re.search(r"(?iu)\b(?:тебе|вам)\b", value):
+        value = re.sub(r"(?iu)\b(?:тебе|вам)\b", "", value)
+        value = re.sub(r"\s+", " ", value).strip(" ,.;:!?—-") + f" для {recipient}"
+    if claim.get("parallel") and not re.search(r"(?iu)\bпараллельно\b", value):
+        value = "Параллельно " + value[:1].lower() + value[1:]
+    value = re.sub(r"(?iu)^\s*(?:хорошо|ладно)\s*,?\s*(?:тогда\s+)?", "", value)
+    value = re.sub(r"\s+", " ", value).strip(" ,.;:!?—-")
+    if value:
+        value = value[0].upper() + value[1:]
+    return value
+
+
 def public_surface_text(claim, preferred=None):
     """Return Russian, source-grounded wording for a public surface."""
     value = sanitize_public_surface(preferred if preferred is not None else claim.get("statement"))
+    time_contract = claim.get("time_contract", {}) if isinstance(claim.get("time_contract"), dict) else {}
+    if time_contract.get("resolution_status") == "ambiguous_clock" and time_contract.get("raw"):
+        value = re.sub(
+            r"(?iu)\bпосле\s+0{1,2}:0{2}\b",
+            sanitize_public_surface(time_contract["raw"]),
+            value,
+        )
     if not has_english_prose(value) and not INTERNAL_LABEL_RE.search(value):
         return value
     allowed_evidence = set(claim.get("evidence_ids", []))
@@ -147,10 +469,39 @@ def substantive_unverified_surface(text):
     if not value or INTERNAL_LABEL_RE.search(value) or has_english_prose(value):
         return False
     tokens = re.findall(r"(?iu)[a-zа-яё0-9]+", value)
+    # A lone command/label such as ``show`` is not a human-facing claim even
+    # though it is too short to trip the English-prose heuristic.
+    if len(tokens) < 2 or not re.search(r"(?iu)[а-яё]{3,}", value):
+        return False
     return not (
         len(tokens) <= 5
         and re.match(r"(?iu)^\s*(?:угу|ага|да|ладно|ок(?:ей)?)(?:\b|[,.!?])", value)
     )
+
+
+def has_adjacent_stem_repetition(text):
+    """Detect malformed neighbouring repetitions without a domain lexicon."""
+    words = re.findall(r"(?iu)[a-zа-яё]{5,}", str(text or ""))
+    stems = [re.sub(r"(?iu)(?:иями|ями|ами|ого|ему|ыми|ими|ая|яя|ое|ее|ие|ые|ий|ый|ой|ов|ев|ам|ям|ах|ях|а|я|о|е|ы|и|у|ю)$", "", word.casefold()) for word in words]
+    return any(len(left) >= 5 and left == right for left, right in zip(stems, stems[1:]))
+
+
+def normalize_question_surface(text):
+    """Remove nested reporting boilerplate and keep only genuine questions."""
+    value = sanitize_public_surface(text).strip()
+    value = re.sub(
+        r"(?iu)^\s*(?:спрашивается[, :] *|возникает\s+вопрос(?:\s+о\s+том)?[, :] *|"
+        r"вопрос\s+о\s+том[, :] *)",
+        "",
+        value,
+    )
+    if not value or not QUESTION_SIGNAL_RE.search(value):
+        return ""
+    if not value.rstrip().endswith(("?", ".", "!")):
+        value += "?"
+    elif value.rstrip().endswith(".") and re.search(r"(?iu)\b(?:ли|кто|что|где|когда|почему|зачем|как|како[йея]|сколько)\b", value):
+        value = value.rstrip()[:-1] + "?"
+    return value
 
 
 def role_relations(text):
@@ -187,16 +538,56 @@ class PublicItem:
 
 
 def can_publish_as_decision(item):
-    return bool(item.get("lifecycle", "active") == "active"
-                and item.get("decision_status") == "accepted"
-                and item.get("decision_evidence_ids", item.get("evidence_ids"))
-                and item.get("acceptance_check", "entailed") == "entailed")
+    if not (item.get("lifecycle", "active") == "active"
+            and item.get("decision_status") == "accepted"
+            and item.get("decision_evidence_ids", item.get("evidence_ids"))):
+        return False
+    explicit_decision = item.get("content_kind") == "decision" or item.get("speech_act") == "decide"
+    if explicit_decision:
+        return item.get("acceptance_check") in {None, "not_applicable", "entailed"}
+    acceptance_ids = set(item.get("acceptance_evidence_ids", []))
+    # A proposal cannot prove its own acceptance.  There must be at least one
+    # separately cited source turn in addition to the accepting reply.
+    proposal_ids = set(item.get("evidence_ids", [])) - acceptance_ids
+    if not proposal_ids:
+        return False
+    acceptance_turns = [
+        turn.get("text")
+        for turn in item.get("dialogue_evidence", [])
+        if turn.get("id") in acceptance_ids
+    ]
+    if acceptance_turns and not any(
+            is_explicit_acceptance_reply(text, item.get("statement"))
+            for text in acceptance_turns
+    ):
+        return False
+    return bool(
+        item.get("acceptance_check") == "entailed"
+        and item.get("acceptance_relation_ids")
+        and item.get("acceptance_evidence_ids")
+        and item.get("accepted_by")
+    )
+
+
+def decision_surface_text(claim):
+    """Make the accepted status explicit without rewriting the proposition."""
+    text = public_surface_text(claim)
+    if not text:
+        return ""
+    if claim.get("content_kind") == "proposal" and PROPOSAL_SURFACE_RE.search(text):
+        return f"Согласовано предложение: {text[:1].lower() + text[1:]}"
+    return text
 
 
 def build_public_items(meeting_graph, summary_plan):
     """Create the complete public contract before formatting Markdown."""
     claims = {x["claim_id"]: x for x in meeting_graph.get("claims", [])}
     claims_by_source = {x.get("source_record_id"): x for x in claims.values()}
+    dialogue_by_id = {}
+    for candidate in claims.values():
+        for turn in candidate.get("dialogue_evidence", []):
+            if isinstance(turn, dict) and turn.get("id"):
+                dialogue_by_id.setdefault(turn["id"], turn)
     view_plans = summary_plan.get("view_plans", {})
     task_states = {x["task_id"]: x for x in meeting_graph.get("task_states", [])}
     task_claims = {}
@@ -211,12 +602,30 @@ def build_public_items(meeting_graph, summary_plan):
             planned_relations.setdefault(claim_id, []).extend(sentence.get("relation_ids", []))
     sections = []
     materialized = {}
+
+    def task_claim_for_render(claim, state):
+        rendered = dict(claim)
+        support_ids = list(dict.fromkeys(
+            state.get("evidence_ids", []) + claim.get("evidence_ids", [])
+        ))
+        rendered["dialogue_evidence"] = [
+            dialogue_by_id[evidence_id]
+            for evidence_id in support_ids
+            if evidence_id in dialogue_by_id
+        ] or list(claim.get("dialogue_evidence", []))
+        return rendered
+
     def add(section, claim, social_state=None, text=None, claim_ids=None, relation_ids=None, extra_evidence=None):
         if claim.get("lifecycle", "active") != "active" or not claim.get("evidence_ids"):
             return
         task_state = task_states.get(claim.get("canonical_task_state_id"), {})
-        evidence_ids = task_state.get("evidence_ids", claim.get("evidence_ids", [])) if section == "tasks" else claim.get("evidence_ids", [])
-        source_word_ids = task_state.get("source_word_ids", claim.get("source_word_ids", [])) if section == "tasks" else claim.get("source_word_ids", [])
+        canonical_task_projection = bool(
+            task_state and claim.get("content_kind") in {"action", "follow_up"}
+            and section in {"overview", "minutes"}
+        )
+        use_task_support = section == "tasks" or canonical_task_projection
+        evidence_ids = task_state.get("evidence_ids", claim.get("evidence_ids", [])) if use_task_support else claim.get("evidence_ids", [])
+        source_word_ids = task_state.get("source_word_ids", claim.get("source_word_ids", [])) if use_task_support else claim.get("source_word_ids", [])
         # Context turns are not automatically supporting evidence. Only cited
         # task/answer support is added to the public provenance contract.
         evidence_ids = list(dict.fromkeys(evidence_ids))
@@ -229,6 +638,8 @@ def build_public_items(meeting_graph, summary_plan):
         if section == "tasks":
             retained_relations.extend(task_state.get("scope_relation_ids", []))
             retained_relations.extend(task_state.get("acceptance_relation_ids", []))
+        if canonical_task_projection:
+            text = task_surface_text(task_claim_for_render(claim, task_state), task_state)
         clean_text = public_surface_text(claim, text if text is not None else claim.get("statement"))
         if not clean_text:
             return
@@ -246,14 +657,91 @@ def build_public_items(meeting_graph, summary_plan):
             decision_status=claim.get("decision_status"), task_status=claim.get("task_status"),
             quantities=list(claim.get("quantities", [])), conditions=list(claim.get("conditions", [])),
             origin_ids=list(claim.get("origin_ids", [])), relation_ids=list(dict.fromkeys(retained_relations)),
-        ).as_dict() | {"start": claim.get("primary_evidence_start", claim.get("start", 0)), "end": claim.get("end", claim.get("start", 0)), "episode_id": claim.get("episode_id"), "aspect_id": claim.get("aspect_id") or (("ownership:" + str(task_state.get("task_id"))) if section == "tasks" and task_state else ("decision:" + claim["claim_id"] if section == "decisions" else None)), "task_state_id": claim.get("canonical_task_state_id"), "task_state": task_state, "action_frame": task_state.get("action_frame", {}), "question_state": question_states.get(claim.get("proposition_id"), {}), "topic_entities": topic_entities, "context_ids": claim.get("context_ids", []), "verification_status": claim.get("verification_status") or "verification_unavailable"}
+        ).as_dict() | {
+            "start": claim.get("primary_evidence_start", claim.get("start", 0)),
+            "end": claim.get("end", claim.get("start", 0)),
+            "episode_id": claim.get("episode_id"),
+            "aspect_id": claim.get("aspect_id") or (
+                ("ownership:" + str(task_state.get("task_id")))
+                if section == "tasks" and task_state
+                else ("decision:" + claim["claim_id"] if section == "decisions" else None)
+            ),
+            "task_state_id": claim.get("canonical_task_state_id"),
+            "task_state": task_state,
+            "action_frame": task_state.get("action_frame", {}),
+            "question_state": question_states.get(claim.get("proposition_id"), {}),
+            "topic_entities": topic_entities,
+            "context_ids": claim.get("context_ids", []),
+            "verification_status": claim.get("verification_status") or "verification_unavailable",
+            # Preserve the acceptance contract through the public boundary so
+            # the runtime gate can independently detect a proposal that was
+            # mislabeled as a decision.
+            "speech_act": claim.get("speech_act"),
+            "acceptance_check": claim.get("acceptance_check"),
+            "acceptance_relation_ids": list(claim.get("acceptance_relation_ids", [])),
+            "acceptance_evidence_ids": list(claim.get("acceptance_evidence_ids", [])),
+            "accepted_by": list(claim.get("accepted_by", [])),
+        }
+        # One public sentence is enough when several typed claims project to
+        # the same meaning in the same reader view.  Merge provenance rather
+        # than spending the section budget on repeated bullets.  Task and
+        # question identities remain protected so genuinely separate work or
+        # asks are never collapsed just because their wording is similar.
+        duplicate = next((
+            existing for existing in sections
+            if existing.get("section") == section
+            and existing.get("social_state") == public.get("social_state")
+            and existing.get("verification_status") == public.get("verification_status")
+            and (section != "tasks" or existing.get("task_state_id") == public.get("task_state_id"))
+            and (section != "questions" or existing.get("question_state", {}).get("proposition_id") == public.get("question_state", {}).get("proposition_id"))
+            and (
+                (
+                    normalize_mixed_script_confusables(existing.get("text", "")).casefold().strip()
+                    == normalize_mixed_script_confusables(public.get("text", "")).casefold().strip()
+                    and existing.get("episode_id") == public.get("episode_id")
+                )
+                or (
+                    # A proposal that was accepted can legitimately project
+                    # both as the proposed decision and as the resulting
+                    # action.  Public readers must see that semantic event
+                    # once, even though the typed source claims differ.  The
+                    # episode guard prevents similar recurring work from
+                    # being collapsed across different parts of a meeting.
+                    existing.get("episode_id") == public.get("episode_id")
+                    and equivalent(existing, public, .8)
+                )
+            )
+        ), None)
+        if duplicate is not None:
+            for key in ("claim_ids", "evidence_ids", "source_word_ids", "origin_ids", "relation_ids", "topic_entities", "context_ids"):
+                duplicate[key] = list(dict.fromkeys(duplicate.get(key, []) + public.get(key, [])))
+            duplicate["start"] = min(float(duplicate.get("start", 0)), float(public.get("start", 0)))
+            duplicate["end"] = max(float(duplicate.get("end", duplicate["start"])), float(public.get("end", public["start"])))
+            for claim_id in cited_ids:
+                materialized.setdefault(section, {})[claim_id] = {
+                    "status": "published", "public_id": duplicate["public_id"],
+                    "reason": "merged_equivalent_public_surface_with_provenance",
+                }
+            return duplicate
+        limit = PUBLIC_SECTION_LIMITS.get(section)
+        if limit is not None and sum(item["section"] == section for item in sections) >= limit:
+            return
         sections.append(public)
         for claim_id in cited_ids:
             materialized.setdefault(section, {})[claim_id] = {"status": "published", "public_id": public["public_id"]}
+        return public
     def selected(view):
         return [claims[x] for x in view_plans.get(view, {}).get("selected_claim_ids", []) if x in claims]
 
-    for claim in selected("requires_verification"):
+    quarantine = sorted(
+        selected("requires_verification"),
+        key=lambda claim: (
+            {"contradicted": 0, "insufficient_evidence": 1, "verification_unavailable": 2}.get(claim.get("verification_status"), 3),
+            0 if claim.get("content_kind") in {"action", "follow_up", "decision", "proposal", "question", "schedule"} else 1,
+            float(claim.get("start", 0)),
+        ),
+    )
+    for claim in quarantine:
         if claim.get("verification_status") in {"verification_unavailable", "insufficient_evidence", "contradicted"}:
             # Quarantine is still a public surface.  An internal machine label
             # is omitted with a planner disposition rather than expanded into
@@ -267,12 +755,7 @@ def build_public_items(meeting_graph, summary_plan):
                     text = re.sub(r"(@[\w.-]+)\s*/\s*(@[\w.-]+)", r"один из \1 или \2", text)
                     if frame["reporter"] not in text:
                         text = f"По словам {frame['reporter']}, {text[:1].lower() + text[1:]}"
-                reason = {
-                    "verification_unavailable": "проверка недоступна",
-                    "insufficient_evidence": "недостаточно доказательств для интерпретации",
-                    "contradicted": "источник содержит противоречие",
-                }[claim.get("verification_status")]
-                add("requires_verification", claim, "needs_verification", text=f"{text} (статус: {reason})")
+                add("requires_verification", claim, "needs_verification", text=text)
 
     def attributed_text(claim):
         text = public_surface_text(claim)
@@ -316,16 +799,28 @@ def build_public_items(meeting_graph, summary_plan):
     for claim in selected("executive"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
-        if can_publish_as_decision(claim):
-            add("decisions", claim, "accepted", attributed_text(claim))
-    for claim in selected("technical"):
+        # Canonical work is rendered once as a task.  Repeating the same
+        # accepted assignment under "decisions" spends attention without
+        # adding a distinct meeting outcome.
+        if can_publish_as_decision(claim) and not claim.get("canonical_task_state_id"):
+            add("decisions", claim, "accepted", decision_surface_text(claim))
+    # Rules have their own protected reader view.  They no longer compete
+    # with ordinary technical details for the same editorial budget.
+    for claim in selected("rules"):
         if claim.get("verification_status") == "verification_unavailable":
             continue
         if claim.get("content_kind") in RULE_KINDS:
             add("rules", claim, "accepted" if can_publish_as_decision(claim) else "described", attributed_text(claim))
-        elif claim.get("content_kind") in TECHNICAL_KINDS:
+    for claim in selected("technical"):
+        if claim.get("verification_status") == "verification_unavailable":
+            continue
+        if claim.get("content_kind") in TECHNICAL_KINDS and claim.get("content_kind") not in RULE_KINDS:
             if not re.search(r"(?iu)\b(?:ширина\s*[—–-]\s*ширина|называется|определяется)\b", str(claim.get("statement") or "")):
-                add("technical", claim, "observation", attributed_text(claim))
+                candidate_text = attributed_text(claim)
+                # Deictic fragments without their referent are grounded but
+                # not standalone technical conclusions for a reader.
+                if not re.search(r"(?iu)^\s*(?:он|она|они|это|этот|эта|эти)\b", candidate_text):
+                    add("technical", claim, "observation", candidate_text)
     emitted_tasks = set()
     confirmed = {"self_committed", "explicit_self_commitment", "assigned", "accepted", "in_progress", "blocked", "completed"}
     for claim in selected("tasks"):
@@ -335,22 +830,31 @@ def build_public_items(meeting_graph, summary_plan):
         if not state or state.get("task_id") in emitted_tasks: continue
         emitted_tasks.add(state["task_id"])
         status = state.get("status", "idea")
-        description = str(state.get("deliverable") or state.get("description") or claim.get("statement") or "")
+        task_claim = task_claim_for_render(claim, state)
+        description = task_surface_text(task_claim, state)
         # A source can contain both proposal and agreement wording while the
         # canonical task still awaits acceptance. Preserve the proposal only.
         if status == "assigned_pending":
             description = re.sub(r"(?iu)^предлагалось\s+участники\s+договорились\s+", "Предлагалось ", description)
         if re.search(r"(?iu)^\s*(?:вопрос|уточнение|метаописание)\b", description):
             continue
-        if claim.get("content_kind") not in {"action", "follow_up", "resource"} and not re.search(r"(?iu)\b(?:сделать|подготовить|отправить|передать|предоставить|разметить|размечивать|проверить|продолжить|реализовать|встроить|экспериментировать)\b", description):
+        # A task card must have a clean structured deliverable. Falling back
+        # from an internal label to a long dialogue turn converts observations
+        # and speculation into apparent work items.
+        description = sanitize_public_surface(description)
+        if (not description or INTERNAL_LABEL_RE.search(description) or has_english_prose(description)
+                or has_adjacent_stem_repetition(description)
+                or RAW_DIALOGUE_RE.search(description)
+                or not WORK_ACTION_SURFACE_RE.search(description)):
             continue
         details = [description]
         if state.get("assignee"):
             details.append(f"исполнитель: {state['assignee']}")
-        if state.get("current_scope"):
+        normalized_description = re.sub(r"\s+", " ", str(description or "")).strip().casefold()
+        if state.get("current_scope") and re.sub(r"\s+", " ", str(state["current_scope"])).strip().casefold() not in normalized_description:
             qualifier = " (предложен, не подтверждён)" if state.get("scope_confidence") == "proposed" else ""
             details.append(f"объём: {state['current_scope']}{qualifier}")
-        if state.get("data_origin"):
+        if state.get("data_origin") and re.sub(r"\s+", " ", str(state["data_origin"])).strip().casefold() not in normalized_description:
             details.append(f"период данных: {state['data_origin']}")
         if state.get("deadline"):
             due = state["deadline"].get("text") if isinstance(state["deadline"], dict) else state["deadline"]
@@ -364,14 +868,22 @@ def build_public_items(meeting_graph, summary_plan):
         task_text = " — ".join(details)
         if status in confirmed or status == "needs_verification":
             add("tasks", claim, status, task_text)
-        elif status in {"proposed", "idea", "assigned_pending", "intent_to_attempt", "in_progress", "past_attempt"}:
+        elif status in {"proposed", "idea", "assigned_pending", "intent_to_attempt", "in_progress"}:
             # The planner already bounds this view. A second hidden cap loses
             # selected, evidence-backed work candidates without disposition.
             add("tasks", claim, status, task_text)
-    for claim in selected("questions"):
+    question_candidates = sorted(
+        selected("questions"),
+        key=lambda claim: (
+            0 if claim.get("content_kind") == "schedule" else 1,
+            0 if "?" in str(claim.get("statement") or "") else 1,
+            float(claim.get("start", 0)),
+        ),
+    )
+    for claim in question_candidates:
         if claim.get("verification_status") == "verification_unavailable":
             continue
-        if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") not in {"answered", "rhetorical", "superseded"}:
+        if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") not in {"answered", "rhetorical", "superseded", "answer_not_verified", "answer_retrieval_failed"}:
             state = question_states.get(claim.get("proposition_id"), {})
             question_text = state.get("residual_question_text") or state.get("remaining_question") or attributed_text(claim)
             if GENERIC_QUESTION_RESIDUAL_RE.fullmatch(str(question_text or "")):
@@ -384,6 +896,9 @@ def build_public_items(meeting_graph, summary_plan):
             if not question_text or GENERIC_QUESTION_RESIDUAL_RE.fullmatch(str(question_text)):
                 continue
             if re.search(r"(?iu)^\s*уточнить\s+недостающ\w+\s+результат", str(question_text or "")):
+                continue
+            question_text = normalize_question_surface(question_text)
+            if not question_text:
                 continue
             speakers = list(claim.get("speaker_refs", []))
             if len(speakers) == 1 and speakers[0] not in question_text:
@@ -403,19 +918,35 @@ def build_public_items(meeting_graph, summary_plan):
         )
         if goal_only:
             continue
+        has_testable_method = bool(re.search(
+            r"(?iu)\b(?:провер\w*|протест\w*|обуч\w*|предсказыва\w*|детект\w*|"
+            r"размеч\w*|эксперимент\w*|сравн\w*|бэктест\w*|апроб\w*)\b",
+            experiment_text,
+        ))
+        if claim.get("content_kind") == "hypothesis" and (
+            not has_testable_method or has_adjacent_stem_repetition(experiment_text)
+            or re.search(r"(?iu)\bобсуждалась\s+возможность\s+инструмент\b", experiment_text)
+        ):
+            continue
         if claim.get("content_kind") == "hypothesis" and re.search(r"(?iu)\b(?:нельзя|невозможно|ограничен)\b", claim.get("statement", "")):
             add("technical", claim, "constraint", attributed_text(claim))
         else:
-            add("experiments", claim, text=attributed_text(claim))
+            candidate_text = attributed_text(claim)
+            candidate = {"text": candidate_text, "content_kind": claim.get("content_kind"), "claim_ids": [claim["claim_id"]]}
+            if not any(item["section"] == "technical" and equivalent(candidate, item, .78) for item in sections):
+                add("experiments", claim, text=candidate_text)
     seen_minutes = set()
     for claim in sorted(selected("minutes"), key=lambda x: (float(x.get("start", 0)), x.get("claim_id", ""))):
         if claim.get("verification_status") == "verification_unavailable":
             continue
         if claim.get("content_kind") in {"question", "schedule"} and claim.get("question_status") in {"answered", "rhetorical", "superseded"}:
             continue
+        minute_text = attributed_text(claim)
+        if unresolved_public_reference(minute_text):
+            continue
         key = (claim.get("proposition_id"), claim.get("social_state"), tuple(claim.get("evidence_ids", [])))
         if key not in seen_minutes:
-            add("minutes", claim, text=attributed_text(claim)); seen_minutes.add(key)
+            add("minutes", claim, text=minute_text); seen_minutes.add(key)
     # A separate source claim may describe the same tentative deliverable as
     # an already published canonical task envelope. Keep the richer wording
     # and union exact provenance instead of printing a near-duplicate line.
@@ -440,9 +971,26 @@ def build_public_items(meeting_graph, summary_plan):
             materialized.setdefault("tasks", {})[cid] = {"status": "published", "public_id": keeper["public_id"],
                                                         "reason": "merged_equivalent_task_with_provenance"}
     sections = [item for item in sections if item["public_id"] not in redundant]
+    compatible_sections = {
+        "executive": {"overview", "decisions"},
+        "rules": {"rules"},
+        "technical": {"technical", "rules"},
+        "tasks": {"tasks"},
+        "experiments": {"experiments", "technical"},
+        "questions": {"questions"},
+        "minutes": {"minutes"},
+        "requires_verification": {"requires_verification"},
+    }
     for view, view_plan in view_plans.items():
         for claim_id in view_plan.get("selected_claim_ids", []):
-            published = next((values[claim_id] for values in materialized.values() if claim_id in values), None)
+            published = next(
+                (
+                    materialized[section][claim_id]
+                    for section in compatible_sections.get(view, {view})
+                    if claim_id in materialized.get(section, {})
+                ),
+                None,
+            )
             view_plan.setdefault("dispositions", {})[claim_id] = published or {"status": "excluded", "reason": "editorial_route_or_dedup"}
     return sections
 
@@ -454,6 +1002,30 @@ def validate_public_items_contract(items):
     for item in items:
         validated.append(PublicItemContract.model_validate(item).model_dump(mode="json"))
     return validated
+
+
+def canonicalize_public_item_order(items):
+    """Order chronology by its final, evidence-anchored timestamps.
+
+    ``build_public_items`` initially orders minute claims by the semantic
+    record timestamp.  The production worker subsequently snaps every item to
+    the closest cited source utterance.  A correction can therefore move past
+    an adjacent claim after the initial sort.  Preserve the editorial order of
+    every other view, but re-sort the chronology slots against the timestamps
+    that will actually be published and audited.
+    """
+    ordered_minutes = iter(sorted(
+        (item for item in items if item.get("section") == "minutes"),
+        key=lambda item: (
+            float(item.get("start", 0)),
+            float(item.get("end", item.get("start", 0))),
+            str(item.get("public_id") or ""),
+        ),
+    ))
+    return [
+        next(ordered_minutes) if item.get("section") == "minutes" else item
+        for item in items
+    ]
 
 
 def relation_markers(text):
@@ -587,13 +1159,32 @@ def verify_generated_items(items, sentence_plans, claims):
             "conditions": claim_conditions or ([v for p in plans for v in p.get("conditions", [])] if single_claim_contracts else []),
             "time_scope": list(dict.fromkeys(bound_scopes)),
         }
-        task_state = item.get("task_state", {}) if item.get("section") == "tasks" else {}
+        # Canonical tasks are intentionally projected into the overview and
+        # chronology as well as the task view.  Those projections use the
+        # same structured assignee/recipient and evidence closure, so they
+        # must be audited against the same task contract.  Restricting this
+        # to the task section caused valid recipient resolutions to be
+        # rejected only in the chronology.
+        task_state = item.get("task_state", {}) if item.get("task_state_id") else {}
         question_state = item.get("question_state", {}) if item.get("section") == "questions" else {}
         if task_state and item.get("task_state_id") in {by_claim[x].get("canonical_task_state_id") for x in claim_ids}:
             metadata_text = " ".join(str(task_state.get(field) or "") for field in ("description", "current_scope", "data_origin", "deadline", "assignee"))
             merged["allowed_numbers"].extend(NUMBER_RE.findall(metadata_text))
             merged["allowed_speakers"].extend(re.findall(r"@[\w.-]+", metadata_text))
             merged["allowed_assignees"].extend(re.findall(r"@[\w.-]+", metadata_text))
+            frame = task_state.get("action_frame", {}) if isinstance(task_state.get("action_frame"), dict) else {}
+            support = task_state.get("field_support", {}) if isinstance(task_state.get("field_support"), dict) else {}
+            supported_participants = []
+            if task_state.get("acceptance_evidence_ids") and frame.get("explicit_acceptance_actor"):
+                supported_participants.append(frame["explicit_acceptance_actor"])
+            for role in ("recipient", "beneficiary"):
+                if frame.get(role) and support.get(role):
+                    supported_participants.append(frame[role])
+            merged["allowed_speakers"].extend(
+                participant for participant in supported_participants
+                if re.fullmatch(r"@[\w.-]+", str(participant))
+            )
+            metadata_text += " " + " ".join(map(str, supported_participants))
             if task_state.get("current_scope"):
                 merged["time_scope"].append(str(task_state["current_scope"]))
         else:
@@ -648,14 +1239,30 @@ def verify_generated_items(items, sentence_plans, claims):
             realization = audit_realization(text, merged)
         if unknown_claim_ids:
             realization["errors"].append("unknown_claim")
+        if INCOMPLETE_PUBLIC_FRAGMENT_RE.search(text.strip()):
+            realization["errors"].append("incomplete_public_fragment")
         source_tokens = {v for value in exact_source_surfaces for v in re.findall(r"(?iu)[a-zа-яё0-9]+", value.casefold()) if len(v) > 2}
         source_tokens.update(v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", metadata_text.casefold()) if len(v) > 2)
         comparison_text = re.sub(
             r"(?iu)\s*\(статус:\s*(?:проверка недоступна|недостаточно доказательств для интерпретации|источник содержит противоречие)\)\s*$",
             "", text,
         )
-        text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", comparison_text.casefold()) if len(v) > 2}
-        editorial_tokens = {"спрашивает", "исполнитель", "статус", "объём", "срок", "условие", "участник", "назначение", "ожидает", "подтверждения", "предложен", "подтверждён", "уточнено", "известно", "осталось", "уточнить", "взял", "себя"}
+        # Task-card suffixes are structured metadata, not an added semantic
+        # clause.  Actor/status/scope are checked separately below and by the
+        # QA slots; including their prose labels in lexical entailment caused
+        # source-backed tasks to be silently removed.
+        semantic_comparison_text = re.sub(
+            r"(?iu)(?:\s+[—–-]\s+(?:исполнитель|объ[её]м|период\s+данных|срок|условие|статус):.*)$",
+            "",
+            comparison_text,
+        ) if item.get("section") == "tasks" else comparison_text
+        text_tokens = {v for v in re.findall(r"(?iu)[a-zа-яё0-9]+", semantic_comparison_text.casefold()) if len(v) > 2}
+        editorial_tokens = {
+            "спрашивает", "исполнитель", "статус", "объём", "срок", "условие",
+            "период", "источника", "выборки", "данных",
+            "участник", "назначение", "ожидает", "подтверждения", "предложен",
+            "подтверждён", "уточнено", "известно", "осталось", "уточнить", "взял", "себя",
+        }
         content_tokens = text_tokens - editorial_tokens
         overlap = len(source_tokens & content_tokens)
         if item.get("section") and overlap / max(1, len(content_tokens)) < .45:
@@ -715,6 +1322,35 @@ def partition_verified_public_items(items, report):
     return retained, rejected
 
 
+def protected_public_item_abstentions(items, report):
+    """Return mandatory outcomes that a lossy post-render filter would hide.
+
+    Weak context may be safely omitted after a failed realization audit, but
+    a confirmed canonical task, accepted decision, correction, blocker or
+    open question is part of the meeting contract.  Publication must fail
+    visibly instead of producing a green but incomplete summary.
+    """
+    audits = list(report.get("audits", []))
+    if len(items) != len(audits):
+        raise ValueError("PublicItem verification result does not match input length")
+    protected = []
+    for item, audit in zip(items, audits):
+        if audit.get("passed"):
+            continue
+        mandatory = (
+            item.get("section") == "tasks"
+            and item.get("social_state") in PROTECTED_TASK_STATES
+        ) or (
+            item.get("section") == "decisions"
+            and item.get("social_state") == "accepted"
+        ) or item.get("content_kind") in {
+            "blocker", "correction", "experimental_result", "schedule",
+        } or item.get("section") == "questions"
+        if mandatory:
+            protected.append({"public_item": item, "audit": audit})
+    return protected
+
+
 def publication_audit(report, artifact_text, items=None, summary_plan=None, verified_hash=None, document=None):
     items = items or []
     summary_plan = summary_plan or {}
@@ -731,6 +1367,7 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     def tokens(value): return {x for x in re.findall(r"(?iu)[a-zа-яё0-9]+", str(value or "").casefold()) if len(x) > 3}
     duplicates = 0
     cross_view_repetitions = 0
+    technical_experiment_duplicates = 0
     for index, left in enumerate(items):
         for right in items[index + 1:]:
             similar = equivalent(left, right, .8)
@@ -740,6 +1377,8 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
                 # Overview, canonical task and chronology intentionally reuse
                 # one supported claim in different views; track, do not reject.
                 cross_view_repetitions += similar
+                if {left.get("section"), right.get("section")} == {"technical", "experiments"}:
+                    technical_experiment_duplicates += similar
     minute_starts = [float(x.get("start", 0)) for x in items if x.get("section") == "minutes"]
     task_ids = [x.get("task_state_id") for x in items if x.get("section") == "tasks"]
     internal = INTERNAL_LABEL_RE
@@ -752,10 +1391,18 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         elif line.startswith("- ") and current: rendered_counts[current] = rendered_counts.get(current, 0) + 1
     item_counts = {section: sum(x.get("section") == section for x in items) for section in sorted({x.get("section") for x in items})}
     title_line = next((line for line in artifact_text.splitlines() if line.startswith("# ")), "")
-    authored_title = title_line.split("—", 1)[-1]
+    authored_title = title_line.removeprefix("# ").split("—", 1)[-1].strip()
     overview_match = re.search(r"(?s)## (?:Главное|Краткое описание[^\n]*)\n(.*?)(?=\n## |\Z)", artifact_text)
     authored_overview = overview_match.group(1) if overview_match else ""
     authored_surface = authored_title + "\n" + authored_overview
+    chronology_match = re.search(r"(?s)## Подробная хронология встречи\n(.*)\Z", artifact_text)
+    chronology_surface = chronology_match.group(1) if chronology_match else ""
+    # Exact source-bound details remain available for auditability inside
+    # collapsed disclosure blocks.  Reading-cost measures the default visible
+    # summary, not text that the reader explicitly chooses to expand.
+    visible_chronology_surface = re.sub(
+        r"(?is)<details>.*?</details>", "", chronology_surface
+    )
     allowed_document_numbers = {x.replace(" ", "") for item in items for x in NUMBER_RE.findall(str(item.get("text") or ""))}
     found_document_numbers = {x.replace(" ", "") for x in NUMBER_RE.findall(authored_surface)}
     state_conflicts = sum(bool(
@@ -773,21 +1420,61 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         if len({x[1] for x in values}) > 1 and not all(x[0] for x in values):
             states = {x[1] for x in values}
             cross_view_conflicts += any({a, b} <= states for a, b in incompatible)
-    dangling = re.compile(r"(?iu)(?:\.{3}|…)$|\b(?:и|или|что|чтобы|из-за|после)\s*$")
     double_modality = re.compile(r"(?iu)\b(?:предлагалось|предложено)\b.{0,40}\b(?:договорились|решили|принято)\b")
     mixed_token = re.compile(r"(?iu)\b(?:[а-яё]+[a-z]+|[a-z]+[а-яё]+)\b")
-    readability_lint = sum(bool(dangling.search(str(x.get("text") or "").strip()) or double_modality.search(str(x.get("text") or "")) or mixed_token.search(str(x.get("text") or ""))) for x in items)
+    readability_lint = sum(bool(INCOMPLETE_PUBLIC_FRAGMENT_RE.search(str(x.get("text") or "").strip()) or double_modality.search(str(x.get("text") or "")) or mixed_token.search(str(x.get("text") or ""))) for x in items)
     overview_surface = re.sub(r"[*`]", "", authored_overview).casefold()
     overview_surface_tokens = tokens(overview_surface)
     confirmed_tasks = [
         x for x in items
         if x.get("section") == "tasks" and x.get("social_state") in {"accepted", "self_committed", "assigned", "completed"}
     ]
+    overview_claim_ids = {
+        claim_id
+        for node in (document or {}).get("overview", [])
+        for claim_id in node.get("claim_ids", [])
+    }
     overview_has_committed_next_step = any(
-        bool(task_words := tokens(task.get("text")))
-        and len(task_words & overview_surface_tokens) / max(1, min(len(task_words), len(overview_surface_tokens))) >= .45
+        bool(set(task.get("claim_ids", [])) & overview_claim_ids)
+        or (
+            bool(task_words := tokens(
+                task.get("task_state", {}).get("deliverable")
+                or task.get("task_state", {}).get("description")
+                or task.get("text")
+            ))
+            and len(task_words & overview_surface_tokens)
+            / max(1, min(len(task_words), len(overview_surface_tokens))) >= .45
+        )
         for task in confirmed_tasks
     )
+    overview_claim_ids_for_utility = {
+        claim_id for node in (document or {}).get("overview", [])
+        for claim_id in node.get("claim_ids", [])
+    }
+    overview_backing_items = [
+        item for item in items
+        if overview_claim_ids_for_utility & set(item.get("claim_ids", []))
+    ]
+    available_constraint_items = [
+        item for item in items
+        if item.get("content_kind") in {"problem", "blocker", "constraint"}
+        and item.get("verification_status") == "supported"
+    ]
+    action_field_checks = []
+    for item in [value for value in items if value.get("section") == "tasks"]:
+        state = item.get("task_state", {})
+        support = state.get("field_support", {})
+        explicit = bool(state.get("source_commitment_evidence_ids"))
+        accepted = bool(state.get("acceptance_evidence_ids"))
+        action_field_checks.append(bool(support.get("predicate") or explicit or accepted))
+        if state.get("assignee"):
+            action_field_checks.append(bool(support.get("actor") or explicit or accepted))
+        frame = state.get("action_frame", {})
+        if frame.get("recipient"):
+            action_field_checks.append(bool(support.get("recipient")))
+        if state.get("completion_criterion"):
+            action_field_checks.append(bool(support.get("object") or state.get("evidence_ids")))
+    verified_action_field_rate = sum(action_field_checks) / max(1, len(action_field_checks))
     counters.update({
         "duplicate_items": duplicates,
         "cross_view_repetitions": cross_view_repetitions,
@@ -806,6 +1493,25 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "state_conflicts": state_conflicts,
         "cross_view_state_conflicts": cross_view_conflicts,
         "readability_lint_failures": readability_lint,
+        "title_unresolved_reference": int(
+            unresolved_public_reference(authored_title)
+            or "@" in authored_title
+            or bool(RAW_DIALOGUE_RE.search(authored_title))
+        ),
+        "overview_unresolved_reference": sum(
+            unresolved_public_reference(line)
+            for line in authored_overview.splitlines()
+            if line.strip() and not line.lstrip().startswith(("<", "**"))
+        ),
+        "overview_raw_dialogue": int(bool(RAW_DIALOGUE_RE.search(authored_overview))),
+        "task_raw_dialogue": sum(
+            x.get("section") == "tasks" and bool(RAW_DIALOGUE_RE.search(str(x.get("text") or "")))
+            for x in items
+        ),
+        "invalid_decision_acceptance": sum(
+            x.get("section") == "decisions" and not can_publish_as_decision(x)
+            for x in items
+        ),
         "task_without_deliverable": sum(x.get("section") == "tasks" and not str(x.get("task_state", {}).get("deliverable") or "").strip() for x in items),
         "vague_focus_tasks": sum(x.get("section") == "tasks" and bool(re.search(r"(?iu)\b(?:сделать\s+упор|сосредоточиться|ещ[её]\s+над\s+этим\s+посидеть)\b", str(x.get("text") or ""))) for x in items),
         "reported_plan_assignee_leaks": sum(
@@ -821,11 +1527,69 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "unplanned_document_numbers": len(found_document_numbers - allowed_document_numbers),
         "navigation_missing": int(bool(item_counts.get("minutes")) and "## Таймкоды" not in artifact_text),
         "chronology_missing": int(bool(item_counts.get("minutes")) and "## Подробная хронология встречи" not in artifact_text and "## Хронология встречи" not in artifact_text),
+        "weak_navigation_labels": sum(
+            navigation_label_needs_repair(chapter.get("label"))
+            for chapter in (document or {}).get("navigation", [])
+        ),
         "title_missing": int(not title_line),
         "title_too_long": int(len(authored_title.strip()) > 110),
+        "title_action_fragment": int(bool(TITLE_ACTION_FRAGMENT_RE.search(authored_title))),
+        "title_dangling_fragment": int(bool(TITLE_DANGLING_RE.search(authored_title))),
+        "title_low_information_clause": int(bool(TITLE_LOW_INFORMATION_RE.search(authored_title))),
+        "participant_only_title": int(document is not None and bool(authored_title.strip()) and not public_context_tokens(authored_title)),
+        "generic_fallback_title": int(document is not None and bool(re.fullmatch(r"(?iu)\s*(?:рабочие\s+итоги|итоги\s+рабочей\s+встречи)(?:\s+и\s+открытые\s+вопросы)?\s*", authored_title.strip()))),
         "excessive_residual_questions": int(item_counts.get("questions", 0) > 5),
         "excessive_technical_items": int(sum(x.get("section") == "technical" and not (x.get("content_kind") == "hypothesis" and x.get("social_state") == "constraint") for x in items) > 6),
+        "excessive_verification_items": int(item_counts.get("requires_verification", 0) > 8),
+        "technical_experiment_duplicates": technical_experiment_duplicates,
+        "tentative_decision_surfaces": sum(
+            x.get("section") == "decisions"
+            and x.get("content_kind") == "proposal"
+            and bool(PROPOSAL_SURFACE_RE.search(str(x.get("text") or "")))
+            and not str(x.get("text") or "").casefold().startswith("согласовано предложение:")
+            for x in items
+        ),
+        "non_action_task_surfaces": sum(
+            x.get("section") == "tasks"
+            and (not WORK_ACTION_SURFACE_RE.search(str(x.get("text") or ""))
+                 or bool(INTERNAL_LABEL_RE.search(str(x.get("text") or "")))
+                 or has_adjacent_stem_repetition(x.get("text")))
+            for x in items
+        ),
+        "verification_status_repeated_in_text": sum(
+            x.get("section") == "requires_verification"
+            and bool(re.search(r"(?iu)\(статус:\s*(?:проверка|недостаточно|источник)", str(x.get("text") or "")))
+            for x in items
+        ),
+        "overview_repeated_status": int(bool(re.search(
+            r"(?iu)—\s*статус:\s*([^().;\n]+?)\s*"
+            r"\(\s*статус:\s*\1\s*\)",
+            authored_overview,
+        ))),
         "definition_only_technical_items": sum(x.get("section") == "technical" and bool(re.search(r"(?iu)\b(?:называется|определяется|ширина\s*[—–-]\s*ширина)\b", str(x.get("text") or ""))) for x in items),
+        "open_questions_with_unverified_answer": sum(
+            x.get("section") == "questions"
+            and x.get("question_state", {}).get("status") in {"answer_not_verified", "answer_retrieval_failed"}
+            for x in items
+        ),
+        "overview_missing_main_constraint": int(
+            bool(available_constraint_items)
+            and not any(item.get("content_kind") in {"problem", "blocker", "constraint"} for item in overview_backing_items)
+        ),
+        "title_too_narrow": int(
+            len((document or {}).get("title", {}).get("claim_ids", [])) < 2
+            and len({item.get("episode_id") for item in items if item.get("episode_id")}) >= 4
+        ),
+        "chronology_excessive_reading_cost": int(
+            bool(chronology_surface)
+            and len(re.findall(r"(?iu)[a-zа-яё0-9]+", visible_chronology_surface))
+                > 110 * max(1, len((document or {}).get("chronology", [])))
+        ),
+        "low_verified_action_field_rate": int(bool(action_field_checks) and verified_action_field_rate < .75),
+        "selected_rules_missing": int(
+            bool(summary_plan.get("view_plans", {}).get("rules", {}).get("selected_claim_ids"))
+            and not item_counts.get("rules")
+        ),
     })
     if document is not None:
         contextual_sections = {"tasks", "questions", "technical", "experiments"}
@@ -913,12 +1677,27 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
         "unexplained_commitment_candidates": len(candidate_ids - routed_work - explained_candidates),
         "published_unique_claims": len(public_claims),
     })
-    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "section_context_repetitions", "section_context_low_relevance", "section_context_missing_role", "question_context_missing_known_answer", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing"}
+    integrity_keys = {"unsupported_public_items", "orphan_public_items", "status_upgrades", "superseded_items_published", "number_or_negation_mismatches", "cross_episode_merges_without_relation", "unknown_assignee_publications", "duplicate_items", "answered_questions_published_as_open", "answered_questions_in_minutes", "unconfirmed_tasks_published_as_committed", "duplicate_task_states", "chronology_inversions", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "missing_public_provenance", "planner_budget_violations", "state_conflicts", "cross_view_state_conflicts", "readability_lint_failures", "task_without_deliverable", "vague_focus_tasks", "reported_plan_assignee_leaks", "section_context_repetitions", "section_context_low_relevance", "section_context_missing_role", "question_context_missing_known_answer", "goal_only_experiments", "chronology_duplicate_fields", "section_count_mismatches", "unplanned_document_numbers", "navigation_missing", "chronology_missing", "title_missing", "invalid_decision_acceptance"}
     integrity = all(counters.get(key, 0) == 0 for key in integrity_keys) and counters["verified_artifact_hash"] == artifact_hash
     grounding = counters["unsupported_public_items"] == counters["number_or_negation_mismatches"] == counters["missing_public_provenance"] == 0
     coverage = bool(items) and unexplained == 0 and counters["unexplained_commitment_candidates"] == 0
-    readability = all(counters[key] == 0 for key in ("duplicate_items", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "readability_lint_failures"))
-    utility = counters["title_too_long"] == 0
+    readability = all(counters[key] == 0 for key in ("duplicate_items", "internal_labels_exposed", "rendered_english_prose", "invented_acronym_expansions", "zero_duration_chapters", "excessive_chapter_count", "readability_lint_failures", "title_unresolved_reference", "overview_unresolved_reference", "overview_raw_dialogue", "task_raw_dialogue"))
+    utility_keys = {
+        "title_too_long", "participant_only_title", "generic_fallback_title",
+        "title_action_fragment", "title_dangling_fragment", "title_low_information_clause",
+        "overview_missing_committed_next_step", "excessive_residual_questions",
+        "excessive_technical_items", "excessive_verification_items",
+        "technical_experiment_duplicates", "tentative_decision_surfaces",
+        "non_action_task_surfaces", "verification_status_repeated_in_text", "overview_repeated_status",
+        "definition_only_technical_items",
+        "open_questions_with_unverified_answer", "overview_missing_main_constraint",
+        "title_too_narrow", "chronology_excessive_reading_cost",
+        "low_verified_action_field_rate", "selected_rules_missing",
+        "title_unresolved_reference", "overview_unresolved_reference",
+        "overview_raw_dialogue", "task_raw_dialogue", "invalid_decision_acceptance",
+        "weak_navigation_labels",
+    }
+    utility = all(counters.get(key, 0) == 0 for key in utility_keys)
     semantic_source = (document or {}).get("semantic_audit")
     semantic_status = semantic_source.get("status", "not_evaluated") if semantic_source else ("passed" if audits and all(x.get("passed") for x in audits) else "not_evaluated")
     required_semantic = document is not None
@@ -935,11 +1714,8 @@ def publication_audit(report, artifact_text, items=None, summary_plan=None, veri
     semantic_reviews = (semantic_source or {}).get("reviews", [])
     relation_reviews = [item for item in semantic_reviews if item.get("relation_id")]
     task_items = [item for item in items if item.get("section") == "tasks"]
-    verified_action_fields = sum(
-        bool(item.get("task_state", {}).get("field_support", {}).get(field))
-        for item in task_items for field in ("actor", "predicate", "object", "recipient")
-    )
-    action_field_total = 4 * len(task_items)
+    verified_action_fields = sum(action_field_checks)
+    action_field_total = len(action_field_checks)
     supported_outcomes = len({claim_id for item in items if item.get("verification_status") == "supported" for claim_id in item.get("claim_ids", [])})
     audit_metrics = {
         "verified_action_field_rate": {"value": verified_action_fields / max(1, action_field_total), "source": "field_evidence", "denominator": action_field_total},
@@ -968,6 +1744,11 @@ def verify_public_document(document, artifact_text, items, graph=None):
     }
     context_source_ids = source_ids | set(graph_claims)
     graph_relations = {relation.get("relation_id"): relation for relation in (graph or {}).get("relations", []) if relation.get("relation_id")}
+    semantic_reviews_by_node = {
+        review.get("node_id"): review
+        for review in (document.get("semantic_audit") or {}).get("reviews", [])
+        if isinstance(review, dict) and review.get("node_id")
+    }
     render_trace = []
     by_claim = {}
     for item in items:
@@ -1048,7 +1829,8 @@ def verify_public_document(document, artifact_text, items, graph=None):
                             for field in ("description", "deliverable", "status", "task_status", "current_scope")))
             for item in backing
         )) if backing else set()
-        if not backing or len(tokens(node.get("text")) - source_words - {"статус"}) > 2:
+        independently_supported = semantic_reviews_by_node.get(f"overview:{overview_index}", {}).get("verdict") == "supported"
+        if not backing or (len(tokens(node.get("text")) - source_words - {"статус"}) > 2 and not independently_supported):
             errors.append("overview_semantic_drift")
     navigation = document.get("navigation", [])
     if document.get("chronology") and not navigation:
@@ -1066,10 +1848,47 @@ def verify_public_document(document, artifact_text, items, graph=None):
         else:
             render_trace.append({"node_id": f"navigation:{chapter_index}", "rendered": True})
         source_words = set().union(*(tokens(item.get("text")) for claim in chapter.get("claim_ids", []) for item in by_claim.get(claim, [])))
-        if len(tokens(chapter.get("label")) - source_words) > 1:
+        navigation_independently_supported = semantic_reviews_by_node.get(f"navigation:{chapter_index}", {}).get("verdict") == "supported"
+        if len(tokens(chapter.get("label")) - source_words) > 1 and not navigation_independently_supported:
             errors.append("navigation_semantic_drift")
         if re.search(r"(?iu)(?:\.{3}|…|\b(?:и|или|что|чтобы|из-за|после))$", str(chapter.get("label") or "").strip()):
             errors.append("truncated_navigation_label")
+        if navigation_label_needs_repair(chapter.get("label")):
+            errors.append("weak_navigation_label")
+    summaries_by_outcome = {}
+    chapter_items_by_outcome = {}
+    for chapter_index, chapter in enumerate(document.get("chronology", []), 1):
+        chapter_item_claims = {
+            claim_id for item in chapter.get("items", [])
+            for claim_id in item.get("claim_ids", [])
+        }
+        for outcome_id in chapter.get("outcome_ids", [chapter.get("outcome_id")]):
+            chapter_items_by_outcome[outcome_id] = chapter_item_claims
+        summaries = chapter.get("summary", [])
+        if not summaries:
+            continue
+        chapter_block = "\n".join(chapter_blocks.get(value, "") for value in chapter.get("outcome_ids", [chapter.get("outcome_id")]))
+        for summary_index, node in enumerate(summaries, 1):
+            node_id = f"chronology_summary:{chapter_index}:{summary_index}"
+            if not node.get("claim_ids") or not set(node.get("claim_ids", [])) <= source_ids or not node.get("evidence_ids"):
+                errors.append("unsupported_chronology_summary")
+            if not set(node.get("evidence_ids", [])) <= evidence_for(node.get("claim_ids", [])):
+                errors.append("chronology_summary_evidence_outside_closure")
+            rendered = surface(node.get("text")) in surface(chapter_block)
+            if not rendered:
+                errors.append("chronology_summary_not_rendered")
+            exact_public_item = any(
+                surface(node.get("text")) == surface(item.get("text"))
+                and set(node.get("claim_ids", [])) == set(item.get("claim_ids", []))
+                and set(node.get("evidence_ids", [])) == set(item.get("evidence_ids", []))
+                for item in items
+            )
+            if semantic_reviews_by_node.get(node_id, {}).get("verdict") != "supported" and not exact_public_item:
+                errors.append("chronology_summary_not_independently_supported")
+            render_trace.append({"node_id": node_id, "rendered": rendered})
+        represented_claims = {claim for node in summaries for claim in node.get("claim_ids", [])}
+        for outcome_id in chapter.get("outcome_ids", [chapter.get("outcome_id")]):
+            summaries_by_outcome[outcome_id] = represented_claims
     for card_index, card in enumerate(document.get("outcome_cards", []), 1):
         if not card.get("claim_ids") or not set(card["claim_ids"]) <= source_ids or not card.get("evidence_ids"):
             errors.append("unsupported_outcome_card")
@@ -1088,21 +1907,39 @@ def verify_public_document(document, artifact_text, items, graph=None):
                 rendered_tokens = tokens(rendered_card_block)
                 field_labels = {"current_state": "Состояние", "constraint": "Ограничение", "resolution": "Согласованный итог", "work_result": "Полученный результат", "mentioned_resource": "Упомянутый ресурс", "described_rule": "Описанное правило", "next_step": "Дальше", "remaining_unknown": "Осталось уточнить"}
                 exact_rendered = surface(field.get("value")) in surface(rendered_card_block)
+                represented_by_summary = bool(
+                    field.get("claim_ids")
+                    and set(field.get("claim_ids", [])) <= summaries_by_outcome.get(card.get("outcome_id"), set())
+                )
+                represented_by_public_item = bool(
+                    field.get("claim_ids")
+                    and set(field.get("claim_ids", [])) <= chapter_items_by_outcome.get(card.get("outcome_id"), set())
+                )
                 # A card projected into chronology must retain its typed
                 # public label.  A card used only as the backing structure for
                 # an overview sentence has no visible field label by design,
                 # but its exact value still has to be present.
                 label_rendered = (not chapter_block and exact_rendered) or surface(field_labels.get(name, name)) in surface(rendered_card_block)
-                if field.get("value") and not (label_rendered and exact_rendered):
+                if field.get("value") and not ((label_rendered and exact_rendered) or represented_by_summary or represented_by_public_item):
                     errors.append("outcome_field_not_rendered")
                     render_trace.append({"node_id": f"outcome:{card_index}:{name}:{field_index}", "rendered": False, "reason": "surface_missing"})
                 else:
-                    render_trace.append({"node_id": f"outcome:{card_index}:{name}:{field_index}", "rendered": True})
+                    reason = "represented_by_chapter_summary" if represented_by_summary and not exact_rendered else "represented_by_verified_detail" if represented_by_public_item and not exact_rendered else None
+                    render_trace.append({"node_id": f"outcome:{card_index}:{name}:{field_index}", "rendered": True, "reason": reason})
     for section, section_items in document.get("sections", {}).items():
         for item_index, item in enumerate(section_items, 1):
             target_words = tokens(section_text.get(section, ""))
             original = next((source for source in items if source.get("public_id") == item.get("public_id")), None)
-            if not original or original.get("text") != item.get("text") or len(tokens(item.get("text")) - target_words) > 2:
+            edited_node_id = f"section:{section}:{item_index}"
+            independently_supported = semantic_reviews_by_node.get(edited_node_id, {}).get("verdict") == "supported"
+            changed = not original or original.get("text") != item.get("text")
+            invalid_edit = (
+                not original or not set(item.get("claim_ids", [])) <= source_ids
+                or not set(item.get("evidence_ids", [])) <= evidence_for(item.get("claim_ids", []))
+                or (changed and not independently_supported)
+                or len(tokens(item.get("text")) - target_words) > 2
+            )
+            if invalid_edit:
                 errors.append("section_not_rendered_from_verified_items")
                 render_trace.append({"node_id": f"section:{section}:{item_index}", "rendered": False, "reason": "surface_missing_or_changed"})
             else:
@@ -1134,15 +1971,21 @@ def verify_public_document(document, artifact_text, items, graph=None):
         fields = [field for card in chapter_cards for raw in card.get("fields", {}).values()
                   for field in (raw if isinstance(raw, list) else [raw] if raw else []) if field and field.get("value")]
         covered = {claim for field in fields for claim in field.get("claim_ids", [])}
+        summary_covered = {claim for node in chapter.get("summary", []) for claim in node.get("claim_ids", [])}
         block = "\n".join(chapter_blocks.get(value, "") for value in chapter.get("outcome_ids", [chapter.get("outcome_id")]))
         for item_index, item in enumerate(chapter.get("items", []), 1):
-            represented = bool(fields) and (
-                set(item.get("claim_ids", [])) <= covered
-                or any(equivalent(item, field) for field in fields)
+            represented = (
+                bool(chapter.get("summary"))
+                and set(item.get("claim_ids", [])) <= summary_covered
+            ) or (
+                bool(fields) and (
+                    set(item.get("claim_ids", [])) <= covered
+                    or any(equivalent(item, field) for field in fields)
+                )
             )
             rendered = surface(item.get("text")) in surface(block)
             render_trace.append({"node_id": f"chronology:{chapter_index}:{item_index}", "rendered": rendered,
-                                 "reason": "represented_by_outcome_field" if represented and not rendered else None})
+                                 "reason": "represented_by_chapter_summary" if chapter.get("summary") and represented and not rendered else "represented_by_outcome_field" if represented and not rendered else None})
             if not represented and not rendered:
                 errors.append("chronology_source_item_not_rendered")
     chronology_ids = {item.get("public_id") for chapter in document.get("chronology", []) for item in chapter.get("items", [])}

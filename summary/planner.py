@@ -9,11 +9,14 @@ from summary.policy import TECHNICAL_KINDS
 TECHNICAL = set(TECHNICAL_KINDS)
 VIEW_KINDS = {
     "executive": {"decision", "proposal", "current_state", "observation", "problem", "blocker", "action", "follow_up", "question", "trading_rule", "system_rule", "design_choice"},
+    "rules": {"trading_rule", "system_rule"},
+    # Rules retain a dedicated protected view while remaining valid technical
+    # context for compatibility with existing projections.
     "technical": TECHNICAL, "tasks": {"action", "follow_up"},
-    "experiments": {"hypothesis", "experimental_result", "metric"},
+    "experiments": {"hypothesis"},
     "questions": {"question", "blocker", "schedule"}, "minutes": set(),
 }
-VIEW_BOOST = {"executive": {"decision": 5, "current_state": 5, "problem": 4, "blocker": 5, "action": 4}, "technical": {x: 5 for x in TECHNICAL}, "tasks": {"action": 8, "follow_up": 8}, "experiments": {"hypothesis": 7, "experimental_result": 7}, "questions": {"question": 8, "schedule": 6}, "minutes": {}}
+VIEW_BOOST = {"executive": {"decision": 5, "current_state": 5, "problem": 4, "blocker": 5, "action": 4}, "rules": {"trading_rule": 8, "system_rule": 8}, "technical": {x: 5 for x in TECHNICAL}, "tasks": {"action": 8, "follow_up": 8}, "experiments": {"hypothesis": 7}, "questions": {"question": 8, "schedule": 6}, "minutes": {}}
 
 
 def _kind(claim): return claim.get("content_kind") or claim.get("kind")
@@ -33,16 +36,16 @@ def adaptive_budget(claims, episodes, *, minimum=7, maximum=120, view="minutes",
     minutes = max([float(x.get("end", x.get("start", 0))) for x in active] or [0]) / 60
     threads = len({x.get("thread_id") for x in active if x.get("thread_id")}) or len(episodes)
     base = math.ceil(math.sqrt(max(1, minutes)) + 1.5 * threads + sum(_mandatory(x) for x in active) + len({_kind(x) for x in active}))
-    configured = {"executive": (4, 8), "technical": (4, 12), "tasks": (3, maximum), "experiments": (2, 10), "questions": (3, 10), "minutes": (minimum, maximum)}
+    configured = {"executive": (4, 8), "rules": (1, 6), "technical": (4, 12), "tasks": (3, maximum), "experiments": (2, 10), "questions": (3, 10), "minutes": (minimum, maximum)}
     if policy:
         global_min = int(policy.get("minimum", minimum))
         global_max = int(policy.get("maximum", maximum))
         configured["minutes"] = (global_min, global_max)
-        fractions = {"executive": (.2, .4), "technical": (.2, .55), "tasks": (.15, 1), "experiments": (.1, .4), "questions": (.1, .4)}
+        fractions = {"executive": (.2, .4), "rules": (.05, .25), "technical": (.2, .55), "tasks": (.15, 1), "experiments": (.1, .4), "questions": (.1, .4)}
         for name, (low_fraction, high_fraction) in fractions.items():
             configured[name] = (max(1, math.ceil(global_min * low_fraction)), max(1, math.ceil(global_max * high_fraction)))
     low, high = configured.get(view, (minimum, maximum))
-    return max(low, min(high, math.ceil(base * {"executive": .55, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 2.0}.get(view, 1))))
+    return max(low, min(high, math.ceil(base * {"executive": .55, "rules": .35, "technical": .85, "tasks": .7, "experiments": .8, "questions": .7, "minutes": 2.0}.get(view, 1))))
 
 
 def _utility(claim, score_fn, view):
@@ -68,7 +71,9 @@ def _select(claims, score_fn, view, budget):
     if view == "tasks":
         eligible = [x for x in eligible if x.get("canonical_task_anchor", True)]
     if view == "questions":
-        eligible = [x for x in eligible if x.get("question_status") not in {"answered", "rhetorical", "superseded"}]
+        # A candidate answer that failed typed entailment is an answer-link
+        # verification problem, not proof that the original ask is open.
+        eligible = [x for x in eligible if x.get("question_status") not in {"answered", "rhetorical", "superseded", "answer_not_verified", "answer_retrieval_failed"}]
     ranked = sorted(eligible, key=lambda x: (-_utility(x, score_fn, view), float(x.get("start", 0))))
     protected = sorted((item for item in eligible if _mandatory(item)), key=lambda x: (float(x.get("start", 0)), x.get("claim_id", "")))
     selected = list(protected)

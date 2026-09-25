@@ -12,6 +12,7 @@ from .reducers import reduce_decisions, reduce_questions, reduce_rules_and_exper
 
 ACT_MAP = {"asserted": "assert", "assert": "assert", "ask": "ask", "answer": "answer", "propose": "propose", "proposal": "propose", "accept": "accept", "reject": "reject", "commit": "commit", "correct": "correct", "decide": "decide", "defer": "defer"}
 SHORT_ACK_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|ага|угу|ок(?:ей)?|согласен|делаем|подтверждаю|нет|неа|не\s+согласен)\s*(?:$|\b)")
+INTERNAL_ACTION_RE = re.compile(r"(?iu)^@?[\w.-]+\s+[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?:\s+.*)?$")
 
 
 def _expand_action_records(records):
@@ -34,7 +35,54 @@ def _expand_action_records(records):
             temporal = action.get("temporal_state", "unknown")
             commitment = action.get("commitment_state", "unknown")
             child = dict(record)
+            turns = sorted(record.get("dialogue_evidence", []), key=lambda item: float(item.get("start", 0)))
+            direct = [turn for turn in turns if turn.get("id") in set(evidence)]
+            reference_surface = " ".join(
+                str(value or "") for value in (
+                    record.get("statement"), action.get("object"),
+                    *(turn.get("text") for turn in direct),
+                )
+            )
+            if len(actions) == 1 and re.search(
+                r"(?iu)\b(?:это|этот|эта|эти|его|е[её]|их|тебе|вам)\b",
+                reference_surface,
+            ):
+                if direct:
+                    first = min(float(turn.get("start", 0)) for turn in direct)
+                    direct_speakers = {turn.get("speaker") for turn in direct if turn.get("speaker")}
+                    antecedents = [
+                        turn for turn in turns
+                        if turn.get("id") not in evidence
+                        and 0 <= first - float(turn.get("start", 0)) <= 20
+                        and turn.get("speaker") in direct_speakers
+                        and len(str(turn.get("text") or "").split()) >= 4
+                    ]
+                    if antecedents:
+                        antecedent = antecedents[-1]
+                        evidence = list(dict.fromkeys([antecedent.get("id")] + evidence))
+                        child["source_word_ids"] = list(dict.fromkeys(
+                            list(child.get("source_word_ids", []))
+                            + list(antecedent.get("source_word_ids", []))
+                        ))
+                        child["reference_resolution"] = {
+                            "status": "resolved_from_adjacent_same_speaker_turn",
+                            "antecedent_evidence_ids": [antecedent.get("id")],
+                        }
             action_statement = " ".join(str(value).strip() for value in (actor, action.get("predicate"), action.get("object")) if value).strip()
+            # Machine predicate identifiers are useful for identity, but are
+            # not a human proposition and fail the language-aware task guard.
+            # Keep the atomic fields while reducing the source statement.
+            # A one-action semantic record already has an independently
+            # reviewed, reader-facing statement.  Rebuilding it from the
+            # model's predicate/object fields can reintroduce the raw spoken
+            # turn (hesitations, second-person deixis and several sentences)
+            # after that wording has been cleaned.  Atomic reconstruction is
+            # needed only when several actions must be separated.
+            public_statement = (
+                record.get("statement")
+                if len(actions) == 1 or INTERNAL_ACTION_RE.fullmatch(action_statement or "")
+                else action_statement or record.get("statement")
+            )
             child.update({
                 "record_id": f"{record.get('record_id')}:A{index:02d}",
                 "source_fact_id": record.get("source_fact_id") or record.get("record_id"),
@@ -43,7 +91,8 @@ def _expand_action_records(records):
                 "kind": "action", "content_kind": "action",
                 "subject": actor, "predicate": action.get("predicate"),
                 "object": action.get("object"), "recipient": action.get("recipient"),
-                "statement": action_statement or record.get("statement"),
+                "parallel": bool(action.get("parallel")),
+                "statement": public_statement,
                 "source_statement": record.get("statement"),
                 "grammatical_actor": actor, "assignees": [actor] if actor else [],
                 "temporal_state": temporal, "commitment_state": commitment,
@@ -64,14 +113,39 @@ def _expand_embedded_replies(records):
     relation resolver bind it.  An intervening question prevents the binding.
     """
     expanded = list(records)
+    # ``_expand_action_records`` keeps a proposal/decision parent alongside
+    # its atomic action children.  An acknowledgement belongs to the work
+    # clauses, not to the broad parent summary.  Let the first atomic child
+    # claim it; the task reducer deliberately shares the resulting relation
+    # with its same-parent siblings.
+    expanded_action_parents = {
+        record.get("parent_record_id")
+        for record in records
+        if record.get("parent_record_id")
+    }
     covered_evidence = {evidence for record in records for evidence in record.get("evidence_ids", []) if record.get("record_id", "").find(":ACK:") >= 0}
     for record in records:
         if record.get("kind") not in {"proposal", "decision", "action", "follow_up", "question"}:
             continue
+        if record.get("record_id") in expanded_action_parents:
+            continue
+        direct_evidence = set(record.get("evidence_ids", []))
+        direct_evidence.update(
+            evidence_id
+            for action in record.get("actions", []) if isinstance(action, dict)
+            for evidence_id in action.get("evidence_ids", [])
+        )
         turns = sorted(record.get("dialogue_evidence", []), key=lambda item: float(item.get("start", 0)))
         for prior, reply in zip(turns, turns[1:]):
             reply_id = reply.get("id")
             if not reply_id or reply_id in covered_evidence or not SHORT_ACK_RE.search(str(reply.get("text") or "")):
+                continue
+            # ``dialogue_evidence`` is a context window, not proof that every
+            # turn belongs to this record.  Bind an acknowledgement only when
+            # the immediately preceding utterance is direct evidence for the
+            # record/action.  Otherwise an earlier broad observation can steal
+            # a later "да" from the actual two-party proposal.
+            if prior.get("id") not in direct_evidence:
                 continue
             if not prior.get("speaker") or not reply.get("speaker") or prior.get("speaker") == reply.get("speaker"):
                 continue
@@ -81,7 +155,7 @@ def _expand_embedded_replies(records):
             if expected_speaker and prior.get("speaker") not in expected_speaker:
                 continue
             is_rejection = bool(re.match(r"(?iu)^\s*(?:нет|неа|не\s+согласен)", str(reply.get("text") or "")))
-            expanded.append({
+            synthetic = {
                 "record_id": f"{record.get('record_id')}:ACK:{reply_id}",
                 "source_fact_id": record.get("source_fact_id") or record.get("record_id"),
                 "origin_id": record.get("origin_id") or record.get("record_id"),
@@ -94,7 +168,12 @@ def _expand_embedded_replies(records):
                 "start": float(reply.get("start", 0)), "end": float(reply.get("end", reply.get("start", 0))),
                 "dialogue_evidence": [reply], "verification_status": record.get("verification_status", "supported"),
                 "synthetic_from_adjacency": True,
-            })
+            }
+            if not is_rejection and record.get("kind") != "question":
+                # Resolve this exact adjacency pair before any separately
+                # extracted fact at the same timestamp can steal the reply.
+                synthetic["accepts_record_ids"] = [record.get("record_id")]
+            expanded.append(synthetic)
             covered_evidence.add(reply_id)
     return expanded
 
@@ -230,9 +309,18 @@ def build_meeting_graph(records, provenance=None, meeting_id=None):
         }
         claim["dialogue_evidence"] = [item for x in prop_events for item in x.get("dialogue_evidence", [])]
         claim["context_ids"] = list(dict.fromkeys(value for x in prop_events for value in x.get("context_ids", [])))
+        claim["protected_outcome"] = any(bool(record.get("protected_outcome")) for record in source_records)
+        claim["parallel"] = any(bool(record.get("parallel")) for record in source_records)
         if prop["proposition_id"] in decision_by_prop:
             decision = decision_by_prop[prop["proposition_id"]]
-            claim.update(decision_status=decision["status"], decision_evidence_ids=decision.get("decision_evidence_ids", []), acceptance_check=decision.get("acceptance_check"))
+            claim.update(
+                decision_status=decision["status"],
+                decision_evidence_ids=decision.get("decision_evidence_ids", []),
+                acceptance_check=decision.get("acceptance_check"),
+                acceptance_relation_ids=decision.get("acceptance_relation_ids", []),
+                acceptance_evidence_ids=decision.get("acceptance_evidence_ids", []),
+                accepted_by=decision.get("accepted_by", []),
+            )
         if prop["proposition_id"] in task_by_prop:
             task = task_by_prop[prop["proposition_id"]]
             claim.update(task_status=task["status"], assignee=task.get("assignee"), automation_eligible=task.get("automation_eligible"), automation_status=task.get("automation_status", "unknown"), scope_state=task.get("scope_state"), time_scope=task.get("current_scope"), canonical_task_state_id=task["task_id"], canonical_task_anchor=prop["proposition_id"] == task["proposition_id"], commitment_strength=task.get("commitment_strength"), commitment_actor=task.get("commitment_actor"), due_raw=task.get("due_raw"), due_normalized=task.get("due_normalized"), due_resolution_status=task.get("due_resolution_status"))

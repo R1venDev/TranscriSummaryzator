@@ -91,7 +91,18 @@ def build_outcome_cards(graph, allowed_claim_ids=None):
             label = str(next_claim.get("publication_text") or task.get("deliverable") or next_claim.get("statement") or "").strip()
             if task.get("status"):
                 labels = {"self_committed": "участник взял на себя", "intent_to_attempt": "участник намерен попробовать", "in_progress": "в работе", "past_attempt": "ранее выполнялось", "assigned_pending": "назначение ожидает подтверждения", "assigned": "назначено", "accepted": "согласовано", "completed": "выполнено", "blocked": "заблокировано", "proposed": "предложено, не подтверждено", "idea": "идея, не подтверждена"}
-                label += f" (статус: {labels.get(task['status'], task['status'])})"
+                status_label = labels.get(task["status"], task["status"])
+                # ``publication_text`` may already be the fully rendered
+                # canonical task (deliverable, assignee and status).  Add the
+                # outcome-card gloss only when that exact status is absent;
+                # a genuinely different status remains visible for the
+                # downstream state-conflict gate.
+                has_same_status = re.search(
+                    rf"(?iu)(?:—|\()\s*статус\s*:\s*{re.escape(str(status_label))}\s*\)?\s*$",
+                    label,
+                )
+                if not has_same_status:
+                    label += f" (статус: {status_label})"
             next_field = _field(next_claim, label)
         resolution_field = _field(resolution)
         earlier_fields = [

@@ -66,7 +66,7 @@ MEETING_DAG = DAG([
     _s("14_thread_resolve", "v5", ("episodes", "relations"), ("meeting_graph",), ("13_episode_segment",), outs="MeetingGraphSchema/v7", metrics=("thread_score",)),
     _s("15_project_delta", "v2", ("meeting_graph",), ("project_graph", "delta"), ("14_thread_resolve",), outs="ProjectGraphSchema/v2"),
     _s("16_view_plan", "v5", ("meeting_graph", "project_graph"), ("view_plans",), ("15_project_delta",), outs="SummaryPlanSchema/v5"),
-    _s("17_realize", "v6", ("view_plans",), ("public_items",), ("16_view_plan",), outs="PublicItemSchema/v4"),
+    _s("17_realize", "v7", ("view_plans",), ("public_items",), ("16_view_plan",), outs="PublicItemSchema/v5"),
     _s("18_verify", "v6", ("public_items", "meeting_graph"), ("verified_public_items",), ("17_realize",), outs="PublicationAuditSchema/v5", degradation="abstain", metrics=("public_precision", "condition_preservation", "orphan_public_items", "status_upgrades", "duplicates", "chronology_inversions", "unknown_semantic_checks", "rendered_node_coverage")),
     _s("19_publish", "v4", ("verified_public_items",), ("published_outputs",), ("18_verify",), outs="PublishedMeeting/v4"),
 ])

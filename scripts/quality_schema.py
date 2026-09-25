@@ -56,6 +56,155 @@ TRANSCRIPT_VERIFICATION_RE = re.compile(
 DISCUSSION_QUESTION_RE = re.compile(
     r"(?iu)(?:следующ\w*\s+созвон|подтверждения времени.*нет|остался вопрос,?\s+где)"
 )
+SOURCE_ACTION_RE = re.compile(
+    r"(?iu)\b(?:сдела(?:ть|ю|ем)|созда(?:ть|м|дим)|подготов(?:ить|лю|им)|"
+    r"переда(?:ть|м|дим)|отправ(?:ить|лю|им)|предостав(?:ить|лю|им)|"
+    r"размеч(?:ать|ивать|у|аю|иваю|аем|иваем)|встро(?:ить|ю|им)|провер(?:ить|ю|им)|"
+    r"исправ(?:ить|лю|им)|продолж(?:ить|у|им)|экспериментир(?:овать|ую|уем)|"
+    r"реализ(?:овать|ую|уем)|добав(?:ить|лю|им)|подключ(?:ить|у|им)|"
+    r"скин(?:уть|у|ем)|показ(?:ать|жу|ем))\b"
+)
+SOURCE_FIRST_PERSON_COMMIT_RE = re.compile(
+    r"(?iu)\bя\b[^.!?\n]{0,120}\b(?:буду|сделаю|создам|подготовлю|передам|"
+    r"отправлю|предоставлю|пришлю|скину|кину|дам|размечу|встрою|проверю|"
+    r"исправлю|продолжу|реализую|добавлю|подключу|покажу)\b|"
+    r"\b(?:сделаю|создам|подготовлю|передам|отправлю|предоставлю|пришлю|"
+    r"скину|кину|размечу|встрою|проверю|исправлю|продолжу|покажу)\b"
+)
+SOURCE_SELF_ASSIGNMENT_RE = re.compile(
+    r"(?iu)\bмне\b[^.!?\n]{0,80}\b(?:сделать|создать|подготовить|передать|"
+    r"отправить|предоставить|размечать|разметить|встроить|проверить|"
+    r"исправить|продолжить|экспериментировать|реализовать|добавить|подключить)\b"
+)
+SOURCE_FIRST_PERSON_PROGRESS_RE = re.compile(
+    r"(?iu)\bя\b[^.!?\n]{0,80}\b(?:делаю|создаю|готовлю|передаю|отправляю|"
+    r"размечаю|встраиваю|проверяю|исправляю|продолжаю|экспериментирую|"
+    r"реализую|добавляю|подключаю|анализирую|работаю|рисую|пишу)\b|"
+    r"\bя\b(?:(?!\b(?:он|она|они|ты|вы)\b)[^.!?\n]){0,80}"
+    r"\b(?:пош[её]л|пошла|начал|начала|приступил|приступила)\b"
+    r"[^.!?\n]{0,30}\b[а-яё-]+(?:ть|ти)\b"
+)
+SOURCE_FIRST_PERSON_ONSET_RE = re.compile(
+    r"(?iu)\bя\b(?:(?!\b(?:он|она|они|ты|вы)\b)[^.!?\n]){0,80}"
+    r"\b(?:пош[её]л|пошла|начал|начала|приступил|приступила)\b"
+    r"[^.!?\n]{0,30}?\b(?P<predicate>[а-яё-]+(?:ть|ти))\b"
+)
+SOURCE_FIRST_PERSON_PAST_RE = re.compile(
+    r"(?iu)\bя\b[^.!?\n]{0,100}\b(?:пробовал(?:а)?|попробовал(?:а)?|"
+    r"пытал(?:ся|ась)|делал(?:а)?|проверял(?:а)?|экспериментировал(?:а)?|"
+    r"занимал(?:ся|ась)|реализовал(?:а)?|добавлял(?:а)?|анализировал(?:а)?)\b"
+)
+INTERNAL_PREDICATE_RE = re.compile(r"(?i)^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+PROCEDURAL_RULE_SURFACE_RE = re.compile(
+    r"(?iu)(?=.*\b(?:если|когда|при|как\s+только|после\s+того\s+как|до\s+того\s+как)\b)"
+    r"(?=.*\b(?:нужно|надо|следует|требуется|разрешено|запрещено|обязательно|"
+    r"[a-zа-яё-]{3,}(?:ется|ются|ается|яются|ится|ятся|ывается|иваются|ируется|ируются|уется|уются))\b)"
+)
+
+
+def source_action_clauses(fact, owners):
+    """Recover independently reducible predicates from exact owner speech.
+
+    This is deliberately a bounded syntactic fallback.  It never invents an
+    actor: only a sole audited owner speaking the cited turn can supply it.
+    """
+    if len(owners) != 1:
+        return []
+    actor = owners[0]
+    result = []
+    for turn in fact.get("evidence", []):
+        if turn.get("speaker") != actor:
+            continue
+        text = str(turn.get("text") or "")
+        matches = []
+        for match in SOURCE_ACTION_RE.finditer(text):
+            local_start = max(text.rfind(mark, 0, match.start()) for mark in ".!?;,\n") + 1
+            local_prefix = text[local_start:match.start()]
+            # A plural subject is a team action, not a personal obligation of
+            # the sole audited owner of the surrounding fact.
+            if re.search(r"(?iu)\bмы\b[^.!?;]{0,40}$", local_prefix):
+                continue
+            matches.append({"start": match.start(), "end": match.end(), "predicate": match.group(0)})
+        # Product/domain vocabularies cannot enumerate every useful verb.
+        # A first-person onset construction (``я X начал/пошёл делать``)
+        # supplies its own safe grammatical boundary, so recover its
+        # infinitive without adding every Russian infinitive to the broad
+        # action lexicon.  The regex rejects an intervening personal subject.
+        for onset in SOURCE_FIRST_PERSON_ONSET_RE.finditer(text):
+            predicate_start, predicate_end = onset.span("predicate")
+            if not any(item["start"] == predicate_start for item in matches):
+                matches.append({
+                    "start": predicate_start,
+                    "end": predicate_end,
+                    "predicate": onset.group("predicate"),
+                })
+        matches.sort(key=lambda item: (item["start"], item["end"]))
+        if not matches:
+            continue
+        # ``X или Y`` is one delivery alternative, while ``X и затем Y`` is
+        # two independently trackable actions.  Preserve the alternative in a
+        # single object instead of manufacturing two obligations.
+        groups = []
+        index = 0
+        while index < len(matches):
+            last = index
+            while last + 1 < len(matches):
+                bridge = text[matches[last]["end"]:matches[last + 1]["start"]]
+                if not re.search(r"(?iu)\b(?:или|либо)\b", bridge):
+                    break
+                last += 1
+            groups.append((index, last))
+            index = last + 1
+        for group_index, (first, last) in enumerate(groups):
+            match = matches[first]
+            end = matches[groups[group_index + 1][0]]["start"] if group_index + 1 < len(groups) else len(text)
+            fragment = text[match["start"]:end]
+            # Some languages naturally place the action object before the
+            # finite verb (``объект тогда буду размечать``).  Preserve that
+            # local object without relying on a domain vocabulary.
+            sentence_start = max(text.rfind(mark, 0, match["start"]) for mark in ".!?;\n") + 1
+            prefix = text[sentence_start:match["start"]].strip(" ,.;:!?—-\"")
+            prefix = re.sub(
+                r"(?iu)\b(?:я|мы|мне|нам|тогда|потом|затем|дальше|сейчас|"
+                r"буду|будем|нужно|надо|хочу|пытаюсь|пош[её]л|пошла|"
+                r"начал|начала|приступил|приступила)\b",
+                " ", prefix,
+            )
+            prefix = re.sub(r"\s+", " ", prefix).strip(" ,.;:!?—-\"")
+            if len(prefix.split()) > 5 or SOURCE_ACTION_RE.search(prefix):
+                prefix = ""
+            fragment = re.sub(r"(?iu)\s+(?:и\s+пойти|и|а|затем|потом|дальше|пойти)\s*$", "", fragment)
+            fragment = fragment.strip(" ,.;:!?—-\"")
+            if not fragment:
+                continue
+            predicate = match["predicate"]
+            object_value = fragment[len(predicate):].strip(" ,.;:!?—-") or None
+            if object_value:
+                object_value = re.split(
+                    r"(?iu)(?:^|[,;]?\s+)(?:и|а)\s+(?:параллельно\s+)?(?:я|мы|он|она|они|вы|ты)\b",
+                    object_value,
+                    maxsplit=1,
+                )[0].strip(" ,.;:!?—-") or None
+            if prefix:
+                object_value = " ".join(part for part in (prefix, object_value) if part)
+            source_temporal = (
+                "past_attempt" if SOURCE_FIRST_PERSON_PAST_RE.search(text)
+                else "in_progress" if SOURCE_FIRST_PERSON_PROGRESS_RE.search(text)
+                else "planned"
+            )
+            source_commitment = (
+                "intent_to_attempt" if re.search(r"(?iu)\bя\b[^.!?\n]{0,80}\b(?:попробую|попытаюсь|хочу\s+попробовать)\b", text)
+                else "explicit_commitment" if SOURCE_FIRST_PERSON_COMMIT_RE.search(text)
+                else "unknown"
+            )
+            result.append({
+                "actor": actor, "predicate": predicate,
+                "object": object_value, "recipient": None,
+                "parallel": bool(re.search(r"(?iu)\bпараллельно\b", text[max(sentence_start, match["start"]-60):end+80])),
+                "temporal_state": source_temporal, "commitment_state": source_commitment,
+                "evidence_ids": [turn.get("id")] if turn.get("id") else [],
+            })
+    return result
 
 
 def clamp(value, default=None):
@@ -158,13 +307,35 @@ def normalize_semantic_record(raw, fact):
         if isinstance(item, dict) and item.get("id") in evidence_set
     }
     audited_owners = [value for value in fact.get("owner_refs", []) if value in speakers]
+    # Editorial correction may legitimately rewrite the public statement, but
+    # it must not erase an actor spoken in the immutable source. Recover only a
+    # first-person actor from that actor's own attributed turn; this is not a
+    # name/role guess and works for arbitrary participants and domains.
+    source_owner_turns = [
+        turn for turn in fact.get("evidence", [])
+        if turn.get("speaker") and (
+            SOURCE_FIRST_PERSON_COMMIT_RE.search(str(turn.get("text") or ""))
+            or SOURCE_SELF_ASSIGNMENT_RE.search(str(turn.get("text") or ""))
+            or SOURCE_FIRST_PERSON_PROGRESS_RE.search(str(turn.get("text") or ""))
+            or SOURCE_FIRST_PERSON_PAST_RE.search(str(turn.get("text") or ""))
+        )
+    ]
+    source_owner_candidates = list(dict.fromkeys(turn.get("speaker") for turn in source_owner_turns))
+    source_lifecycle_owner_candidates = list(dict.fromkeys(
+        turn.get("speaker") for turn in fact.get("evidence", [])
+        if turn.get("speaker") and (
+            SOURCE_FIRST_PERSON_PROGRESS_RE.search(str(turn.get("text") or ""))
+            or SOURCE_FIRST_PERSON_PAST_RE.search(str(turn.get("text") or ""))
+        )
+    ))
     action_text = str(fact.get("statement") or "")
     commitment_like = bool(COMMITMENT_RE.search(action_text))
+    source_work_lifecycle = len(source_lifecycle_owner_candidates) == 1
     owners = []
     if fact.get("type") == "action" or commitment_like:
         # The semantic model may see several speakers in the evidence.  Only the
         # owner already proven by the action-policy pass may become an assignee.
-        owners = audited_owners
+        owners = audited_owners or (source_owner_candidates if len(source_owner_candidates) == 1 else [])
         # An assignee is confirmed only by their own utterance.  Agreement from
         # another participant can confirm the plan, but cannot accept work on
         # somebody else's behalf.
@@ -173,6 +344,12 @@ def normalize_semantic_record(raw, fact):
             evidence_id for evidence_id in confirmation_ids
             if evidence_by_id.get(evidence_id, {}).get("speaker") in owner_set
         ]
+    elif source_work_lifecycle:
+        # A model/editor may retype ongoing or attempted work as a proposal or
+        # observation.  Only the one speaker whose own words encode that
+        # lifecycle may be restored; a self-assignment question remains merely
+        # a proposal until accepted and is handled by its atomic action frames.
+        owners = audited_owners or source_lifecycle_owner_candidates
     proposed_by = [value for value in raw.get("proposed_by", []) if value in speakers]
     if fact.get("type") not in {"proposal", "action"}:
         proposed_by = []
@@ -264,7 +441,7 @@ def normalize_semantic_record(raw, fact):
             question_status = "unclear"
     uncertainty = dict(fact.get("uncertainty", {}))
     assignment_status = "not_applicable"
-    if fact.get("type") == "action" or commitment_like:
+    if fact.get("type") == "action" or commitment_like or source_work_lifecycle:
         if owners and confirmation_ids:
             assignment_status = "confirmed"
         elif owners:
@@ -275,17 +452,68 @@ def normalize_semantic_record(raw, fact):
             uncertainty = dict(uncertainty, needs_review=True)
             uncertainty["reasons"] = sorted(set(uncertainty.get("reasons", [])) | {"assignee_not_confirmed"})
     evidence_text = " ".join(str(item.get("text") or "") for item in fact.get("evidence", []))
-    detected_act = primary_speech_act(action_text, fact.get("type"))
+    owner_source_text = " ".join(
+        str(item.get("text") or "") for item in fact.get("evidence", [])
+        if len(owners) == 1 and item.get("speaker") == owners[0]
+    )
+    source_first_person_commitment = bool(
+        owner_source_text and SOURCE_FIRST_PERSON_COMMIT_RE.search(owner_source_text)
+    )
+    source_first_person_progress = bool(
+        owner_source_text and SOURCE_FIRST_PERSON_PROGRESS_RE.search(owner_source_text)
+    )
+    source_first_person_past = bool(
+        owner_source_text and SOURCE_FIRST_PERSON_PAST_RE.search(owner_source_text)
+    )
+    # Detect the act from the words themselves.  Treating every extractor item
+    # typed ``action`` as a commitment turned observations and questions into
+    # tasks.  Type-based defaults remain safe for inherently dialogic kinds.
+    detected_act = primary_speech_act(action_text, None)
+    # Third-person future wording in an editorial statement ("X сделает") is
+    # not itself a commitment. Only the actor's own source turn can upgrade it.
+    if detected_act == "commit" and not source_first_person_commitment:
+        detected_act = "propose" if fact.get("type") in {"action", "proposal", "follow_up"} else "assert"
+    if source_first_person_commitment:
+        detected_act = "commit"
+    if detected_act == "assert" and fact.get("type") == "question":
+        detected_act = "ask"
+    elif detected_act == "assert" and fact.get("type") == "proposal":
+        detected_act = "propose"
+    elif detected_act == "assert" and fact.get("type") == "decision":
+        detected_act = "decide"
     raw_act = raw.get("speech_act")
     if raw_act in {"assert", "propose", "ask", "answer", "commit", "accept", "reject", "correct", "decide"}:
-        detected_act = raw_act if detected_act == "assert" else detected_act
+        # A model-only ``commit`` cannot override source wording; an explicit
+        # promise or the later acceptance reducer must establish obligation.
+        if detected_act == "assert" and (raw_act != "commit" or commitment_like):
+            detected_act = raw_act
+    source_self_proposal = bool(
+        fact.get("type") in {"action", "follow_up"}
+        and len(owners) == 1
+        and any(
+            turn.get("speaker") == owners[0]
+            and "?" in str(turn.get("text") or "")
+            and (SOURCE_SELF_ASSIGNMENT_RE.search(str(turn.get("text") or ""))
+                 or SOURCE_ACTION_RE.search(str(turn.get("text") or "")))
+            for turn in fact.get("evidence", [])
+        )
+    )
+    if source_self_proposal and detected_act in {"assert", "answer", "ask", "commit"}:
+        detected_act = "propose"
     legacy_modality = raw.get("modality") if raw.get("modality") in {"asserted", "tentative", "proposed", "committed", "question"} else ("tentative" if fact.get("certainty") == "tentative" else "asserted")
-    explicit_commitment = bool(COMMITMENT_RE.search(action_text)) and len(owners) == 1
+    explicit_commitment = source_first_person_commitment and len(owners) == 1
     raw_time_expression = (
         str(raw.get("time_expression", {}).get("raw_text") or raw.get("time_expression", {}).get("text") or "").strip()
         if isinstance(raw.get("time_expression"), dict)
         else str(raw.get("time_expression") or "").strip()
     ) or None
+    source_ambiguous_clock = re.search(
+        r"(?iu)\bпосле\s+0{1,2}(?::0{2})?\b", evidence_text,
+    )
+    if source_ambiguous_clock:
+        # Preserve the exact source expression.  A model-normalized 00:00
+        # would falsely imply a resolved cross-day boundary.
+        raw_time_expression = source_ambiguous_clock.group(0)
     ambiguous_clock = bool(raw_time_expression and re.search(r"(?iu)\bпосле\s+0{1,2}(?::0{2})?\b", raw_time_expression)
                            and not (isinstance(raw.get("time_expression"), dict) and raw["time_expression"].get("timezone")))
     known_term_text = " ".join(str(value or "") for value in (
@@ -332,11 +560,22 @@ def normalize_semantic_record(raw, fact):
         field_ids = lambda key: [item for item in value.get(key, []) if item in ids]
         temporal_state = value.get("temporal_state") if value.get("temporal_state") in {"planned", "in_progress", "past_attempt", "completed", "unknown"} else "unknown"
         commitment_state = value.get("commitment_state") if value.get("commitment_state") in {"none", "intent_to_attempt", "explicit_commitment", "accepted_assignment", "unknown"} else "unknown"
+        if source_first_person_past:
+            temporal_state, commitment_state = "past_attempt", "none"
+        elif source_first_person_progress:
+            temporal_state = "in_progress"
+        elif source_first_person_commitment:
+            temporal_state, commitment_state = "planned", "explicit_commitment"
+        elif temporal_state in {"planned", "in_progress", "past_attempt", "completed"}:
+            # Model lifecycle labels cannot create work state without exact
+            # source tense/commitment evidence.
+            temporal_state, commitment_state = "unknown", "unknown"
         actions.append({
             "action_id": f"A{index:02d}", "model_action_id": str(value.get("action_id") or "") or None,
             "actor": actor, "predicate": predicate,
             "object": object_value,
             "recipient": recipient, "temporal_state": temporal_state,
+            "parallel": bool(value.get("parallel")),
             "commitment_state": commitment_state, "evidence_ids": ids,
             "field_evidence": {
                 "actor": field_ids("actor_evidence_ids") or (ids if actor else []),
@@ -356,6 +595,66 @@ def normalize_semantic_record(raw, fact):
             "evidence_ids": evidence_ids,
             "field_evidence": {"actor": source_ids if (source_ids := [item for item in evidence_ids if evidence_by_id.get(item, {}).get("speaker") in owners]) else [], "predicate": evidence_ids, "object": [], "recipient": []},
         })
+    # A single semantic frame must not swallow a second action from the same
+    # exact owner utterance.  Map opaque model predicates to the corresponding
+    # source clause by order, then materialize every remaining source clause.
+    recovered_clauses = source_action_clauses(fact, owners)
+    covered_clause_indexes = set()
+    mapped_action_indexes = set()
+    for action_index, action in enumerate(actions):
+        predicate = str(action.get("predicate") or "")
+        match_index = next((
+            index for index, clause in enumerate(recovered_clauses)
+            if index not in covered_clause_indexes
+            and clause["predicate"].casefold()[:5] == predicate.casefold()[:5]
+        ), None)
+        if match_index is None and INTERNAL_PREDICATE_RE.fullmatch(predicate) and action_index < len(recovered_clauses):
+            match_index = action_index
+        if match_index is None:
+            continue
+        clause = recovered_clauses[match_index]
+        covered_clause_indexes.add(match_index)
+        mapped_action_indexes.add(action_index)
+        action["predicate"] = clause["predicate"]
+        action["object"] = action.get("object") or clause.get("object")
+        action["actor"] = action.get("actor") or clause.get("actor")
+        action["parallel"] = bool(action.get("parallel") or clause.get("parallel"))
+        action["evidence_ids"] = list(dict.fromkeys(action.get("evidence_ids", []) + clause.get("evidence_ids", [])))
+        action["field_evidence"]["predicate"] = clause.get("evidence_ids", [])
+        if action.get("actor"):
+            action["field_evidence"]["actor"] = clause.get("evidence_ids", [])
+        if action.get("object"):
+            action["field_evidence"]["object"] = clause.get("evidence_ids", [])
+    # Once an exact source clause has been recovered, additional opaque model
+    # labels are not independent obligations.  Keeping them would manufacture
+    # duplicate tasks from a single source delivery alternative.
+    if recovered_clauses:
+        actions = [
+            action for index, action in enumerate(actions)
+            if index in mapped_action_indexes
+            or not INTERNAL_PREDICATE_RE.fullmatch(str(action.get("predicate") or ""))
+        ]
+    for clause_index, clause in enumerate(recovered_clauses):
+        if clause_index in covered_clause_indexes or not clause.get("evidence_ids"):
+            continue
+        actions.append({
+            "action_id": f"A{len(actions)+1:02d}", "model_action_id": None,
+            **clause,
+            "field_evidence": {
+                "actor": clause["evidence_ids"], "predicate": clause["evidence_ids"],
+                "object": clause["evidence_ids"] if clause.get("object") else [], "recipient": [],
+            },
+        })
+    derived_content_kind = raw.get("content_kind") or content_kind(fact.get("type"))
+    if (
+        detected_act not in {"ask", "commit", "accept", "reject"}
+        and fact.get("type") not in {"action", "follow_up", "question", "schedule"}
+        and PROCEDURAL_RULE_SURFACE_RE.search(action_text)
+    ):
+        # The source does not have to belong to any predefined business
+        # domain.  A generic conditional instruction is a system rule; an
+        # extractor may still explicitly classify a domain-specific rule.
+        derived_content_kind = "system_rule"
     return {
         "record_id": fact["fact_id"],
         "kind": fact["type"],
@@ -368,7 +667,7 @@ def normalize_semantic_record(raw, fact):
         "object": str(raw.get("object") or "").strip() or None,
         "polarity": "negative" if raw.get("polarity") == "negative" else "positive",
         "modality": legacy_modality,
-        "content_kind": raw.get("content_kind") or content_kind(fact.get("type")),
+        "content_kind": derived_content_kind,
         "speech_act": detected_act,
         "modality_axis": modality_axis(legacy_modality, fact.get("certainty")),
         "lifecycle": "active",
@@ -403,10 +702,15 @@ def normalize_semantic_record(raw, fact):
         "world_truth_status": "not_evaluated",
         "interpretation_status": "requires_clarification" if semantic_verification == "insufficient_evidence" else "typed",
         "evidence_ids": evidence_ids,
-        "dialogue_evidence": list(fact.get("dialogue_evidence", [])),
+        # ``fact.evidence`` is already the immutable, speaker-attributed source
+        # window.  Preserve it as dialogue evidence when an older extractor did
+        # not duplicate the same turns under ``dialogue_evidence``; reducers
+        # need those exact words for first-person intent and adjacency pairs.
+        "dialogue_evidence": list(fact.get("dialogue_evidence") or fact.get("evidence", [])),
         "uncertainty": uncertainty,
         "semantic_risks": list(fact.get("semantic_risks", [])),
         "risk_level": fact.get("risk_level", "LOW"),
+        "protected_outcome": bool(fact.get("protected_outcome")),
         "verification_status": semantic_verification,
         "source_word_ids": list(dict.fromkeys(
             word_id for item in fact.get("evidence", []) for word_id in item.get("source_word_ids", [])

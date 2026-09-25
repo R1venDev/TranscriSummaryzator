@@ -5,12 +5,65 @@ import re
 from .questions import verify_slot_entailment
 
 ACCEPT_RE = re.compile(r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|согласен|делаем|ок(?:ей)?|подтверждаю|(?:а[\s,]*)?(?:месяца?[\s,.:—-]*)?ну\s+ладно)\b")
+WEAK_BACKCHANNEL_PREFIX_RE = re.compile(
+    r"(?iu)^\s*(?:угу|ага|понятно|хорошо|ясно|ладно)\b[\s,!.—-]*(?P<rest>.*)$"
+)
+EXPLICIT_ACCEPTANCE_CLAUSE_RE = re.compile(
+    r"(?iu)\b(?:соглас(?:ен|на|ны)|делаем|подтверждаю|принимаю|утверждаю|"
+    r"договорились|так\s+и\s+сделаем)\b"
+)
 REJECT_RE = re.compile(r"(?iu)^\s*(?:нет|не согласен|не делаем|отклоняем)\b")
 CAUSE_RE = re.compile(r"(?iu)\b(?:из-за|поэтому|в результате|привел[оа]? к)\b")
 CONDITION_RE = re.compile(r"(?iu)\b(?:если|когда|при условии|после того как)\b")
 SCOPE_RE = re.compile(r"(?iu)\b(?:месяц\w*|год\w*|недел\w*|день|дня|дней|час\w*|минут\w*|период\w*|объ[её]м\w*)\b")
 SCOPE_REPLY_RE = re.compile(r"(?iu)\b(?:для\s+(?:начала|проверки|этого)|достаточно|возьм[её]м|объ[её]м|период|нужн\w+\s+(?:данн\w*|выборк\w*|объ[её]м\w*|период\w*))")
 DATA_RESULT_RE = re.compile(r"(?iu)\b(?:данн\w*|выборк\w*|выгруз\w*|отрезк\w*|файл\w*|истори\w*)\b")
+
+
+def is_weak_backchannel(text):
+    """Return true when an acknowledgement does not accept a proposition.
+
+    A turn such as ``Угу. Есть такой инструмент`` starts a new statement; the
+    leading listener signal must not be promoted to acceptance of the previous
+    proposal. An explicit clause such as ``Хорошо, договорились`` remains a
+    valid acceptance candidate.
+    """
+    match = WEAK_BACKCHANNEL_PREFIX_RE.fullmatch(str(text or ""))
+    return bool(match and not EXPLICIT_ACCEPTANCE_CLAUSE_RE.search(match.group("rest") or ""))
+
+
+def is_explicit_acceptance_reply(text, target_text=None):
+    """Require a reply to actually accept the targeted proposition.
+
+    A bare short acknowledgement is valid by adjacency.  If the speaker adds
+    content after ``yes``, that continuation must either explicitly accept,
+    move the accepted work to its next stage, or overlap the target.  This
+    prevents an unrelated long answer beginning with ``yes`` from certifying
+    an earlier proposal.
+    """
+    value = str(text or "").strip()
+    if EXPLICIT_ACCEPTANCE_CLAUSE_RE.search(value):
+        return True
+    if not ACCEPT_RE.search(value) or REJECT_RE.search(value) or "?" in value:
+        return False
+    words = re.findall(r"(?iu)[a-zа-яё0-9]+", value)
+    if len(words) > 10:
+        return False
+    continuation = re.sub(
+        r"(?iu)^\s*(?:(?:да[\s,!.—-]*)+|ок(?:ей)?|(?:а[\s,]*)?(?:месяца?[\s,.:—-]*)?ну\s+ладно)\b",
+        "", value,
+    ).strip(" ,.!—-")
+    if not continuation:
+        return True
+    if re.search(
+        r"(?iu)^(?:я\s+)?(?:сделаю|возьму|беру|подготовлю|отправлю|передам|"
+        r"выполню|займусь|реализую|проверю|проведу|запущу)\b",
+        continuation,
+    ):
+        return True
+    if re.search(r"(?iu)\b(?:дальше|следующ\w*|переходим|этап)\b", continuation):
+        return True
+    return bool(target_text and _similarity(continuation, target_text) >= .12)
 
 
 def _tokens(value):
@@ -68,9 +121,14 @@ def resolve_relations(propositions, events, records):
             if target: add("supersedes", source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "explicit_revision", record.get("record_id"), target_record_id=target_id)
         for target_id in record.get("accepts_record_ids", []):
             target = prop_by_record.get(target_id)
-            if target:
+            if target and not is_weak_backchannel(record.get("statement")) \
+                    and is_explicit_acceptance_reply(record.get("statement"), target.get("statement")):
                 relation_kind = "answers" if target.get("content_kind") == "question" else "accepts"
-                add(relation_kind, source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []) + by_record.get(target_id, {}).get("evidence_ids", []), .99, "source_grounded_short_reply", record.get("record_id"), target_record_id=target_id)
+                # The relation already identifies its target proposition.  Its
+                # evidence closure must therefore contain only the accepting
+                # reply, otherwise ``acceptance_evidence_ids`` incorrectly
+                # labels the proposal itself as proof of acceptance.
+                add(relation_kind, source["proposition_id"], target["proposition_id"], record.get("evidence_ids", []), .99, "source_grounded_short_reply", record.get("record_id"), target_record_id=target_id)
     for index, event in enumerate(ordered):
         source = next(x for x in propositions if x["proposition_id"] == event["proposition_id"])
         text = source["statement"]
@@ -79,7 +137,8 @@ def resolve_relations(propositions, events, records):
                         if event.get("timestamp", 0) - x.get("timestamp", 0) <= 120]
         local_scope_targets = [x for x in prior_events if event.get("timestamp", 0) - x.get("timestamp", 0) <= 45
                                and next(p for p in propositions if p["proposition_id"] == x["proposition_id"])["content_kind"] in {"action", "follow_up", "resource"}]
-        if event["speech_act"] in {"accept", "reject"} or ACCEPT_RE.search(text) or REJECT_RE.search(text):
+        if ((event["speech_act"] in {"accept", "reject"} or ACCEPT_RE.search(text) or REJECT_RE.search(text))
+                and not is_weak_backchannel(text)):
             candidates = [x for x in prior_events if x["speech_act"] in {"propose", "ask", "commit"}]
             same_thread = [x for x in candidates if not event.get("thread_hint") or x.get("thread_hint") == event.get("thread_hint")]
             candidates = same_thread or candidates
@@ -90,11 +149,20 @@ def resolve_relations(propositions, events, records):
             target_event = candidates[0] if candidates and event.get("timestamp", 0) - candidates[0].get("timestamp", 0) <= 45 else None
             if (target_event and target_event.get("speech_act") != "ask" and len(candidates) > 1
                     and candidates[1].get("speech_act") == target_event.get("speech_act")
-                    and abs(candidates[0].get("timestamp", 0) - candidates[1].get("timestamp", 0)) < 8):
+                    and abs(candidates[0].get("timestamp", 0) - candidates[1].get("timestamp", 0)) < 8
+                    # Multiple atomic actions expanded from one source turn are
+                    # one compound proposal for adjacency purposes.  Bind the
+                    # reply to one child; the task reducer deliberately shares
+                    # that verified relation with its same-parent siblings.
+                    and candidates[0].get("source_fact_id") != candidates[1].get("source_fact_id")):
                 target_event = None
             # A speaker's own acknowledgement is not evidence that another
             # participant accepted the proposition.
             is_rejection = event["speech_act"] == "reject" or bool(REJECT_RE.search(text))
+            if target_event and not is_rejection:
+                target_prop = next(x for x in propositions if x["proposition_id"] == target_event["proposition_id"])
+                if not is_explicit_acceptance_reply(text, target_prop.get("statement")):
+                    target_event = None
             if target_event and (is_rejection or not event.get("speaker") or event.get("speaker") != target_event.get("speaker")):
                 kind = "rejects" if is_rejection else "answers" if target_event.get("speech_act") == "ask" else "accepts"
                 add(kind, source["proposition_id"], target_event["proposition_id"], event.get("evidence_ids", []), .96, "coreference_short_reply", event.get("source_record_id"), event.get("event_id"), target_event.get("source_record_id"))

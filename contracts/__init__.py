@@ -12,7 +12,7 @@ SCHEMA_VERSIONS = {
     "PropositionSchema": 4,
     "DialogueActSchema": 2,
     "MeetingGraphSchema": 7,
-    "PublicItemSchema": 4,
+    "PublicItemSchema": 5,
     "PublicationAuditSchema": 5,
     "VerifiedDocumentSchema": 6,
     "FinalDocumentSemanticAuditSchema": 1,

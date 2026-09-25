@@ -226,6 +226,11 @@ class PublicItemContract(StrictModel):
     topic_entities: list[str] = Field(default_factory=list)
     context_ids: list[str] = Field(default_factory=list)
     verification_status: Literal["supported", "contradicted", "insufficient_evidence", "verification_unavailable"] = "supported"
+    speech_act: Optional[str] = None
+    acceptance_check: Optional[Literal["not_applicable", "entailed", "not_entailed", "failed", "unknown"]] = None
+    acceptance_relation_ids: list[str] = Field(default_factory=list)
+    acceptance_evidence_ids: list[str] = Field(default_factory=list)
+    accepted_by: list[str] = Field(default_factory=list)
     navigation_basis: Optional[Literal["supporting_utterance", "nearest_utterance_fallback"]] = None
     aspect_id: Optional[str] = None
 

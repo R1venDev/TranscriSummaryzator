@@ -27,7 +27,7 @@ def rec(number, kind, statement, act="assert", **extra):
 
 
 class Run13SemanticRegressions(unittest.TestCase):
-    def test_unverified_answers_keep_specific_questions_not_generic_slot_labels(self):
+    def test_unverified_answers_are_not_reopened_as_raw_questions(self):
         graph = build_meeting_graph([
             rec(1, "question", "Почему первый сервис задерживает данные?", "ask",
                 requested_slots=["explanation"], answer_record_ids=["F3"]),
@@ -44,9 +44,7 @@ class Run13SemanticRegressions(unittest.TestCase):
         )
         planned = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _: 1)
         questions = [item["text"] for item in build_public_items(graph, planned) if item["section"] == "questions"]
-        self.assertEqual(len(questions), 2)
-        self.assertNotEqual(*questions)
-        self.assertFalse(any("проверить объяснение" in text for text in questions))
+        self.assertEqual(questions, [])
 
     def test_contextual_commitment_and_acceptance_are_detected(self):
         self.assertEqual(primary_speech_act("Потом встрою это в методичку"), "commit")
@@ -137,6 +135,15 @@ class Run13PublicationRegressions(unittest.TestCase):
         graph = build_meeting_graph([rec(1, "action", "Я подготовлю отчёт", "commit", assignees=["@A"])])
         result = plan(graph["claims"], graph["episodes"], graph["relations"], lambda _item: 1)
         item = next(x for x in build_public_items(graph, result) if x["section"] == "tasks")
+        PublicItemContract.model_validate(item)
+
+    def test_public_contract_accepts_an_explicitly_unentailed_proposal(self):
+        item = {
+            "public_id": "PI1", "section": "technical", "text": "Предложена дополнительная проверка",
+            "claim_ids": ["C1"], "evidence_ids": ["U1"], "source_word_ids": ["W1"],
+            "content_kind": "proposal", "social_state": "candidate",
+            "acceptance_check": "not_entailed",
+        }
         PublicItemContract.model_validate(item)
 
     def test_unknown_evidence_and_unrendered_card_are_rejected(self):

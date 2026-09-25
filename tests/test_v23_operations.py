@@ -5,7 +5,8 @@ import unittest
 
 import pipeline
 from scripts import diagnostics
-from scripts.summary_worker import ensure_closing_schedule_question
+from scripts.summary_worker import ensure_closing_schedule_question, matching_candidate_claims
+from semantics.meeting_graph import build_meeting_graph
 
 
 class GlobalStageCacheTests(unittest.TestCase):
@@ -73,6 +74,45 @@ class ClosingScheduleRecoveryTests(unittest.TestCase):
         record = ensure_closing_schedule_question([], utterances)[0]
         self.assertEqual(record["question_status"], "answered")
         self.assertNotIn("или", record["statement"])
+
+    def test_canonical_schedule_inherits_replaced_candidate_lineage(self):
+        utterances = [
+            {"id": "U1", "start": 100, "end": 101, "speaker": "@A", "text": "Созвон с клиентом во вторник?", "source_word_ids": ["W1"]},
+            {"id": "U2", "start": 102, "end": 103, "speaker": "@B", "text": "В 18:00 или 19:00", "source_word_ids": ["W2"]},
+        ]
+        original = {
+            "record_id": "F17", "kind": "proposal", "statement": "Созвон во вторник в 18:00 или 19:00.",
+            "start": 100, "evidence_ids": ["U1", "U2"],
+            "origin_id": "OR-original", "origin_ids": ["OR-original"],
+        }
+        records = ensure_closing_schedule_question([original], utterances)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["origin_id"], "OR-original")
+        self.assertEqual(records[0]["origin_ids"], ["OR-original"])
+        self.assertTrue(records[0]["revision_id"].startswith("RV"))
+        graph = build_meeting_graph(records)
+        claim_origins = {
+            claim["claim_id"]: set(claim.get("origin_ids", []))
+            for claim in graph["claims"]
+        }
+        matches, mode = matching_candidate_claims(
+            {"origin_id": "OR-original", "statement": original["statement"], "evidence_ids": original["evidence_ids"]},
+            graph["claims"], claim_origins,
+        )
+        self.assertEqual(mode, "exact_origin")
+        self.assertEqual(len(matches), 1)
+
+    def test_closing_schedule_does_not_replace_an_earlier_unrelated_meeting(self):
+        utterances = [
+            {"id": "U9", "start": 300, "end": 301, "speaker": "@A", "text": "Созвон с клиентом в пятницу?", "source_word_ids": ["W9"]},
+            {"id": "U10", "start": 302, "end": 303, "speaker": "@B", "text": "В 16:00 или 17:00", "source_word_ids": ["W10"]},
+        ]
+        earlier = {
+            "record_id": "F-old", "kind": "schedule", "statement": "Встреча команды в понедельник в 10:00.",
+            "start": 20, "evidence_ids": ["U-old"], "origin_id": "OR-old", "origin_ids": ["OR-old"],
+        }
+        records = ensure_closing_schedule_question([earlier], utterances)
+        self.assertEqual({record["record_id"] for record in records}, {"F-old", "F-CLOSING-SCHEDULE"})
 
 
 if __name__ == "__main__":
