@@ -107,6 +107,8 @@ class PipelineConfig(BaseModel):
     utterance_gap_seconds: float = 1.2
     utterance_continuation_gap_seconds: float = 3.0
     summary_enabled: bool = True
+    # Explicit route selection; Luna failures never fall back to local models.
+    summary_backend: Literal["legacy_local", "luna_batch"] = "legacy_local"
     summary_project_name: str = "Project"
     ollama_url: str = "http://127.0.0.1:11434"
     summary_extractor_model: str = "qwen3.5:9b-q4_K_M"

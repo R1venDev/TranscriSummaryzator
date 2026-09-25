@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Настройки суммаризатора — OpenRouter</title>
+  <style>
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+    *{box-sizing:border-box}body{margin:0;background:#0c0e13;color:#f5f7fb}
+    main{width:min(960px,calc(100% - 32px));margin:30px auto 70px}
+    a{color:#add2ff}h1{font-size:28px}h2{font-size:20px;margin:0 0 16px}
+    .card{padding:24px;margin:20px 0;background:#171a22;border:1px solid #292e3b;border-radius:18px}
+    .muted{color:#a4afc0;line-height:1.5}.warning{color:#ffd295}.error{color:#ff969d}.ok{color:#85d9ad}
+    label{display:grid;gap:5px;font-size:13px;color:#a4afc0}
+    input{width:100%;background:#202530;border:1px solid #3a4353;border-radius:9px;padding:11px;color:white;font:inherit}
+    button{background:#2d75e8;color:white;border:0;border-radius:9px;padding:10px 12px;font:600 14px -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}
+    button.secondary{background:#293141}button.danger{background:#7e3440}button:disabled{opacity:.5;cursor:wait}
+    .add{display:grid;grid-template-columns:1fr 2fr auto;gap:12px;align-items:end}
+    .key{border-top:1px solid #343b48;padding:17px 0}.key:first-child{border:0}
+    .key-head{display:flex;flex-wrap:wrap;align-items:center;gap:9px}.key-name{font-weight:700;font-size:17px}.pill{border-radius:99px;background:#2c3543;padding:4px 8px;font-size:12px}
+    .meta{color:#a4afc0;font-size:13px;line-height:1.5;margin:8px 0}.controls{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}
+    .replace{display:flex;gap:8px;align-items:end;margin-top:10px}.replace label{flex:1}
+    @media(max-width:700px){.add{grid-template-columns:1fr}.replace{display:block}.replace button{margin-top:8px}}
+  </style>
+</head>
+<body><main>
+  <nav><a href="/">← К записям</a></nav>
+  <h1>Настройки → Суммаризатор → OpenRouter</h1>
+  <p class="muted">Здесь хранятся ключи только для суммаризатора. Сначала используется основной, остальные — резерв доступности при допустимом повторе. Проверка ключа не отправляет стенограмму и не запускает платную генерацию.</p>
+  <section class="card"><h2>Добавить ключ</h2>
+    <form id="addForm" class="add" autocomplete="off">
+      <label>Название<input name="label" maxlength="80" required autocomplete="off"></label>
+      <label>OpenRouter inference-ключ<input name="key" type="password" minlength="16" required autocomplete="new-password" spellcheck="false"></label>
+      <button type="submit">Сохранить</button>
+    </form>
+    <p class="muted">Ключ отправляется только в backend и после сохранения больше не показывается. Для проверки используется бесплатный GET /api/v1/key; готовность ключа не подтверждает права на Luna или настройки приватности.</p>
+  </section>
+  <section class="card"><h2>Сохранённые ключи</h2><div id="message" role="status" aria-live="polite"></div><div id="keys">Загружаю…</div></section>
+  <p class="warning">Выбранный режим OpenRouter Batch хранит входы и результаты у шлюза до 30 дней; пользователь отдельно разрешил этот режим без provider ZDR. Необязательное логирование, обучение, плагины и веб-поиск остаются выключенными. Удаление здесь не отзывает ключ в кабинете OpenRouter.</p>
+</main><script src="/summary-settings.js" defer></script></body></html>

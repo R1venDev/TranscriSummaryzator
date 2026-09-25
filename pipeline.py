@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import fcntl
 import hashlib
 import html
+import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
@@ -24,7 +26,7 @@ import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
 from quality_schema import utterance_uncertainty, word_uncertainty
@@ -33,6 +35,7 @@ from evidence_ledger import attach_word_ids, ledger_document, record_resolution
 from diagnostics import configure as configure_diagnostics, decision as diagnostic_decision
 from diagnostics import event as diagnostic_event, publish as publish_diagnostics
 from diagnostics import system_snapshot
+from summary_credentials import CredentialError, credential_dispatch_guard, verify_admin_password
 
 
 ROOT = Path(__file__).resolve().parent
@@ -47,10 +50,17 @@ CONFIG_PATH = ROOT / "config.json"
 VOCABULARY_PATH = ROOT / "vocabulary.json"
 DASHBOARD_PATH = ROOT / "dashboard.html"
 PROFILES_PATH = ROOT / "profiles.html"
+SUMMARY_SETTINGS_PATH = ROOT / "summary_settings.html"
+SUMMARY_SETTINGS_JS_PATH = ROOT / "summary_settings.js"
+SUMMARY_TASKS_PATH = ROOT / "summary_tasks.html"
+SUMMARY_TASKS_JS_PATH = ROOT / "summary_tasks.js"
+SUMMARY_CREDENTIAL_DB = STATE / "summary_private" / "credentials.sqlite3"
 SUMMARY_BENCHMARK = Path("/mnt/shared-data/MeetingTranscript/summary-benchmark")
 SUMMARY_STATUS_PATH = SUMMARY_BENCHMARK / "current.json"
 MEDIA_EXTENSIONS = {".mkv", ".mp4", ".mov", ".m4v", ".webm", ".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 PROFILE_LOCK = threading.Lock()
+SUMMARY_ADMIN_RATE_LOCK = threading.Lock()
+SUMMARY_ADMIN_FAILURES = {}
 
 
 def now():
@@ -90,12 +100,32 @@ STAGE_DEPENDENCIES = {
     "export": ["pipeline.py", "scripts/quality_schema.py", "scripts/evidence_ledger.py", "scripts/diagnostics.py"],
 }
 
+# The production pipeline before the summary-only migration had this digest.
+# Keep its protected stage-cache identity for this *reviewed source snapshot*
+# only. Any later byte change (including a speech-path change) falls back to
+# the actual file digest, so a later edit cannot silently reuse old stages.
+LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "e38ea5edc6696cc431baa69debbcf128c65885ad61f34a5e0777bc008024d50e"
+
+
+def _stage_pipeline_sha256(source):
+    actual = hashlib.sha256(source).hexdigest()
+    # The self-referential digest value is the only byte sequence normalized.
+    # No Python-version-specific AST serialization enters the cache identity.
+    pattern = rb'(?m)^PROTECTED_MIGRATION_SOURCE_SHA256 = "[0-9a-f]{64}"$'
+    if len(re.findall(pattern, source)) != 1:
+        return actual
+    canonical = re.sub(pattern, b'PROTECTED_MIGRATION_SOURCE_SHA256 = "<self>"', source, count=1)
+    fingerprint = hashlib.sha256(canonical).hexdigest()
+    return LEGACY_PROTECTED_PIPELINE_SHA256 if fingerprint == PROTECTED_MIGRATION_SOURCE_SHA256 else actual
+
 
 def stage_cache_key(stage, inputs):
     family = stage.split("-", 1)[0]
     paths = [ROOT / value for value in STAGE_DEPENDENCIES.get(family, ["pipeline.py"])]
     return _json_hash({"stage": stage, "inputs": inputs, "code": {
-        str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+        str(path.relative_to(ROOT)): (_stage_pipeline_sha256(path.read_bytes()) if path.name == "pipeline.py"
+                                      else hashlib.sha256(path.read_bytes()).hexdigest())
         for path in paths if path.is_file()
     }})
 
@@ -451,6 +481,10 @@ REQUIRED_GENERATION_FILES = {
     "candidate_disposition.json", "evidence_versions.json", "summary.html",
     "transcript.html", "semantics/meeting_state.v2.json", "release_manifest.json",
 }
+LUNA_GENERATION_FILES = {
+    "summary.md", "summary.html", "summary.fragment.html", "summary.json",
+    "tasks.json", "transcript.html", "run_manifest.json", "model_document.json",
+}
 
 
 def current_summary_output(base):
@@ -464,7 +498,14 @@ def current_summary_output(base):
         target = base / "summary_generations" / generation_id
         manifest = load_json(target / "generation_manifest.json")
         digests = manifest.get("artifact_sha256")
-        if manifest.get("generation_id") != generation_id or not isinstance(digests, dict) or not REQUIRED_GENERATION_FILES <= set(digests):
+        contract = manifest.get("contract_version")
+        if contract == "luna_summary_v1":
+            required = LUNA_GENERATION_FILES
+        elif contract is None:
+            required = REQUIRED_GENERATION_FILES
+        else:
+            return None
+        if manifest.get("generation_id") != generation_id or not isinstance(digests, dict) or not required <= set(digests):
             return None
         for name, expected in digests.items():
             relative = Path(str(name))
@@ -498,6 +539,14 @@ def current_summary_generation_id(base):
         return generation_id if re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{12}", generation_id) else None
     except (OSError, ValueError, json.JSONDecodeError):
         return None
+
+
+def luna_effective_view(output_dir):
+    """Read the selected sealed Luna document plus local human overrides."""
+    from summary.luna_v1.task_api import read_current
+    output_dir = Path(output_dir)
+    return read_current(output_dir, output_dir / "transcript.json",
+                        STATE / "summary_private" / "tasks.sqlite3", current_summary_output)
 
 
 def current_release_commit():
@@ -2006,6 +2055,85 @@ def run_next():
     return True
 
 
+def summary_python():
+    """The credential/Batched inference runtime is separate from speech venvs."""
+    interpreter = os.environ.get("TRANSCRI_SUMMARY_PYTHON", "")
+    if not interpreter or not Path(interpreter).is_absolute() or not Path(interpreter).is_file():
+        raise RuntimeError("Не настроен изолированный Python суммаризатора")
+    return interpreter
+
+
+def _process_luna_summary(db, job, transcript, output_dir, job_dir, log, summary_run_id, force):
+    """Dispatch once. Remote completion belongs to the independent scheduler."""
+    job_id = job["id"]
+    status_path = output_dir / "summary_luna_attempt.json"
+    prior_stat = status_path.stat().st_mtime_ns if status_path.is_file() else None
+    command = [
+        summary_python(), str(ROOT / "scripts" / "luna_summary_worker.py"), "submit",
+        "--transcript", str(transcript), "--output", str(output_dir),
+        "--private-root", str(STATE / "summary_private"),
+    ]
+    if force:
+        command += ["--force-nonce", summary_run_id]
+    try:
+        try:
+            run_command(
+                command, log,
+                env=dict(os.environ, PYTHONUNBUFFERED="1", PYTHONPATH=str(ROOT)),
+                deadline_seconds=120, idle_seconds=120,
+            )
+        except RuntimeError:
+            # A definite preflight refusal exits nonzero after saving status.
+            # An absent status remains unknown and is never blindly retried.
+            if not status_path.is_file() or status_path.stat().st_mtime_ns == prior_stat:
+                raise
+        if not status_path.is_file() or status_path.stat().st_mtime_ns == prior_stat:
+            raise RuntimeError("Luna worker did not save this attempt status")
+        attempt = load_json(status_path)
+        state = attempt.get("status")
+        if state in {"accepted_cache_hit", "accepted"}:
+            package = current_summary_output(output_dir)
+            if package is None or load_json(package / "generation_manifest.json").get("contract_version") != "luna_summary_v1":
+                raise RuntimeError("Luna worker reported accepted without a committed generation")
+            update_job(db, job_id, summary_status="done", summary_stage="summary_done", summary_progress=100,
+                       summary_detail="Саммари готово из сохранённого результата", summary_error=None,
+                       summary_finished_at=now())
+        elif state in {"submitted", "pending", "polling", "completed_raw"}:
+            update_job(db, job_id, summary_status="pending_batch", summary_stage="summary_pending_batch", summary_progress=10,
+                       summary_detail="OpenRouter Batch выполняется", summary_error=None)
+        elif state in {"submission_unknown", "submitting", "reserved"}:
+            update_job(db, job_id, summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                       summary_progress=5, summary_detail="Исход отправки требует восстановления по ledger",
+                       summary_error=str(attempt.get("reason") or state))
+        elif state == "credential_required":
+            update_job(db, job_id, summary_status="credential_required", summary_stage="summary_credential_required",
+                       summary_progress=0, summary_detail="Добавьте или проверьте ключ в настройках суммаризатора",
+                       summary_error=None, summary_finished_at=now())
+        else:
+            update_job(db, job_id, summary_status="blocked", summary_stage="summary_blocked", summary_progress=0,
+                       summary_detail="Отправка саммари остановлена до внешнего запроса",
+                       summary_error=str(attempt.get("reason") or attempt.get("error_code") or state)[:240],
+                       summary_finished_at=now())
+        write_json(output_dir / "summary_attempt.json", {
+            "schema_version": 2, "job_id": job_id, "attempt_id": summary_run_id,
+            "attempt_status": state, "luna_job_id": attempt.get("job_id"),
+            "remote_batch_id": attempt.get("remote_id"),
+            "privacy_mode": "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized",
+            "displayed_generation_id": current_summary_generation_id(output_dir),
+        })
+        diagnostic_event("summary_job", category="stage", outcome=str(state),
+                         refs={"summary_attempt": str(output_dir / "summary_attempt.json")})
+        return state in {"accepted_cache_hit", "accepted", "submitted", "pending", "polling", "completed_raw"}
+    except Exception as exc:
+        with log.open("a", encoding="utf-8") as stream:
+            traceback.print_exc(file=stream)
+        update_job(db, job_id, summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                   summary_detail="Проверяю исход попытки перед повтором", summary_error=str(exc)[:240])
+        diagnostic_event("summary_job", category="stage", outcome="submission_unknown", severity="ERROR", error=exc,
+                         refs={"summary_log": str(log)})
+        return False
+
+
 def process_summary(job_id, force=False):
     cfg = config()
     db = connect()
@@ -2031,6 +2159,9 @@ def process_summary(job_id, force=False):
         summary_detail="Подготавливаю стенограмму", summary_error=None,
         summary_started_at=job["summary_started_at"] or now(), summary_finished_at=None,
     )
+
+    if cfg.get("summary_backend") == "luna_batch":
+        return _process_luna_summary(db, job, transcript, output_dir, job_dir, log, summary_run_id, force)
 
     worker_failure_detail = None
 
@@ -2128,16 +2259,19 @@ def process_summary(job_id, force=False):
 
 
 def run_next_summary():
-    if not config().get("summary_enabled", True):
+    cfg = config()
+    if not cfg.get("summary_enabled", True):
         return False
     db = connect()
     worker_id = "{}:{}".format(os.uname().nodename, os.getpid())
     attempt_id = uuid.uuid4().hex
     lease_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds")
     db.execute("BEGIN IMMEDIATE")
-    job = db.execute(
-        "SELECT id, summary_status FROM jobs WHERE status = 'done' AND summary_status IN ('queued', 'queued_force') ORDER BY id LIMIT 1"
-    ).fetchone()
+    candidates = db.execute(
+        "SELECT id,output_dir,summary_status FROM jobs WHERE status='done' AND summary_status IN ('queued','queued_force') ORDER BY id LIMIT 50"
+    ).fetchall()
+    job = next((candidate for candidate in candidates
+                if cfg.get("summary_backend") != "luna_batch" or not _luna_output_has_active_batch(candidate["output_dir"])), None)
     if not job:
         db.commit()
         return False
@@ -2151,6 +2285,168 @@ def run_next_summary():
         return False
     process_summary(job["id"], force=prior_status == "queued_force")
     return True
+
+
+def _luna_output_has_active_batch(output_dir):
+    """A later source revision waits for an older unresolved external call."""
+    ledger_path = STATE / "summary_private" / "luna.sqlite3"
+    if not ledger_path.is_file():
+        return False
+    try:
+        ledger = sqlite3.connect("file:{}?mode=ro".format(ledger_path), uri=True)
+        try:
+            count = ledger.execute("""SELECT COUNT(DISTINCT j.id) FROM jobs AS j
+                LEFT JOIN consumers AS c ON c.semantic_key=j.semantic_key
+                WHERE (j.output_dir=? OR c.output_dir=?) AND j.status IN
+                ('reserved','submitting','submission_unknown','submitted','polling','credential_required','completed_raw')""",
+                (str(output_dir), str(output_dir))).fetchone()[0]
+            return count > 0
+        finally:
+            ledger.close()
+    except sqlite3.Error:
+        return True  # unknown ledger means no new paid dispatch
+
+
+def reconcile_luna_summary_queue():
+    """Recover queue display from the durable external-job ledger, never POST."""
+    db = connect()
+    ledger_path = STATE / "summary_private" / "luna.sqlite3"
+    if not ledger_path.is_file():
+        rows = db.execute("SELECT id FROM jobs WHERE status='done' AND summary_status='running'").fetchall()
+        for row in rows:
+            update_job(db, row["id"], summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                       summary_detail="Реестр внешней отправки недоступен; повтор запрещён",
+                       summary_error="luna_ledger_missing")
+        db.close()
+        return len(rows)
+    ledger = sqlite3.connect("file:{}?mode=ro".format(ledger_path), uri=True)
+    ledger.row_factory = sqlite3.Row
+    changed = 0
+    try:
+        rows = db.execute("""SELECT id,output_dir,summary_status,summary_attempt_id,summary_started_at FROM jobs
+            WHERE status='done' AND output_dir IS NOT NULL
+              AND summary_status IN ('running','pending_batch','submission_unknown','credential_required')""").fetchall()
+        for row in rows:
+            output_dir = Path(row["output_dir"])
+            attempt_path = output_dir / "summary_luna_attempt.json"
+            envelope_path = output_dir / "summary_attempt.json"
+            try:
+                envelope = load_json(envelope_path) if envelope_path.is_file() else {}
+                attempt = load_json(attempt_path) if attempt_path.is_file() else {}
+            except (OSError, ValueError, json.JSONDecodeError):
+                envelope, attempt = {}, {}
+            matching_attempt = envelope.get("attempt_id") == row["summary_attempt_id"]
+            ledger_job_id = attempt.get("job_id") if matching_attempt else None
+            ledger_job = ledger.execute("SELECT * FROM jobs WHERE id=?", (ledger_job_id,)).fetchone() if ledger_job_id else None
+            if ledger_job is None:
+                # This also covers a crash after the durable reserve but before
+                # the small output status was written; the newest matching row
+                # can be inspected, but never used to dispatch a second POST.
+                try:
+                    started = datetime.fromisoformat(row["summary_started_at"]).timestamp()
+                except (TypeError, ValueError):
+                    started = time.time()
+                ledger_job = ledger.execute(
+                    "SELECT * FROM jobs WHERE output_dir=? AND created_at>=? ORDER BY created_at DESC LIMIT 1",
+                    (str(output_dir), started - 2),
+                ).fetchone()
+                if ledger_job is None:
+                    ledger_job = ledger.execute("""SELECT j.* FROM jobs AS j
+                        JOIN consumers AS c ON c.semantic_key=j.semantic_key
+                        WHERE c.output_dir=? AND c.updated_at>=?
+                        ORDER BY c.updated_at DESC LIMIT 1""",
+                        (str(output_dir), started - 2),
+                    ).fetchone()
+            if ledger_job is None:
+                if row["summary_status"] == "running":
+                    update_job(db, row["id"], summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                               summary_detail="Нет записи внешней отправки; требуется проверка", summary_error="ledger_job_missing")
+                    changed += 1
+                continue
+            state = ledger_job["status"]
+            if state == "accepted":
+                consumer = ledger.execute("SELECT status,error_code FROM consumers WHERE semantic_key=? AND output_dir=?",
+                    (ledger_job["semantic_key"], str(output_dir))).fetchone()
+                if consumer and consumer["status"] == "failed":
+                    update_job(db, row["id"], summary_status="failed", summary_stage="summary_consumer_failed",
+                               summary_detail="Принятый Batch нельзя применить к этой версии стенограммы",
+                               summary_error=str(consumer["error_code"] or "consumer_failed")[:240],
+                               summary_finished_at=now())
+                    changed += 1
+                    continue
+                package = current_summary_output(output_dir)
+                manifest = load_json(package / "run_manifest.json") if package else {}
+                if manifest.get("job_id") == ledger_job["id"]:
+                    update_job(db, row["id"], summary_status="done", summary_stage="summary_done", summary_progress=100,
+                               summary_detail="Саммари готово", summary_error=None, summary_finished_at=now())
+                else:
+                    update_job(db, row["id"], summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                               summary_detail="Batch принят, но публикация не совпадает", summary_error="accepted_pointer_mismatch")
+                changed += 1
+            elif state in {"submitted", "polling", "completed_raw"} and row["summary_status"] != "pending_batch":
+                update_job(db, row["id"], summary_status="pending_batch", summary_stage="summary_pending_batch",
+                           summary_detail="OpenRouter Batch выполняется", summary_error=None)
+                changed += 1
+            elif state == "credential_required" and row["summary_status"] != "credential_required":
+                update_job(db, row["id"], summary_status="credential_required", summary_stage="summary_credential_required",
+                           summary_detail="Ключ недоступен для уже отправленного Batch", summary_error=None)
+                changed += 1
+            elif state in {"failed_validation", "remote_failed", "remote_expired", "remote_cancelled", "rejected_before_submit", "cancelled_before_submit"}:
+                update_job(db, row["id"], summary_status="failed", summary_stage="summary_failed", summary_progress=0,
+                           summary_detail="Batch завершился без пригодного конспекта", summary_error=str(ledger_job["error_code"] or state)[:240],
+                           summary_finished_at=now())
+                changed += 1
+            elif state in {"reserved", "submitting", "submission_unknown"} and row["summary_status"] != "submission_unknown":
+                update_job(db, row["id"], summary_status="submission_unknown", summary_stage="summary_recovery_required",
+                           summary_detail="Исход отправки требует восстановления по ledger", summary_error=state)
+                changed += 1
+    finally:
+        ledger.close()
+        db.close()
+    return changed
+
+
+def luna_scheduler_tick():
+    """One bounded queue/GET tick. A separate service may call it repeatedly."""
+    if not config().get("summary_enabled", True) or config().get("summary_backend") != "luna_batch":
+        return False
+    summary_python()  # fail before claiming any queued job
+    reconcile_luna_summary_queue()
+    log = STATE / "summary_private" / "scheduler.log"
+    run_command(
+        [summary_python(), str(ROOT / "scripts" / "luna_summary_worker.py"), "poll",
+         "--private-root", str(STATE / "summary_private")],
+        log, env=dict(os.environ, PYTHONUNBUFFERED="1", PYTHONPATH=str(ROOT)),
+        deadline_seconds=120, idle_seconds=120,
+    )
+    reconcile_luna_summary_queue()
+    return run_next_summary()
+
+
+def summary_scheduler(once=False):
+    """Independent Batch queue: restart-safe, no speech retry or LLM observer."""
+    private = STATE / "summary_private"
+    private.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_stream = (private / "scheduler.lock").open("a+b")
+    try:
+        fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Суммаризатор уже запущен.", flush=True)
+        return
+    try:
+        while True:
+            try:
+                luna_scheduler_tick()
+            except Exception as exc:
+                # The next ordinary scheduler tick may recover a known remote
+                # ID. It must never convert an unknown POST into a new POST.
+                print("Ошибка очереди суммаризатора: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
+            if once:
+                return
+            time.sleep(60)
+    finally:
+        fcntl.flock(lock_stream, fcntl.LOCK_UN)
+        lock_stream.close()
 
 
 def scan_inbox(seen, cfg):
@@ -2186,7 +2482,8 @@ def watch():
     dashboard = start_dashboard(background=True)
     db = connect()
     db.execute("UPDATE jobs SET status = 'queued', detail = 'Возобновляю после истечения lease', worker_id = NULL, attempt_id = NULL, lease_until = NULL, updated_at = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?)", (now(), now()))
-    db.execute("UPDATE jobs SET summary_status = 'queued', summary_detail = 'Возобновляю после перезапуска', updated_at = ? WHERE summary_status = 'running'", (now(),))
+    if cfg.get("summary_backend") != "luna_batch":
+        db.execute("UPDATE jobs SET summary_status = 'queued', summary_detail = 'Возобновляю после перезапуска', updated_at = ? WHERE summary_status = 'running'", (now(),))
     db.commit()
     write_status_snapshot(db)
     print("Наблюдаю за {}. Для остановки нажмите Ctrl-C.".format(INBOX), flush=True)
@@ -2194,7 +2491,7 @@ def watch():
         while True:
             try:
                 scan_inbox(seen, cfg)
-                if not run_next():
+                if not run_next() and cfg.get("summary_backend") != "luna_batch":
                     run_next_summary()
             except Exception as exc:
                 print("Ошибка: {}".format(exc), file=sys.stderr, flush=True)
@@ -2202,6 +2499,8 @@ def watch():
     finally:
         if dashboard:
             dashboard.shutdown()
+        fcntl.flock(lock_stream, fcntl.LOCK_UN)
+        lock_stream.close()
 
 
 def show_status():
@@ -2243,6 +2542,186 @@ def dashboard_payload():
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def send_summary_admin_bytes(self, body, content_type, status=200, challenge=False):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store, private")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if challenge:
+            self.send_header("WWW-Authenticate", 'Basic realm="Summary settings", charset="UTF-8"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_summary_admin_json(self, value, status=200, challenge=False):
+        self.send_summary_admin_bytes(json.dumps(value, ensure_ascii=False).encode("utf-8"),
+                                      "application/json; charset=utf-8", status, challenge)
+
+    def _summary_admin_origin(self):
+        configured = os.environ.get("TRANSCRI_SUMMARY_ADMIN_ORIGIN") or "http://127.0.0.1:{}".format(config().get("dashboard_port", 8765))
+        parsed = urlsplit(configured)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path or parsed.query or parsed.fragment):
+            return None
+        if parsed.scheme == "http" and parsed.hostname not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+            return None
+        return configured
+
+    def require_summary_admin(self, write=False):
+        """Protect only new summary administrative routes; never trust proxy identity headers."""
+        expected_origin = self._summary_admin_origin()
+        verifier = os.environ.get("TRANSCRI_SUMMARY_ADMIN_PASSWORD_HASH")
+        if not expected_origin or not verifier:
+            self.send_summary_admin_json({"error": "Управление суммаризатором не настроено"}, 503)
+            return False
+        try:
+            local_peer = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            local_peer = False
+        if not local_peer or self.headers.get("Host", "").lower() != urlsplit(expected_origin).netloc.lower():
+            self.send_summary_admin_json({"error": "Недопустимый адрес управления"}, 403)
+            return False
+        if write:
+            if (self.headers.get("Origin") != expected_origin
+                    or self.headers.get("X-Requested-With") != "TranscriSummaryzator-Admin"
+                    or self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none")):
+                self.send_summary_admin_json({"error": "Проверка происхождения запроса не пройдена"}, 403)
+                return False
+        now_monotonic = time.monotonic()
+        with SUMMARY_ADMIN_RATE_LOCK:
+            failures = [t for t in SUMMARY_ADMIN_FAILURES.get("loopback", []) if now_monotonic - t < 60]
+            SUMMARY_ADMIN_FAILURES["loopback"] = failures
+            blocked = len(failures) >= 10
+        if blocked:
+            self.send_summary_admin_json({"error": "Слишком много попыток входа"}, 429)
+            return False
+        header = self.headers.get("Authorization", "")
+        try:
+            if not header.startswith("Basic ") or len(header) > 4096:
+                raise ValueError
+            decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+            username, password = decoded.split(":", 1)
+            accepted = username == "admin" and verify_admin_password(password, verifier)
+        except (ValueError, UnicodeError):
+            accepted = False
+        if not accepted:
+            with SUMMARY_ADMIN_RATE_LOCK:
+                SUMMARY_ADMIN_FAILURES.setdefault("loopback", []).append(now_monotonic)
+            self.send_summary_admin_json({"error": "Требуется доступ администратора"}, 401, challenge=True)
+            return False
+        return True
+
+    def summary_admin_request_json(self, max_bytes=4096):
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.send_summary_admin_json({"error": "Требуется application/json"}, 415)
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self.send_summary_admin_json({"error": "Укажите размер запроса"}, 411)
+            return None
+        if not 0 < length <= max_bytes or self.headers.get("Transfer-Encoding"):
+            self.send_summary_admin_json({"error": "Превышен лимит размера запроса"}, 413)
+            return None
+        try:
+            value = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeError):
+            value = None
+        if not isinstance(value, dict):
+            self.send_summary_admin_json({"error": "Неверный JSON объект"}, 400)
+            return None
+        return value
+
+    def summary_active_credential_jobs(self, identifier):
+        """Count pending remote jobs; unknown ledger state blocks replacement/deletion."""
+        ledger = None
+        try:
+            from summary.luna_v1.ledger import Ledger
+            ledger = Ledger(STATE / "summary_private")
+            return ledger.active_summary_jobs_for_credential(identifier)
+        except Exception:
+            return None
+        finally:
+            if ledger is not None:
+                ledger.close()
+
+    def summary_credential_rpc(self, operation, body):
+        """Use the isolated summary Python; never load its packages into ASR runtime."""
+        interpreter = os.environ.get("TRANSCRI_SUMMARY_PYTHON", "")
+        if not interpreter or not Path(interpreter).is_absolute() or not Path(interpreter).is_file():
+            raise CredentialError("Не настроен изолированный Python суммаризатора")
+        environment = os.environ.copy()
+        environment["TRANSCRI_SUMMARY_CREDENTIAL_DB"] = str(SUMMARY_CREDENTIAL_DB)
+        request = json.dumps({"operation": operation, "body": body}, ensure_ascii=False)
+        if len(request.encode("utf-8")) > 4096:
+            raise CredentialError("Превышен лимит запроса к хранилищу")
+        try:
+            result = subprocess.run(
+                [interpreter, str(ROOT / "scripts" / "summary_credentials.py"), "--credential-rpc"],
+                input=request, text=True, capture_output=True, env=environment, timeout=15, check=False,
+            )
+            if len(result.stdout) > 65536:
+                raise CredentialError("Слишком большой ответ хранилища")
+            response = json.loads(result.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            raise CredentialError("Хранилище ключей недоступно") from exc
+        if not isinstance(response, dict) or not isinstance(response.get("ok"), bool):
+            raise CredentialError("Неожиданный ответ хранилища")
+        if result.returncode == 0 and response["ok"]:
+            return response["result"]
+        if result.returncode == 2 and not response["ok"]:
+            raise CredentialError(str(response.get("error") or "Операция с ключом не выполнена"))
+        raise CredentialError("Хранилище ключей недоступно")
+
+    def handle_summary_credential_write(self, path):
+        if not self.require_summary_admin(write=True):
+            return
+        body = self.summary_admin_request_json()
+        if body is None:
+            return
+        action = path.removeprefix("/api/summary/credentials/")
+        try:
+            if action == "add":
+                result = self.summary_credential_rpc("add", body)
+                status = 201
+            elif action == "check":
+                result = self.summary_credential_rpc("check", body)
+                status = 200
+            elif action == "replace":
+                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                    active = self.summary_active_credential_jobs(body.get("id"))
+                    if active is None:
+                        raise CredentialError("Состояние внешних запросов неизвестно; замена пока закрыта")
+                    result = self.summary_credential_rpc("replace", {**body, "active_jobs": active})
+                status = 200
+            elif action == "order":
+                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                    result = self.summary_credential_rpc("order", body)
+                status = 200
+            elif action == "enabled":
+                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                    result = self.summary_credential_rpc("enabled", body)
+                status = 200
+            elif action == "delete":
+                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                    active = self.summary_active_credential_jobs(body.get("id"))
+                    if active is None:
+                        raise CredentialError("Состояние внешних запросов неизвестно; удаление пока закрыто")
+                    result = self.summary_credential_rpc("delete", {**body, "active_jobs": active})
+                status = 200
+            else:
+                self.send_summary_admin_json({"error": "Неизвестная операция"}, 404)
+                return
+        except CredentialError as exc:
+            self.send_summary_admin_json({"error": str(exc)}, 409)
+            return
+        except sqlite3.Error:
+            self.send_summary_admin_json({"error": "Ошибка хранилища ключей"}, 500)
+            return
+        self.send_summary_admin_json({"ok": True, "result": result}, status)
+
     def send_bytes(self, body, content_type, status=200):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -2260,6 +2739,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/summary/credentials/"):
+            self.handle_summary_credential_write(parsed.path)
+            return
+        if parsed.path.startswith("/api/summary/tasks/"):
+            if not self.require_summary_admin(write=True):
+                return
+            body = self.summary_admin_request_json(max_bytes=32768)
+            if body is None:
+                return
+            action_id = parsed.path.removeprefix("/api/summary/tasks/")
+            job_id = parse_qs(parsed.query).get("id", [""])[0]
+            if not job_id.isdecimal() or not action_id:
+                self.send_summary_admin_json({"error": "Неверный номер записи или карточки"}, 400)
+                return
+            row = connect().execute("SELECT status,output_dir FROM jobs WHERE id=?", (int(job_id),)).fetchone()
+            if not row or row["status"] != "done" or not row["output_dir"]:
+                self.send_summary_admin_json({"error": "Готовая расшифровка не найдена"}, 404)
+                return
+            try:
+                from summary.luna_v1.task_api import edit_current, TaskViewUnavailable
+                from summary.luna_v1.tasks import RevisionConflict
+                view = edit_current(
+                    Path(row["output_dir"]), Path(row["output_dir"]) / "transcript.json",
+                    STATE / "summary_private" / "tasks.sqlite3", current_summary_output,
+                    action_id=action_id,
+                    expected_generation_id=body.get("expected_generation_id"),
+                    expected_revision=body.get("expected_revision"),
+                    changes=body.get("changes"), actor="admin",
+                )
+            except (TaskViewUnavailable, RevisionConflict) as exc:
+                self.send_summary_admin_json({"error": str(exc)}, 409)
+                return
+            except (TypeError, ValueError) as exc:
+                self.send_summary_admin_json({"error": str(exc)[:240]}, 400)
+                return
+            except (OSError, sqlite3.Error):
+                self.send_summary_admin_json({"error": "Карточку не удалось сохранить"}, 500)
+                return
+            self.send_summary_admin_json(view.public())
+            return
         if parsed.path == "/api/profiles/create":
             name = parse_qs(parsed.query).get("name", [""])[0].strip()
             if not name or len(name) > 80 or any(ord(character) < 32 for character in name):
@@ -2515,6 +3034,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/summary":
+            luna_backend = config().get("summary_backend") == "luna_batch"
+            if luna_backend and not self.require_summary_admin(write=True):
+                return
             params = parse_qs(parsed.query)
             try:
                 job_id = int(params.get("id", [""])[0])
@@ -2526,8 +3048,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not job or job["status"] != "done" or not job["output_dir"]:
                 self.send_json({"error": "Сначала дождитесь окончания расшифровки"}, 409)
                 return
-            if job["summary_status"] == "running":
-                self.send_json({"error": "Саммари уже создаётся"}, 409)
+            active = {"running", "pending_batch", "submission_unknown"} if luna_backend else {"running"}
+            if job["summary_status"] == "credential_required" and luna_backend:
+                attempt_path = Path(job["output_dir"]) / "summary_luna_attempt.json"
+                attempt = load_json(attempt_path) if attempt_path.is_file() else {}
+                if attempt.get("job_id"):
+                    active.add("credential_required")
+            if job["summary_status"] in active:
+                self.send_json({"error": "Предыдущая отправка ещё не завершена или требует восстановления"}, 409)
                 return
             update_job(
                 db, job_id,
@@ -2647,6 +3175,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path in ("/summary-tasks", "/summary-tasks.js", "/api/summary/tasks"):
+            if not self.require_summary_admin():
+                return
+            if parsed.path == "/summary-tasks" or parsed.path == "/summary-tasks.js":
+                target = SUMMARY_TASKS_PATH if parsed.path == "/summary-tasks" else SUMMARY_TASKS_JS_PATH
+                self.send_summary_admin_bytes(target.read_bytes(),
+                    "text/html; charset=utf-8" if parsed.path == "/summary-tasks" else "text/javascript; charset=utf-8")
+                return
+            job_id = parse_qs(parsed.query).get("id", [""])[0]
+            if not job_id.isdecimal():
+                self.send_summary_admin_json({"error": "Неверный номер записи"}, 400)
+                return
+            row = connect().execute("SELECT status,output_dir FROM jobs WHERE id=?", (int(job_id),)).fetchone()
+            if not row or row["status"] != "done" or not row["output_dir"]:
+                self.send_summary_admin_json({"error": "Готовая расшифровка не найдена"}, 404)
+                return
+            try:
+                self.send_summary_admin_json(luna_effective_view(Path(row["output_dir"])).public())
+            except ValueError as exc:
+                self.send_summary_admin_json({"error": str(exc)[:240]}, 409)
+            except (OSError, sqlite3.Error):
+                self.send_summary_admin_json({"error": "Карточки недоступны"}, 500)
+            return
+        if parsed.path in ("/summary-settings", "/summary-settings.js", "/api/summary/credentials"):
+            if not self.require_summary_admin():
+                return
+            if parsed.path == "/api/summary/credentials":
+                try:
+                    self.send_summary_admin_json(self.summary_credential_rpc("list", {}))
+                except CredentialError as exc:
+                    self.send_summary_admin_json({"error": str(exc)}, 503)
+                except sqlite3.Error:
+                    self.send_summary_admin_json({"error": "Ошибка хранилища ключей"}, 500)
+                return
+            target = SUMMARY_SETTINGS_PATH if parsed.path == "/summary-settings" else SUMMARY_SETTINGS_JS_PATH
+            self.send_summary_admin_bytes(target.read_bytes(), "text/html; charset=utf-8" if parsed.path == "/summary-settings" else "text/javascript; charset=utf-8")
+            return
         if parsed.path == "/health":
             self.send_bytes(b'{"status":"ok"}', "application/json; charset=utf-8")
             return
@@ -2722,6 +3287,22 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             row = connect().execute("SELECT output_dir FROM jobs WHERE id = ?", (job_id,)).fetchone()
             base = Path(row["output_dir"]) if row and row["output_dir"] else None
             package = current_summary_output(base) if base else None
+            luna = bool(package and load_json(package / "generation_manifest.json").get("contract_version") == "luna_summary_v1")
+            if luna and name in {"summary.md", "summary.html", "summary.json", "tasks.json", "transcript.html"}:
+                try:
+                    rendered = luna_effective_view(base).rendered[name]
+                except (ValueError, OSError, sqlite3.Error):
+                    self.send_bytes(b"Effective summary unavailable", "text/plain", 409)
+                    return
+                body = (json.dumps(rendered, ensure_ascii=False, indent=2) + "\n").encode("utf-8") if name.endswith(".json") else rendered.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", mimetypes.guess_type(name)[0] or "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="{}"'.format(name))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             summary_files = {"summary.md", "summary.html", "transcript.html", "summary.json", "summary_audit.json", "semantic_records.json", "tasks.json", "run_manifest.json", "public_items.json", "publication_audit.json", "summary_plan.json", "candidate_disposition.json", "evidence_versions.json"}
             target = (package if name in summary_files else base) / name if name in allowed and (package if name in summary_files else base) else None
             if not target or not target.is_file():
@@ -2747,8 +3328,14 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             package = current_summary_output(Path(row["output_dir"])) if row["output_dir"] else None
             body_path = package / "summary.html" if package else None
             ready = bool(body_path and body_path.is_file())
-            content = body_path.read_text(encoding="utf-8").replace('href="transcript.html#',
-                'href="/result?id={}#'.format(job_id)) if ready else ""
+            luna = bool(package and load_json(package / "generation_manifest.json").get("contract_version") == "luna_summary_v1")
+            try:
+                content = (luna_effective_view(Path(row["output_dir"])).rendered["summary.fragment.html"]
+                           if ready and luna else body_path.read_text(encoding="utf-8") if ready else "")
+                content = content.replace('href="transcript.html#', 'href="/result?id={}#'.format(job_id))
+            except (ValueError, OSError, sqlite3.Error):
+                ready = False
+                content = ""
             title = html.escape(row["original_name"])
             status = html.escape(row["summary_detail"] or "Саммари ещё не создано")
             error = html.escape(row["summary_error"] or "")
@@ -2763,6 +3350,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                     html.escape(str(attempt.get("displayed_generation_id") or "неизвестно")), error or "не указана")
             download_specs = [
                 ("summary.md", "Markdown", True),
+                ("summary.html", "HTML конспект", False),
                 ("transcript.html", "HTML расшифровка для таймкодов", False),
                 ("summary.json", "JSON", False),
                 ("tasks.json", "Задачи", False),
@@ -2788,12 +3376,14 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                     for name, label, primary in download_specs
                     if (package / name if name in {"summary.md", "summary.html", "transcript.html", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
                 )
-            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id},generation={generation};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST'}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';const changed=j.summary_generation_id&&j.summary_generation_id!==generation;if(j.summary_status==='done'&&(changed||document.querySelector('#content').style.display==='none'))location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
+            task_link = '<a href="/summary-tasks?id={}">Редактировать карточки</a>'.format(job_id) if ready and luna else ""
+            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}{task_link}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id},generation={generation};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST',headers:{{'X-Requested-With':'TranscriSummaryzator-Admin'}}}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';const changed=j.summary_generation_id&&j.summary_generation_id!==generation;if(j.summary_status==='done'&&(changed||document.querySelector('#content').style.display==='none'))location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
                 title=title, job_id=int(job_id), content=content,
                 generation=json.dumps(package.name if package else None),
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
                 state_display="none" if ready and row["summary_status"] == "done" else "block", content_display="block" if ready else "none",
                 downloads=downloads,
+                task_link=task_link,
                 fallback=fallback,
             )
             self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
@@ -2931,6 +3521,8 @@ def main():
     rename_parser = sub.add_parser("rename", help="переэкспортировать после изменения speakers.json")
     rename_parser.add_argument("job_id", type=int)
     sub.add_parser("watch", help="наблюдать за inbox")
+    sub.add_parser("summary-scheduler", help="самостоятельная очередь OpenRouter Batch")
+    sub.add_parser("summary-scheduler-once", help="один цикл очереди OpenRouter Batch")
     sub.add_parser("once", help="обработать следующее задание")
     sub.add_parser("status", help="показать очередь")
     sub.add_parser("dashboard", help="показать страницу прогресса")
@@ -2945,6 +3537,10 @@ def main():
         rename_export(args.job_id)
     elif args.command == "watch":
         watch()
+    elif args.command == "summary-scheduler":
+        summary_scheduler()
+    elif args.command == "summary-scheduler-once":
+        summary_scheduler(once=True)
     elif args.command == "once":
         run_next()
     elif args.command == "status":

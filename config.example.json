@@ -88,6 +88,7 @@
   "utterance_gap_seconds": 1.2,
   "utterance_continuation_gap_seconds": 3.0,
   "summary_enabled": true,
+  "summary_backend": "legacy_local",
   "summary_project_name": "Project",
   "ollama_url": "http://127.0.0.1:11434",
   "summary_extractor_model": "qwen3.5:9b-q4_K_M",

@@ -1,6 +1,8 @@
 # TranscriSummaryzator
 
-Локальный pipeline для расшифровки встреч, определения говорящих и создания проверяемого саммари с таймкодами.
+Pipeline для локальной расшифровки встреч и определения говорящих. В этой ветке добавлен изолированный summary-only backend для `openai/gpt-6-luna:batch` через OpenRouter. Он читает уже готовый `transcript.json` и не запускает распознавание речи повторно.
+
+Новый backend по умолчанию выключен (`summary_backend: legacy_local`). Его контракт, ограничения приватности Batch, локальные карточки и порядок изолированного запуска описаны в [docs/SUMMARY_LUNA_BATCH.md](docs/SUMMARY_LUNA_BATCH.md); защищённое управление ключами — в [docs/SUMMARY_ADMIN_KEYS.md](docs/SUMMARY_ADMIN_KEYS.md). Реальный API-результат и включение production подтверждаются только отдельной приёмкой.
 
 ## Возможности
 
