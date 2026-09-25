@@ -7,6 +7,7 @@ until a caller has reserved budget and selected a verified credential.
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +18,13 @@ API_BASE = "https://openrouter.ai/api/v1"
 MODEL = "openai/gpt-6-luna:batch"
 PROVIDER = "openai"
 TERMINAL = frozenset({"completed", "failed", "expired", "cancelled"})
+_BATCH_ID = re.compile(r"batch[-_][A-Za-z0-9_-]{3,128}\Z")
+
+
+def valid_batch_id(value: object) -> bool:
+    # Current OpenRouter responses use batch-..., while examples in the
+    # official quickstart use batch_.... Both are opaque remote identifiers.
+    return isinstance(value, str) and _BATCH_ID.fullmatch(value) is not None
 
 
 class BatchError(RuntimeError):
@@ -98,12 +106,12 @@ class BatchClient:
         return self._request("GET", "/model/openai/gpt-6-luna:batch")
 
     def get(self, batch_id: str) -> Reply:
-        if not batch_id.startswith("batch_") or not batch_id[6:].replace("-", "").replace("_", "").isalnum():
+        if not valid_batch_id(batch_id):
             raise ValueError("invalid batch id")
         return self._request("GET", f"/batches/{batch_id}")
 
     def delete(self, batch_id: str) -> Reply:
-        if not batch_id.startswith("batch_") or not batch_id[6:].replace("-", "").replace("_", "").isalnum():
+        if not valid_batch_id(batch_id):
             raise ValueError("invalid batch id")
         return self._request("DELETE", f"/batches/{batch_id}")
 

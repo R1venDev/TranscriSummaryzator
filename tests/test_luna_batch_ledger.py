@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from summary.luna_v1.batch import BatchClient, extract_one_completed
+from summary.luna_v1.batch import BatchClient, extract_one_completed, valid_batch_id
 from summary.luna_v1.ledger import Ledger
 
 
@@ -30,6 +30,12 @@ class _Opener:
 
 
 class LedgerTests(unittest.TestCase):
+    def test_remote_batch_id_accepts_live_and_documented_forms(self):
+        self.assertTrue(valid_batch_id("batch-1790364440-Gq1lAnlrV1xmZGmroHeB"))
+        self.assertTrue(valid_batch_id("batch_abc123"))
+        self.assertFalse(valid_batch_id("batch-../../other"))
+        self.assertFalse(valid_batch_id("batch_"))
+
     def test_single_flight_restart_and_unknown_charge_hold_weekly_budget(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

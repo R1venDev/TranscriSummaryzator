@@ -38,10 +38,11 @@ class FakeClient:
         self.__class__.submit_calls += 1
         self.__class__.custom_id = custom_id
         self.__class__.request_body = request_body
-        return Reply(202, {"id": "batch_synthetic001", "status": "validating"})
+        return Reply(202, {"id": "batch-synthetic001", "status": "validating",
+                           "model": "openai/gpt-6-luna-20260922"})
 
     def get(self, batch_id):
-        assert batch_id == "batch_synthetic001"
+        assert batch_id == "batch-synthetic001"
         document = {
             "schema_version": SCHEMA_ID,
             "meeting": {"topic": "Проверка данных", "project": None},
@@ -60,11 +61,12 @@ class FakeClient:
                           "details": []}],
         }
         return Reply(200, {
-            "id": batch_id, "status": "completed", "usage": {"cost": 0.003,
+            "id": batch_id, "status": "completed", "model": "openai/gpt-6-luna-20260922",
+            "usage": {"cost": 0.003,
             "prompt_tokens": 300, "completion_tokens": 900},
             "results": [{"custom_id": self.__class__.custom_id,
                          "response": {"status_code": 200, "body": {
-                             "model": "openai/gpt-6-luna:batch",
+                             "model": "openai/gpt-6-luna-20260922",
                              "choices": [{"finish_reason": "stop", "message": {
                                  "content": json.dumps(document, ensure_ascii=False)}}],
                          }}, "error": None}],
@@ -229,7 +231,7 @@ class EngineTests(unittest.TestCase):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
             self.assertEqual(started["status"], "submitted")
-            raw = FakeClient("synthetic-secret-never-sent").get("batch_synthetic001")
+            raw = FakeClient("synthetic-secret-never-sent").get("batch-synthetic001")
             document = json.loads(raw.body["results"][0]["response"]["body"]["choices"][0]["message"]["content"])
             _, source_index, source_sha = load_source(source)
             store = TaskStore(private / "tasks.sqlite3")

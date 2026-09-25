@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.summary_credentials import CredentialError, CredentialStore, credential_dispatch_guard
 
 from . import PROMPT_PATH, SCHEMA, SCHEMA_ID, load_source, validate_document
-from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_completed
+from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_completed, valid_batch_id
 from .ledger import Ledger, usd_micros, write_private_json
 from .publication import publish_document
 from .route import MAX_COMPLETION_TOKENS, RouteBlocked, verify_batch_route
@@ -192,7 +192,7 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             reply = client.submit(job["custom_id"], request_body)
             write_private_json(artifacts / "submit_response.json", reply.body)
             remote_id = reply.body.get("id")
-            if reply.status_code != 202 or not isinstance(remote_id, str) or not remote_id.startswith("batch_"):
+            if reply.status_code != 202 or not valid_batch_id(remote_id):
                 ledger.submission_result(job["id"], remote_id=None, error_code="unexpected_submit_response")
                 return {"status": "submission_unknown", "job_id": job["id"]}
             ledger.submission_result(job["id"], remote_id=remote_id)
@@ -265,9 +265,16 @@ def _poll_backoff(retry_after: str | None) -> int:
 def _finish_raw(ledger: Ledger, job: dict) -> dict:
     artifacts = Path(job["artifact_dir"])
     batch = json.loads((artifacts / "batch_terminal.json").read_text(encoding="utf-8"))
+    submission = json.loads((artifacts / "submit_response.json").read_text(encoding="utf-8"))
+    if submission.get("id") != job["remote_id"] or batch.get("model") != submission.get("model"):
+        raise ValueError("batch_submission_identity_mismatch")
     request_manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
     body, usage = extract_one_completed(batch, job["custom_id"])
-    if body.get("model") not in (MODEL, "openai/gpt-6-luna"):
+    resolved_model = submission.get("model")
+    allowed_models = {MODEL, "openai/gpt-6-luna"}
+    if isinstance(resolved_model, str) and resolved_model.startswith("openai/gpt-6-luna-"):
+        allowed_models.add(resolved_model)
+    if body.get("model") not in allowed_models:
         raise ValueError("response_model_mismatch")
     choices = body.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
