@@ -15,7 +15,8 @@ WEEK_CAP_MICROUSD = 1_000_000
 JOB_CAP_MICROUSD = 100_000
 MAX_DISPATCHES_PER_JOB = 6
 QUALITY_STAGE_KINDS = frozenset({"audit", "verify", "inventory_1", "inventory_2",
-                                 "inventory_3", "reconcile"})
+                                 "inventory_3", "reconcile", "segment_1", "segment_2",
+                                 "segment_3"})
 
 
 def usd_micros(amount: float) -> int:
@@ -176,6 +177,7 @@ class Ledger:
                                 "gemini_openrouter_judge_repair_v2",
                                 "gemini_openrouter_judge_repair_v3_source_inventory",
                                 "gemini_openrouter_source_inventory_reconcile_v1",
+                                "gemini_openrouter_segment_review_v1",
                             }
                             or manifest.get("judge_workspace_id") != workspace_id
                             or not isinstance(workspace_id, str) or not workspace_id
@@ -256,7 +258,8 @@ class Ledger:
 
     def stage_completed(self, job_id: str, report_path: Path) -> None:
         changed = self.db.execute("UPDATE jobs SET status='stage_complete',accepted_document_path=?,updated_at=? "
-                                  "WHERE id=? AND kind IN ('audit','verify','inventory_1','inventory_2','inventory_3','reconcile') AND status='completed_raw'",
+                                  "WHERE id=? AND kind IN ('audit','verify','inventory_1','inventory_2','inventory_3','reconcile',"
+                                  "'segment_1','segment_2','segment_3') AND status='completed_raw'",
                                   (str(report_path), time.time(), job_id))
         if changed.rowcount != 1:
             raise ValueError("invalid stage completion transition")

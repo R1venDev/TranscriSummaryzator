@@ -218,7 +218,7 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
     md.extend([f"**Участники по транскрипции:** {_md(participants)}", ""])
     fragment.append(f"<p><strong>Участники по транскрипции:</strong> {_html(participants)}</p>")
     if quality_review is not None and quality_review.get("status") not in {
-            "checked", "model_reconciled_checked"}:
+            "checked", "model_reconciled_checked", "model_segment_reviewed_checked"}:
         status = quality_review.get("status")
         count = quality_review.get("unresolved_count", 0)
         if status == "unresolved":
@@ -238,6 +238,12 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
         elif status == "model_reconciled_unverified":
             notice = ("Независимый перечень по частям стенограммы сопоставлен с черновиком; "
                       "адресная повторная проверка не требовалась. Это не гарантия полной смысловой точности.")
+        elif status == "model_segment_reviewed_unverified":
+            notice = ("Части исходной стенограммы автоматически сопоставлены с полным черновиком. "
+                      "Адресная повторная проверка не требовалась; абсолютная полнота этим не доказана.")
+        elif status == "segment_review_unavailable":
+            notice = ("Автоматическая проверка не охватила все части стенограммы; "
+                      "конспект и выполненные проверки сохранены, недостающая область отмечена в статусе.")
         else:
             notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
         warning_count = quality_review.get("coverage_warning_count", 0)

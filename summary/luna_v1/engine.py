@@ -41,6 +41,12 @@ from summary.gemini_v1.reconcile_contract import (
     build_reconcile_input, validate_reconciliation_report,
     apply_reconciliation_report, reconciliation_warnings,
 )
+from summary.gemini_v1.segment_review_contract import (
+    SEGMENT_REVIEW_PROMPT_PATH, SEGMENT_REVIEW_SCHEMA,
+    SEGMENT_REVIEW_SCHEMA_ID, build_segment_review_input,
+    validate_segment_review_report, segment_review_warnings,
+    merge_segment_review_reports, segment_inventory_view,
+)
 from summary.gemini_v1.batch import BatchClient as GeminiBatchClient
 from summary.gemini_v1.batch import BatchError as GeminiBatchError
 from summary.gemini_v1.batch import BATCH_MODEL_IDS as GEMINI_BATCH_MODEL_IDS
@@ -59,7 +65,8 @@ LEGACY_QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
 PREVIOUS_GEMINI_QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v2"
 INVENTORY_V2_QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v3_source_inventory"
 INVENTORY_RECONCILE_QUALITY_POLICY_VERSION = "gemini_openrouter_source_inventory_reconcile_v1"
-QUALITY_POLICY_VERSION = INVENTORY_RECONCILE_QUALITY_POLICY_VERSION
+SEGMENT_REVIEW_QUALITY_POLICY_VERSION = "gemini_openrouter_segment_review_v1"
+QUALITY_POLICY_VERSION = SEGMENT_REVIEW_QUALITY_POLICY_VERSION
 QUALITY_PROVIDER = "openrouter_gemini"
 GEMINI_MODEL = "google/gemini-3.7-flash:batch"
 GEMINI_PRIVACY_MODE = "openrouter_batch_30d_google_vertex_user_authorized"
@@ -69,6 +76,7 @@ INVENTORY_SEGMENTER_VERSION = "source_inventory_segments_v1"
 INVENTORY_OUTPUT_CAP = 5_000
 RECONCILE_OUTPUT_CAP = 7_000
 FOCUSED_VERIFY_OUTPUT_CAP = 3_000
+SEGMENT_REVIEW_OUTPUT_CAP = 10_000
 INVENTORY_THIRD_SEGMENT_AFTER_CHARS = 120_000
 INVENTORY_CONTEXT_OVERLAP = 4
 INVENTORY_WINDOWS_PER_SEGMENT = 4
@@ -147,7 +155,8 @@ def _quality_route(manifest: dict) -> str:
         return "luna"
     if (policy in {PREVIOUS_GEMINI_QUALITY_POLICY_VERSION,
                    INVENTORY_V2_QUALITY_POLICY_VERSION,
-                   INVENTORY_RECONCILE_QUALITY_POLICY_VERSION}
+                   INVENTORY_RECONCILE_QUALITY_POLICY_VERSION,
+                   SEGMENT_REVIEW_QUALITY_POLICY_VERSION}
             and manifest.get("quality_provider") == QUALITY_PROVIDER):
         return "gemini"
     raise ValueError("unknown_quality_policy")
@@ -161,7 +170,9 @@ def _quality_contract(provider: str, policy: str | None = None) -> tuple[Path, d
             return GEMINI_AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID
         if policy == INVENTORY_V2_QUALITY_POLICY_VERSION:
             return GEMINI_AUDIT_PROMPT_PATH_V2, GEMINI_AUDIT_SCHEMA_V2, GEMINI_AUDIT_SCHEMA_ID_V2
-        if policy in {None, INVENTORY_RECONCILE_QUALITY_POLICY_VERSION}:
+        if policy == SEGMENT_REVIEW_QUALITY_POLICY_VERSION or policy is None:
+            return SEGMENT_REVIEW_PROMPT_PATH, SEGMENT_REVIEW_SCHEMA, SEGMENT_REVIEW_SCHEMA_ID
+        if policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION:
             return RECONCILE_PROMPT_PATH, RECONCILE_SCHEMA, RECONCILE_SCHEMA_ID
     raise ValueError("unknown_quality_provider")
 
@@ -170,6 +181,9 @@ def _quality_stage_contract(provider: str, policy: str | None, kind: str) -> tup
     if (provider == "gemini" and policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION
             and kind.startswith("inventory_")):
         return INVENTORY_PROMPT_PATH, INVENTORY_SCHEMA, INVENTORY_SCHEMA_ID
+    if (provider == "gemini" and policy == SEGMENT_REVIEW_QUALITY_POLICY_VERSION
+            and kind == "verify"):
+        return RECONCILE_PROMPT_PATH, RECONCILE_SCHEMA, RECONCILE_SCHEMA_ID
     return _quality_contract(provider, policy)
 
 
@@ -222,6 +236,11 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
         "inventory_output_cap": INVENTORY_OUTPUT_CAP,
         "reconcile_output_cap": RECONCILE_OUTPUT_CAP,
         "focused_verify_output_cap": FOCUSED_VERIFY_OUTPUT_CAP,
+        "segment_review_prompt_sha256": _sha(SEGMENT_REVIEW_PROMPT_PATH.read_bytes()),
+        "segment_review_schema_sha256": _sha(_json_bytes(SEGMENT_REVIEW_SCHEMA)),
+        "segment_review_output_cap": SEGMENT_REVIEW_OUTPUT_CAP,
+        "verify_prompt_sha256": _sha(RECONCILE_PROMPT_PATH.read_bytes()),
+        "verify_schema_sha256": _sha(_json_bytes(RECONCILE_SCHEMA)),
         "force_nonce": force_nonce,
     }
     return _sha(_json_bytes(material))
@@ -346,6 +365,11 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "inventory_output_cap": INVENTORY_OUTPUT_CAP,
             "reconcile_output_cap": RECONCILE_OUTPUT_CAP,
             "focused_verify_output_cap": FOCUSED_VERIFY_OUTPUT_CAP,
+            "segment_review_prompt_sha256": _sha(SEGMENT_REVIEW_PROMPT_PATH.read_bytes()),
+            "segment_review_schema_sha256": _sha(_json_bytes(SEGMENT_REVIEW_SCHEMA)),
+            "segment_review_output_cap": SEGMENT_REVIEW_OUTPUT_CAP,
+            "verify_prompt_sha256": _sha(RECONCILE_PROMPT_PATH.read_bytes()),
+            "verify_schema_sha256": _sha(_json_bytes(RECONCILE_SCHEMA)),
             "request_sha256": _sha(serialized_request),
             "reserve_microusd": reserve_micros,
             "pricing": {
@@ -558,7 +582,8 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
         ledger.mark_quality_pending(job["id"])
         return {"status": "draft_ready", "job_id": job["id"],
                 "reserved_usd": job["reserved_microusd"] / 1_000_000}
-    new_quality_kind = job["kind"] in {"inventory_1", "inventory_2", "inventory_3", "reconcile"}
+    new_quality_kind = job["kind"] in {"inventory_1", "inventory_2", "inventory_3",
+                                       "reconcile", "segment_1", "segment_2", "segment_3"}
     if job["kind"] not in {"audit", "verify"} and not new_quality_kind:
         raise ValueError("unknown_quality_stage")
     provider = "gemini" if request_manifest.get("provider") == QUALITY_PROVIDER else "luna"
@@ -570,6 +595,34 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     root = ledger.get(job["root_job_id"])
     if root is None or root["source_sha256"] != source_sha:
         raise ValueError("audit_root_source_mismatch")
+    if stage_policy == SEGMENT_REVIEW_QUALITY_POLICY_VERSION:
+        target = json.loads((artifacts / "target.json").read_text(encoding="utf-8"))
+        if _sha(_json_bytes(target)) != request_manifest["target_document_sha256"]:
+            raise ValueError("segment_review_target_changed")
+        if job["kind"].startswith("segment_"):
+            validate_segment_review_report(document, target["segment"],
+                                           target["draft"], source_index)
+            warnings = segment_review_warnings(document, target["segment"],
+                                               target["draft"], source_index)
+            report_file = artifacts / "segment_review_report.json"
+            count = len(document["items"])
+        elif job["kind"] == "verify":
+            validate_reconciliation_report(document, target["draft"],
+                                           target["inventory"], source_index,
+                                           mode="verify")
+            warnings = reconciliation_warnings(
+                document, target["draft"], target["inventory"], source_index,
+                mode="verify", prior_findings=target["prior_findings"])
+            report_file = artifacts / "segment_verify_report.json"
+            count = len(document["findings"])
+        else:
+            raise ValueError("unknown_segment_quality_stage")
+        if warnings:
+            write_private_json(artifacts / "coverage_warnings.json", {"warnings": warnings})
+        write_private_json(report_file, document)
+        ledger.stage_completed(job["id"], report_file)
+        return {"status": "stage_complete", "stage": job["kind"], "job_id": job["id"],
+                "root_job_id": root["id"], "items_or_findings": count}
     if stage_policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION:
         target_path = artifacts / "target.json"
         target = json.loads(target_path.read_text(encoding="utf-8"))
@@ -620,15 +673,31 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
 
 def _quality_request_body(source_text: str, target: dict, *, kind: str,
                           prior_findings: list[dict], provider: str,
-                          policy: str | None = None) -> dict:
-    if kind not in {"audit", "verify", "inventory_1", "inventory_2", "inventory_3", "reconcile"}:
+                          policy: str | None = None,
+                          source_index: dict | None = None) -> dict:
+    if kind not in {"audit", "verify", "inventory_1", "inventory_2", "inventory_3",
+                    "reconcile", "segment_1", "segment_2", "segment_3"}:
         raise ValueError("invalid quality request kind")
     if provider == "gemini":
         # OpenRouter Chat Completions carries a Gemini-specific instruction.
         # The transcript stays in a separate user message and receives no
         # tools, web plugin, audio, or renderer output.
         prompt_path, schema, schema_id = _quality_stage_contract(provider, policy, kind)
-        if policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION:
+        if policy == SEGMENT_REVIEW_QUALITY_POLICY_VERSION:
+            if kind.startswith("segment_"):
+                if source_index is None:
+                    raise ValueError("segment source index missing")
+                content = build_segment_review_input(
+                    source_text, target["segment"], target["draft"], source_index)
+                output_cap = SEGMENT_REVIEW_OUTPUT_CAP
+            elif kind == "verify":
+                content = build_reconcile_input(
+                    source_text, target["draft"], target["inventory"],
+                    mode="verify", prior_findings=prior_findings)
+                output_cap = FOCUSED_VERIFY_OUTPUT_CAP
+            else:
+                raise ValueError("invalid segment quality stage")
+        elif policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION:
             if kind.startswith("inventory_"):
                 content = build_inventory_input(target)
                 output_cap = INVENTORY_OUTPUT_CAP
@@ -821,12 +890,12 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     if not isinstance(pinned_scope, str) or pinned_scope == "judge-unavailable":
         return {"status": "unavailable", "reason": "judge_credential_required_at_writer_dispatch"}
     transcript_path = Path(root["output_dir"]) / "transcript.json"
-    source_text, _, source_sha = load_source(transcript_path)
+    source_text, source_index, source_sha = load_source(transcript_path)
     if source_sha != root["source_sha256"]:
         raise ValueError("source_revision_changed_before_audit")
     request_body = _quality_request_body(source_text, target, kind=kind,
                                          prior_findings=prior_findings, provider="gemini",
-                                         policy=policy)
+                                         policy=policy, source_index=source_index)
     request_bytes = _json_bytes(request_body)
     target_sha = _sha(_json_bytes(target))
     semantic_key = _quality_stage_key(root, kind, request_body, "gemini", policy)
@@ -902,7 +971,8 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
         }
         _pin_stage_files(
             artifacts, manifest, request_body,
-            target if policy == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION else None,
+            target if policy in {INVENTORY_RECONCILE_QUALITY_POLICY_VERSION,
+                                 SEGMENT_REVIEW_QUALITY_POLICY_VERSION} else None,
         )
         if stage["status"] != "reserved":
             return {"status": stage["status"], "job_id": stage["id"]}
@@ -955,15 +1025,21 @@ def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: 
     verify = ledger.stage(root["id"], "verify")
     reconcile = ledger.stage(root["id"], "reconcile")
     inventories = [ledger.stage(root["id"], f"inventory_{number}") for number in (1, 2, 3)]
+    segments = [ledger.stage(root["id"], f"segment_{number}") for number in (1, 2, 3)]
     coverage_warning_count = 0
-    for stage in (audit, reconcile, verify, *inventories):
+    for stage in (audit, reconcile, verify, *inventories, *segments):
         if stage is None:
             continue
         warning_file = Path(stage["artifact_dir"]) / "coverage_warnings.json"
         if warning_file.exists():
             coverage_warning_count += len(json.loads(warning_file.read_text(encoding="utf-8"))["warnings"])
+    merge_warning_file = artifacts / "segment_merge_warnings.json"
+    if merge_warning_file.exists():
+        coverage_warning_count += len(json.loads(merge_warning_file.read_text(encoding="utf-8"))["warnings"])
     if coverage_warning_count and status in {"checked", "model_audit_unverified",
-                                             "model_reconciled_unverified", "model_reconciled_checked"}:
+                                             "model_reconciled_unverified", "model_reconciled_checked",
+                                             "model_segment_reviewed_unverified",
+                                             "model_segment_reviewed_checked"}:
         status = "coverage_incomplete"
         reason = "coverage_report_inconsistent"
     quality_review = {
@@ -971,6 +1047,7 @@ def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: 
         "coverage_warning_count": coverage_warning_count,
         "reason": reason, "audit_job_id": audit["id"] if audit else None,
         "inventory_job_ids": [stage["id"] for stage in inventories if stage],
+        "segment_job_ids": [stage["id"] for stage in segments if stage],
         "reconcile_job_id": reconcile["id"] if reconcile else None,
         "verify_job_id": verify["id"] if verify else None,
     }
@@ -1026,6 +1103,39 @@ def _inventory_plan(root: dict, source_text: str, source_index: dict) -> list[di
     if path.exists():
         if _sha(_json_bytes(json.loads(path.read_text(encoding="utf-8")))) != _sha(_json_bytes(frozen)):
             raise ValueError("inventory_plan_changed_after_dispatch")
+    else:
+        write_private_json(path, frozen)
+    return segments
+
+
+def _segment_review_plan(root: dict, source_text: str, source_index: dict) -> list[dict]:
+    """Freeze the complete primary partition before any segment review POST."""
+    artifacts = Path(root["artifact_dir"])
+    manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
+    if (manifest.get("quality_policy_version") != SEGMENT_REVIEW_QUALITY_POLICY_VERSION
+            or manifest.get("inventory_segmenter_version") != INVENTORY_SEGMENTER_VERSION
+            or manifest.get("inventory_third_segment_after_chars") != INVENTORY_THIRD_SEGMENT_AFTER_CHARS
+            or manifest.get("inventory_context_overlap") != INVENTORY_CONTEXT_OVERLAP
+            or manifest.get("inventory_windows_per_segment") != INVENTORY_WINDOWS_PER_SEGMENT
+            or manifest.get("segment_review_output_cap") != SEGMENT_REVIEW_OUTPUT_CAP
+            or manifest.get("focused_verify_output_cap") != FOCUSED_VERIFY_OUTPUT_CAP
+            or manifest.get("segment_review_prompt_sha256") != _sha(SEGMENT_REVIEW_PROMPT_PATH.read_bytes())
+            or manifest.get("segment_review_schema_sha256") != _sha(_json_bytes(SEGMENT_REVIEW_SCHEMA))
+            or manifest.get("verify_prompt_sha256") != _sha(RECONCILE_PROMPT_PATH.read_bytes())
+            or manifest.get("verify_schema_sha256") != _sha(_json_bytes(RECONCILE_SCHEMA))):
+        raise ValueError("segment_review_code_or_prompt_changed_while_pending")
+    count = 3 if len(source_text) > INVENTORY_THIRD_SEGMENT_AFTER_CHARS else 2
+    segments = plan_inventory_segments(
+        source_text, count=count, overlap=INVENTORY_CONTEXT_OVERLAP,
+        windows_per_segment=INVENTORY_WINDOWS_PER_SEGMENT,
+    )
+    validate_inventory_plan(segments, source_index)
+    path = artifacts / "segment_review_plan.json"
+    frozen = {"version": INVENTORY_SEGMENTER_VERSION,
+              "source_sha256": root["source_sha256"], "segments": segments}
+    if path.exists():
+        if _sha(_json_bytes(json.loads(path.read_text(encoding="utf-8")))) != _sha(_json_bytes(frozen)):
+            raise ValueError("segment_review_plan_changed_after_dispatch")
     else:
         write_private_json(path, frozen)
     return segments
@@ -1167,6 +1277,131 @@ def _advance_quality_inventory(ledger: Ledger, root: dict, source_text: str,
         reason="final_bounded_correction" if verify_report["patches"] else None)
 
 
+def _advance_quality_segments(ledger: Ledger, root: dict, source_text: str,
+                              source_index: dict, draft: dict,
+                              gemini_client_factory) -> dict:
+    """Review each source part against the full draft, within one shared cap.
+
+    The next segment is submitted only after the preceding one is terminal and
+    its actual usage replaces its reservation. This prevents simultaneous
+    pessimistic reserves from consuming the logical $0.10 cap without
+    weakening either the per-call cost estimate or cache-miss assumption.
+    """
+    artifacts = Path(root["artifact_dir"])
+    segments = _segment_review_plan(root, source_text, source_index)
+    reports = []
+
+    def partial(reason: str) -> dict:
+        revised = draft
+        unresolved = []
+        if reports:
+            try:
+                combined, warnings = merge_segment_review_reports(
+                    reports, segments, draft, source_index, allow_partial=True)
+                write_private_json(artifacts / "segment_partial_report.json", combined)
+                if warnings:
+                    write_private_json(artifacts / "segment_merge_warnings.json",
+                                       {"warnings": warnings})
+                revised, unresolved = apply_audit(draft, combined, source_index)
+            except (ValueError, json.JSONDecodeError) as exc:
+                write_private_json(artifacts / "segment_partial_apply_error.json",
+                                   {"reason": type(exc).__name__ + ":" + str(exc)[:200]})
+        write_private_json(artifacts / "segment_partial_document.json", revised)
+        return _finalize_quality(ledger, root, revised, source_index,
+            status="segment_review_unavailable", unresolved_count=len(unresolved),
+            reason=reason)
+
+    for number, segment in enumerate(segments, 1):
+        kind = f"segment_{number}"
+        stage = ledger.stage(root["id"], kind)
+        if stage is None or stage["status"] == "reserved":
+            target = {"segment": segment, "draft": draft}
+            try:
+                started = _start_gemini_stage(ledger, root, kind, target, [],
+                                               gemini_client_factory)
+            except ValueError as exc:
+                started = {"status": "unavailable", "reason": str(exc)[:120]}
+            if started["status"] == "unavailable":
+                write_private_json(artifacts / "segment_unavailable.json", {
+                    "stage": kind, "reason": started.get("reason"),
+                    "completed_segments": len(reports),
+                })
+                return partial(f"{kind}:{started.get('reason')}")
+            stage = ledger.stage(root["id"], kind)
+        if stage is None or _quality_stage_outcome(stage) == "pending":
+            return {"status": "segment_review_pending", "job_id": root["id"],
+                    "stage": kind, "stage_job_id": stage["id"] if stage else None,
+                    "completed_segments": len(reports), "total_segments": len(segments)}
+        if _quality_stage_outcome(stage) == "failed":
+            write_private_json(artifacts / "segment_unavailable.json", {
+                "stage": kind, "reason": stage["status"],
+                "completed_segments": len(reports),
+            })
+            return partial(f"{kind}:{stage['status']}")
+        reports.append(json.loads(Path(stage["accepted_document_path"]).read_text(encoding="utf-8")))
+
+    try:
+        combined, warnings = merge_segment_review_reports(
+            reports, segments, draft, source_index)
+        inventory = merge_inventory_reports(
+            [segment_inventory_view(report) for report in reports],
+            segments, source_index)
+        revised, unresolved = apply_audit(draft, combined, source_index)
+    except (ValueError, json.JSONDecodeError) as exc:
+        write_private_json(artifacts / "segment_merge_error.json",
+                           {"reason": type(exc).__name__ + ":" + str(exc)[:200]})
+        return partial("segment_reports_could_not_be_merged")
+    write_private_json(artifacts / "segment_combined_report.json", combined)
+    write_private_json(artifacts / "segment_merged_inventory.json", inventory)
+    write_private_json(artifacts / "revised_document.json", revised)
+    if warnings:
+        write_private_json(artifacts / "segment_merge_warnings.json", {"warnings": warnings})
+    if not combined["patches"]:
+        return _finalize_quality(ledger, root, revised, source_index,
+            status="unresolved" if unresolved else "model_segment_reviewed_unverified",
+            unresolved_count=len(unresolved))
+
+    target = {"draft": revised, "inventory": inventory,
+              "prior_findings": combined["findings"]}
+    verification = ledger.stage(root["id"], "verify")
+    if verification is None or verification["status"] == "reserved":
+        try:
+            started = _start_gemini_stage(ledger, root, "verify", target,
+                                          combined["findings"], gemini_client_factory)
+        except ValueError as exc:
+            started = {"status": "unavailable", "reason": str(exc)[:120]}
+        if started["status"] == "unavailable":
+            return _finalize_quality(ledger, root, revised, source_index,
+                status="verify_unavailable", unresolved_count=len(unresolved),
+                reason=started.get("reason"))
+        verification = ledger.stage(root["id"], "verify")
+    if verification is None or _quality_stage_outcome(verification) == "pending":
+        return {"status": "verify_pending", "job_id": root["id"],
+                "stage_job_id": verification["id"] if verification else None}
+    if _quality_stage_outcome(verification) == "failed":
+        return _finalize_quality(ledger, root, revised, source_index,
+            status="verify_unavailable", unresolved_count=len(unresolved),
+            reason=verification["status"])
+    report = json.loads(Path(verification["accepted_document_path"]).read_text(encoding="utf-8"))
+    try:
+        checked, later_unresolved = apply_reconciliation_report(
+            revised, report, inventory, source_index, mode="verify")
+    except (ValueError, json.JSONDecodeError) as exc:
+        write_private_json(artifacts / "segment_verify_apply_error.json",
+                           {"reason": type(exc).__name__ + ":" + str(exc)[:200]})
+        return _finalize_quality(ledger, root, revised, source_index,
+            status="verify_unavailable", unresolved_count=len(unresolved),
+            reason="invalid_verify_report")
+    if report["patches"]:
+        write_private_json(artifacts / "postverify_document.json", checked)
+    return _finalize_quality(ledger, root, checked, source_index,
+        status=("postverify_corrected_unchecked" if report["patches"] else
+                "unresolved" if unresolved or later_unresolved else
+                "model_segment_reviewed_checked"),
+        unresolved_count=len(unresolved) + len(later_unresolved),
+        reason="final_bounded_correction" if report["patches"] else None)
+
+
 def _advance_quality(ledger: Ledger, root: dict, client_factory,
                      gemini_client_factory=GeminiBatchClient) -> dict:
     """Advance one saved workflow; semantic uncertainty is published visibly."""
@@ -1179,6 +1414,9 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
     root_manifest_path = artifacts / "manifest.json"
     root_manifest = (json.loads(root_manifest_path.read_text(encoding="utf-8"))
                      if root_manifest_path.exists() else {})
+    if root_manifest.get("quality_policy_version") == SEGMENT_REVIEW_QUALITY_POLICY_VERSION:
+        return _advance_quality_segments(ledger, root, source_text, source_index,
+                                         draft, gemini_client_factory)
     if root_manifest.get("quality_policy_version") == INVENTORY_RECONCILE_QUALITY_POLICY_VERSION:
         return _advance_quality_inventory(ledger, root, source_text, source_index,
                                           draft, gemini_client_factory)

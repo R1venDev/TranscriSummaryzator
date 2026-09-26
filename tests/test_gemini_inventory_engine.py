@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from summary.gemini_v1.batch import MODEL as GEMINI_MODEL, Reply as GeminiReply
-from summary.luna_v1.engine import _pin_stage_files, poll_once, submit
+from summary.luna_v1.engine import (INVENTORY_RECONCILE_QUALITY_POLICY_VERSION,
+                                     _pin_stage_files, poll_once, submit)
 from summary.luna_v1.ledger import Ledger
 from tests.test_gemini_engine import TwoRoleStore
 from tests.test_luna_engine import FakeClient, arm_poll
@@ -147,7 +148,9 @@ class InventoryEngineTests(unittest.TestCase):
             InventoryGemini.submissions = {}
             with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=writer_route), \
-                 patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route):
+                 patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route), \
+                 patch("summary.luna_v1.engine.QUALITY_POLICY_VERSION",
+                       INVENTORY_RECONCILE_QUALITY_POLICY_VERSION):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
                 self.assertEqual(started["status"], "submitted")
