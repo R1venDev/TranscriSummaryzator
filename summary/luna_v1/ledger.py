@@ -157,9 +157,23 @@ class Ledger:
             if root_job_id is not None:
                 root = self.db.execute("SELECT * FROM jobs WHERE id=?", (root_job_id,)).fetchone()
                 if (root is None or root["kind"] != "summary"
-                        or root["source_sha256"] != source_sha256
-                        or root["workspace_id"] != workspace_id):
+                        or root["source_sha256"] != source_sha256):
                     raise ValueError("invalid quality root or workspace")
+                if root["workspace_id"] != workspace_id:
+                    # A Gemini judge uses a separate Google project and key.
+                    # Only a root which selected this route before its writer
+                    # POST may spend against another credential scope. Legacy
+                    # Luna quality jobs remain pinned to the writer workspace.
+                    manifest_path = Path(root["artifact_dir"]) / "manifest.json"
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError) as exc:
+                        raise ValueError("quality root manifest unavailable") from exc
+                    if (manifest.get("quality_provider") != "google_gemini"
+                            or manifest.get("quality_policy_version") != "gemini_judge_repair_v1"
+                            or not isinstance(workspace_id, str) or not workspace_id
+                            or credential_id == root["credential_id"]):
+                        raise ValueError("invalid quality root or workspace")
                 group_cost = self.db.execute("""SELECT COALESCE(SUM(
                     CASE WHEN billed_microusd IS NULL THEN reserved_microusd ELSE billed_microusd END),0)
                     FROM jobs WHERE root_job_id=? AND status NOT IN

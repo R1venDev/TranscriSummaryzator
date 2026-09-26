@@ -21,6 +21,7 @@ from summary_credentials import CredentialError, CredentialStore, credential_dis
 
 FAKE_KEY_A = "sk-or-v1-fake-credential-0001"
 FAKE_KEY_B = "sk-or-v1-fake-credential-0002"
+FAKE_GOOGLE_KEY = "synthetic-google-api-key-0001"
 
 
 class FakeKeyResponse:
@@ -34,6 +35,11 @@ class FakeKeyResponse:
         return json.dumps({"data": {"workspace_id": "0df9e665-d932-5740-b2c7-b52af166bc11", "limit": 1.0,
                                     "limit_remaining": 0.8, "limit_reset": "weekly",
                                     "usage_weekly": 0.2}}).encode()
+
+
+class FakeGoogleModelsResponse(FakeKeyResponse):
+    def read(self, _):
+        return json.dumps({"models": [{"name": "models/synthetic-gemini"}]}).encode()
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -76,6 +82,78 @@ class CredentialStoreTests(unittest.TestCase):
         with sqlite3.connect(self.store.path) as db:
             events = db.execute("SELECT operation FROM credential_events").fetchall()
         self.assertEqual(events, [])
+
+    def test_judge_key_isolated_and_paid_project_attestation_required(self):
+        writer = self.store.add("Автор", FAKE_KEY_A)
+        judge = self.store.add("Проверяющий", FAKE_GOOGLE_KEY, role="judge")
+        requests = []
+
+        def google_open(request, **_kwargs):
+            requests.append(request)
+            return FakeGoogleModelsResponse()
+
+        checked = self.store.check(judge["id"], opener=google_open)
+        self.assertEqual(checked["status"], "ready")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_method(), "GET")
+        self.assertEqual(requests[0].full_url,
+                         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1")
+        self.assertEqual(dict((name.lower(), value) for name, value in requests[0].header_items())["x-goog-api-key"],
+                         FAKE_GOOGLE_KEY)
+        self.assertNotIn(FAKE_GOOGLE_KEY, requests[0].full_url)
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
+        with self.assertRaises(CredentialError):
+            self.store.reveal_for_dispatch(judge["id"], 1, role="judge")
+        with self.assertRaises(CredentialError):
+            self.store.reveal_for_dispatch(judge["id"], 1)
+        self.assertEqual(self.store.dispatch_candidates(), [])  # writer not checked yet
+        self.store.check(writer["id"], opener=lambda *_args, **_kwargs: FakeKeyResponse())
+        self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
+        with self.assertRaises(CredentialError):
+            self.store.set_judge_policy(writer["id"], paid_tier_confirmed=True,
+                                        project_scope="paid-project-1")
+        confirmed = self.store.set_judge_policy(judge["id"], paid_tier_confirmed=True,
+                                                project_scope="paid-project-1")
+        self.assertTrue(confirmed["paid_tier_confirmed"])
+        self.assertIsNotNone(confirmed["paid_tier_confirmed_at"])
+        self.assertEqual(self.store.dispatch_candidates(role="judge")[0]["id"], judge["id"])
+        self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
+        with self.assertRaises(CredentialError):
+            self.store.set_order([writer["id"]], role="judge")
+        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 1, role="judge"), FAKE_GOOGLE_KEY)
+        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), self.store.path.read_bytes())
+        self.assertNotIn(FAKE_GOOGLE_KEY, json.dumps(self.store.list()))
+        self.store.set_judge_policy(judge["id"], paid_tier_confirmed=False, project_scope=None)
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
+        self.store.set_judge_policy(judge["id"], paid_tier_confirmed=True,
+                                    project_scope="paid-project-1")
+        self.store.replace(judge["id"], FAKE_GOOGLE_KEY)
+        self.assertFalse(next(k for k in self.store.list()["keys"] if k["id"] == judge["id"])["paid_tier_confirmed"])
+
+    def test_existing_database_migrates_to_writer_without_changing_ciphertext(self):
+        legacy_path = self.root / "legacy" / "credentials.sqlite3"
+        legacy_path.parent.mkdir(mode=0o700)
+        master = Fernet.generate_key()
+        ciphertext = Fernet(master).encrypt(FAKE_KEY_A.encode())
+        with sqlite3.connect(legacy_path) as db:
+            db.execute("""CREATE TABLE credentials (
+                id TEXT PRIMARY KEY, version INTEGER NOT NULL, label TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                ciphertext BLOB NOT NULL, mask TEXT NOT NULL, enabled INTEGER NOT NULL,
+                priority INTEGER NOT NULL, status TEXT NOT NULL, checked_at TEXT,
+                workspace_id TEXT, limit_amount REAL, limit_remaining REAL,
+                limit_reset TEXT, usage_weekly REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            db.execute("""INSERT INTO credentials
+                (id,version,label,ciphertext,mask,enabled,priority,status,created_at,updated_at)
+                VALUES(?,1,'Старый',?,'••••0001',1,0,'ready','old','old')""",
+                ("a" * 32, ciphertext))
+        os.chmod(legacy_path, 0o600)
+        migrated = CredentialStore(legacy_path, master)
+        self.assertEqual(migrated.dispatch_candidates()[0]["role"], "writer")
+        self.assertEqual(migrated.reveal_for_existing_job("a" * 32, 1), FAKE_KEY_A)
+        with sqlite3.connect(legacy_path) as db:
+            self.assertEqual(db.execute("SELECT ciphertext FROM credentials").fetchone()[0], ciphertext)
+            self.assertIn("role", [row[1] for row in db.execute("PRAGMA table_info(credentials)")])
 
     def test_dispatch_guard_serializes_separate_users_of_credential_path(self):
         started = threading.Event()
@@ -195,6 +273,30 @@ class AdminHttpTests(unittest.TestCase):
         status, raw, _ = self.request("POST", "/api/summary/credentials/delete", {"id": identifier})
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(raw)["result"]["revoked_upstream"])
+
+    def test_judge_admin_role_and_attestation_protected(self):
+        body = {"role": "judge", "label": "Gemini judge", "key": FAKE_GOOGLE_KEY}
+        status, _, _ = self.request("POST", "/api/summary/credentials/add", body, auth=False)
+        self.assertEqual(status, 401)
+        status, _, _ = self.request("POST", "/api/summary/credentials/add", body, origin=False)
+        self.assertEqual(status, 403)
+        status, raw, _ = self.request("POST", "/api/summary/credentials/add", body)
+        self.assertEqual(status, 201)
+        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), raw)
+        identifier = json.loads(raw)["result"]["id"]
+        policy = {"id": identifier, "paid_tier_confirmed": True, "project_scope": "paid-project-1"}
+        status, _, _ = self.request("POST", "/api/summary/credentials/judge-policy", policy, origin=False)
+        self.assertEqual(status, 403)
+        status, raw, _ = self.request("POST", "/api/summary/credentials/judge-policy", policy)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["result"]["paid_tier_confirmed"])
+        status, raw, _ = self.request("GET", "/api/summary/credentials")
+        self.assertEqual(status, 200)
+        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), raw)
+        self.assertEqual(json.loads(raw)["keys"][0]["role"], "judge")
+        status, page, _ = self.request("GET", "/summary-settings")
+        self.assertEqual(status, 200)
+        self.assertIn("Google Gemini".encode(), page)
 
 
 if __name__ == "__main__":

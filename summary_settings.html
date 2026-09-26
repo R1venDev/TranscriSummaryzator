@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Настройки суммаризатора — OpenRouter</title>
+  <title>Настройки суммаризатора — API-ключи</title>
   <style>
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
     *{box-sizing:border-box}body{margin:0;background:#0c0e13;color:#f5f7fb}
@@ -25,16 +25,26 @@
 </head>
 <body><main>
   <nav><a href="/">← К записям</a></nav>
-  <h1>Настройки → Суммаризатор → OpenRouter</h1>
-  <p class="muted">Здесь хранятся ключи только для суммаризатора. Сначала используется основной, остальные — резерв доступности при допустимом повторе. Проверка ключа не отправляет стенограмму и не запускает платную генерацию.</p>
-  <section class="card"><h2>Добавить ключ</h2>
-    <form id="addForm" class="add" autocomplete="off">
+  <h1>Настройки → Суммаризатор → API-ключи</h1>
+  <p class="muted">Ключи автора конспекта и проверяющего разделены. В каждой группе сначала используется основной, остальные — резерв доступности при допустимом повторе. Проверка ключа не отправляет стенограмму и не запускает платную генерацию.</p>
+  <div id="message" role="status" aria-live="polite"></div>
+  <section class="card"><h2>Автор конспекта · OpenRouter / Luna</h2>
+    <form id="writerAddForm" class="add" autocomplete="off">
       <label>Название<input name="label" maxlength="80" required autocomplete="off"></label>
       <label>OpenRouter inference-ключ<input name="key" type="password" minlength="16" required autocomplete="new-password" spellcheck="false"></label>
       <button type="submit">Сохранить</button>
     </form>
-    <p class="muted">Ключ отправляется только в backend и после сохранения больше не показывается. Для проверки используется бесплатный GET /api/v1/key; готовность ключа не подтверждает права на Luna или настройки приватности.</p>
+    <p class="muted">Проверка: бесплатный OpenRouter GET /api/v1/key. Статус не подтверждает права на Luna, тариф Batch или настройки приватности.</p>
+    <div id="writerKeys">Загружаю…</div>
   </section>
-  <section class="card"><h2>Сохранённые ключи</h2><div id="message" role="status" aria-live="polite"></div><div id="keys">Загружаю…</div></section>
-  <p class="warning">Выбранный режим OpenRouter Batch хранит входы и результаты у шлюза до 30 дней; пользователь отдельно разрешил этот режим без provider ZDR. Необязательное логирование, обучение, плагины и веб-поиск остаются выключенными. Удаление здесь не отзывает ключ в кабинете OpenRouter.</p>
+  <section class="card"><h2>Проверка и исправление · Google Gemini</h2>
+    <form id="judgeAddForm" class="add" autocomplete="off">
+      <label>Название<input name="label" maxlength="80" required autocomplete="off"></label>
+      <label>Google Gemini API-ключ<input name="key" type="password" minlength="16" required autocomplete="new-password" spellcheck="false"></label>
+      <button type="submit">Сохранить</button>
+    </form>
+    <p class="muted">Проверка: бесплатный Google GET /v1beta/models. Она подтверждает ответ API, но не доступ к выбранной модели, Batch, кэшу, тариф или условия хранения. Для отправки приватной стенограммы отдельно подтвердите оплачиваемый проект этого ключа: <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener noreferrer">условия Google для free/paid tier</a>.</p>
+    <div id="judgeKeys">Загружаю…</div>
+  </section>
+  <p class="warning">Секреты хранятся только на backend и никогда не возвращаются в браузер после сохранения. OpenRouter Batch хранит входы и результаты у шлюза до 30 дней; этот режим уже разрешён пользователем. Удаление сохранённого ключа не отзывает его у провайдера.</p>
 </main><script src="/summary-settings.js" defer></script></body></html>

@@ -19,7 +19,9 @@ from summary.luna_v1.tasks import TaskStore
 
 
 class FakeStore:
-    def dispatch_candidates(self):
+    def dispatch_candidates(self, role="writer"):
+        if role == "judge":
+            return []
         return [{"id": "synthetic-key", "version": 1, "workspace_id": "synthetic-workspace"}]
 
     def reveal_for_dispatch(self, identifier, version):
@@ -101,6 +103,22 @@ def arm_poll(private):
     ledger.close()
 
 
+def pin_legacy_quality(private, job_id):
+    """Existing Luna quality attempts keep their recorded v3 route."""
+    import hashlib
+    from summary.luna_v1.audit import AUDIT_PROMPT_PATH
+    ledger = Ledger(private)
+    job = ledger.get(job_id)
+    manifest_path = Path(job["artifact_dir"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["quality_policy_version"] = "luna_auto_audit_v3"
+    manifest["audit_prompt_sha256"] = hashlib.sha256(AUDIT_PROMPT_PATH.read_bytes()).hexdigest()
+    for key in ("quality_provider", "judge_project_scope", "audit_model", "audit_privacy_mode"):
+        manifest.pop(key, None)
+    manifest_path.write_text(json.dumps(manifest))
+    ledger.close()
+
+
 def fake_poll(private, route):
     with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
          patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
@@ -173,8 +191,9 @@ class EngineTests(unittest.TestCase):
             FakeClient.report_factory = None
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
-                submit(transcript_path=source, output_dir=output,
-                       private_root=private, client_factory=FakeClient)
+                started = submit(transcript_path=source, output_dir=output,
+                                 private_root=private, client_factory=FakeClient)
+            pin_legacy_quality(private, started["job_id"])
             arm_poll(private)
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route",
@@ -220,6 +239,7 @@ class EngineTests(unittest.TestCase):
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
+            pin_legacy_quality(private, started["job_id"])
             for expected in ("draft_ready", "stage_complete"):
                 arm_poll(private)
                 events = fake_poll(private, route)
@@ -298,6 +318,7 @@ class EngineTests(unittest.TestCase):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
             self.assertEqual(started["status"], "submitted")
+            pin_legacy_quality(private, started["job_id"])
             for expected in ("draft_ready", "stage_complete", "stage_complete"):
                 arm_poll(private)
                 events = fake_poll(private, route)
@@ -355,6 +376,7 @@ class EngineTests(unittest.TestCase):
                 ledger = Ledger(private)
                 self.assertEqual(len(ledger.consumers(shared["semantic_key"])), 2)
                 ledger.close()
+                pin_legacy_quality(private, started["job_id"])
                 arm_poll(private)
                 first = fake_poll(private, route)
                 self.assertIn("draft_ready", {item["status"] for item in first})
@@ -428,6 +450,7 @@ class EngineTests(unittest.TestCase):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
             self.assertEqual(started["status"], "submitted")
+            pin_legacy_quality(private, started["job_id"])
             arm_poll(private)
             self.assertIn("draft_ready", {item["status"] for item in fake_poll(private, route)})
             arm_poll(private)
@@ -480,6 +503,7 @@ class EngineTests(unittest.TestCase):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
             self.assertEqual(started["status"], "submitted")
+            pin_legacy_quality(private, started["job_id"])
             raw = FakeClient("synthetic-secret-never-sent").get("batch-synthetic001")
             document = json.loads(raw.body["results"][0]["response"]["body"]["choices"][0]["message"]["content"])
             _, source_index, source_sha = load_source(source)

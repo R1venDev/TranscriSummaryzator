@@ -22,6 +22,14 @@ from .audit import (AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID,
                     apply_audit, build_audit_input, coverage_warnings,
                     validate_audit)
 from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_completed, valid_batch_id
+from summary.gemini_v1 import GEMINI_AUDIT_PROMPT_PATH, build_gemini_audit_input
+from summary.gemini_v1.batch import BatchClient as GeminiBatchClient
+from summary.gemini_v1.batch import BatchError as GeminiBatchError
+from summary.gemini_v1.batch import extract_one_completed as extract_one_gemini_completed
+from summary.gemini_v1.batch import normalize_batch_status as normalize_gemini_batch_status
+from summary.gemini_v1.route import (RouteBlocked as GeminiRouteBlocked,
+                                     estimate_usage_cost_microusd,
+                                     verify_batch_route as verify_gemini_batch_route)
 from .ledger import Ledger, usd_micros, write_private_json
 from .publication import publish_document
 from .route import MAX_COMPLETION_TOKENS, RouteBlocked, verify_batch_route
@@ -30,7 +38,11 @@ from .tasks import RevisionConflict, TaskStore
 
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
 REASONING_EFFORT = "medium"
-QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
+LEGACY_QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
+QUALITY_POLICY_VERSION = "gemini_judge_repair_v1"
+QUALITY_PROVIDER = "google_gemini"
+GEMINI_MODEL = "gemini-3.7-flash"
+GEMINI_PRIVACY_MODE = "google_paid_batch_retention_up_to_6w_store_false_user_authorized"
 QUALITY_CREDENTIAL_WAIT_SECONDS = 30 * 60
 QUALITY_BATCH_WAIT_SECONDS = 26 * 60 * 60
 
@@ -41,6 +53,24 @@ def _json_bytes(value) -> bytes:
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _quality_route(manifest: dict) -> str:
+    """A submitted writer keeps the quality backend pinned in its manifest."""
+    policy = manifest.get("quality_policy_version")
+    if policy == LEGACY_QUALITY_POLICY_VERSION and not manifest.get("quality_provider"):
+        return "luna"
+    if policy == QUALITY_POLICY_VERSION and manifest.get("quality_provider") == QUALITY_PROVIDER:
+        return "gemini"
+    raise ValueError("unknown_quality_policy")
+
+
+def _quality_prompt_path(provider: str) -> Path:
+    if provider == "luna":
+        return AUDIT_PROMPT_PATH
+    if provider == "gemini":
+        return GEMINI_AUDIT_PROMPT_PATH
+    raise ValueError("unknown_quality_provider")
 
 
 def _request_body(source_text: str) -> dict:
@@ -59,11 +89,13 @@ def _request_body(source_text: str) -> dict:
 
 
 def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: str,
-                       prompt_sha256: str, schema_sha256: str, force_nonce: str | None) -> str:
+                       prompt_sha256: str, schema_sha256: str, force_nonce: str | None,
+                       judge_scope: str = "judge-unavailable") -> str:
     material = {
         "source_sha256": source_sha256,
         "projected_source_sha256": _sha(source_text.encode("utf-8")),
         "workspace_scope": workspace_scope,
+        "judge_scope": judge_scope,
         "prompt_sha256": prompt_sha256,
         "schema_sha256": schema_sha256,
         "model": MODEL,
@@ -71,7 +103,10 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
         "reasoning_effort": REASONING_EFFORT,
         "max_completion_tokens": MAX_COMPLETION_TOKENS,
         "quality_policy_version": QUALITY_POLICY_VERSION,
-        "audit_prompt_sha256": _sha(AUDIT_PROMPT_PATH.read_bytes()),
+        "quality_provider": QUALITY_PROVIDER,
+        "audit_model": GEMINI_MODEL,
+        "audit_privacy_mode": GEMINI_PRIVACY_MODE,
+        "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
         "audit_schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
         "force_nonce": force_nonce,
     }
@@ -141,12 +176,15 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
         guard_context = credential_dispatch_guard(getattr(store, "path", Path(private_root) / "credentials.sqlite3"))
         guard_context.__enter__()
         guard = guard_context
-        candidates = store.dispatch_candidates()
+        candidates = store.dispatch_candidates(role="writer")
         if not candidates:
             return {"status": "credential_required", "source_sha256": source_sha}
         selected = candidates[0]  # ordered primary; no automatic account hopping
         scope = selected.get("workspace_id") or ("unverified-key-version:" + selected["id"] + ":" + str(selected["version"]))
-        semantic_key = _semantic_identity(source_sha, source_text, scope, prompt_sha, schema_sha, force_nonce)
+        judge_candidates = store.dispatch_candidates(role="judge")
+        judge_scope = (judge_candidates[0].get("project_scope") or "judge-unavailable") if judge_candidates else "judge-unavailable"
+        semantic_key = _semantic_identity(source_sha, source_text, scope, prompt_sha,
+                                          schema_sha, force_nonce, judge_scope)
         prior = ledger.attach_consumer(semantic_key, source_sha, output_dir)
         if prior:
             if prior["status"] == "accepted":
@@ -178,7 +216,11 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "provider": "openai", "privacy_mode": PRIVACY_MODE,
             "prompt_sha256": prompt_sha, "schema_sha256": schema_sha,
             "quality_policy_version": QUALITY_POLICY_VERSION,
-            "audit_prompt_sha256": _sha(AUDIT_PROMPT_PATH.read_bytes()),
+            "quality_provider": QUALITY_PROVIDER,
+            "judge_project_scope": judge_scope,
+            "audit_model": GEMINI_MODEL,
+            "audit_privacy_mode": GEMINI_PRIVACY_MODE,
+            "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
             "audit_schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
             "request_sha256": _sha(serialized_request),
             "reserve_microusd": reserve_micros,
@@ -281,26 +323,49 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     artifacts = Path(job["artifact_dir"])
     batch = json.loads((artifacts / "batch_terminal.json").read_text(encoding="utf-8"))
     submission = json.loads((artifacts / "submit_response.json").read_text(encoding="utf-8"))
-    if submission.get("id") != job["remote_id"] or batch.get("model") != submission.get("model"):
-        raise ValueError("batch_submission_identity_mismatch")
     request_manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
-    body, usage = extract_one_completed(batch, job["custom_id"])
-    resolved_model = submission.get("model")
-    allowed_models = {MODEL, "openai/gpt-6-luna"}
-    if isinstance(resolved_model, str) and resolved_model.startswith("openai/gpt-6-luna-"):
-        allowed_models.add(resolved_model)
-    if body.get("model") not in allowed_models:
-        raise ValueError("response_model_mismatch")
-    choices = body.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise ValueError("response_choices_invalid")
-    choice = choices[0]
-    if choice.get("finish_reason") != "stop":
-        raise ValueError("response_not_terminal_stop")
-    message = choice.get("message") or {}
-    if message.get("refusal") or not isinstance(message.get("content"), str):
-        raise ValueError("response_refusal_or_content_invalid")
-    raw_text = message["content"]
+    if request_manifest.get("provider") == QUALITY_PROVIDER:
+        if (submission.get("name") != job["remote_id"]
+                or batch.get("name") != job["remote_id"]):
+            raise ValueError("gemini_batch_submission_identity_mismatch")
+        body, usage = extract_one_gemini_completed(batch, job["custom_id"])
+        version = body.get("modelVersion")
+        if not isinstance(version, str) or not version.startswith(GEMINI_MODEL):
+            raise ValueError("gemini_response_model_mismatch")
+        candidates = body.get("candidates")
+        if (not isinstance(candidates, list) or len(candidates) != 1
+                or not isinstance(candidates[0], dict)):
+            raise ValueError("gemini_response_candidates_invalid")
+        candidate = candidates[0]
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("gemini_response_not_terminal_stop")
+        content = candidate.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if (not isinstance(parts, list) or not parts
+                or any(not isinstance(part, dict) or not isinstance(part.get("text"), str)
+                       or part.get("thought") for part in parts)):
+            raise ValueError("gemini_response_text_invalid")
+        raw_text = "".join(part["text"] for part in parts)
+    else:
+        if submission.get("id") != job["remote_id"] or batch.get("model") != submission.get("model"):
+            raise ValueError("batch_submission_identity_mismatch")
+        body, usage = extract_one_completed(batch, job["custom_id"])
+        resolved_model = submission.get("model")
+        allowed_models = {MODEL, "openai/gpt-6-luna"}
+        if isinstance(resolved_model, str) and resolved_model.startswith("openai/gpt-6-luna-"):
+            allowed_models.add(resolved_model)
+        if body.get("model") not in allowed_models:
+            raise ValueError("response_model_mismatch")
+        choices = body.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ValueError("response_choices_invalid")
+        choice = choices[0]
+        if choice.get("finish_reason") != "stop":
+            raise ValueError("response_not_terminal_stop")
+        message = choice.get("message") or {}
+        if message.get("refusal") or not isinstance(message.get("content"), str):
+            raise ValueError("response_refusal_or_content_invalid")
+        raw_text = message["content"]
     write_private_json(artifacts / "native_response.json", {"text": raw_text, "usage": usage})
     document = json.loads(raw_text)
     transcript_path = Path(job["output_dir"]) / "transcript.json"
@@ -326,8 +391,8 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
             return {"status": "accepted_legacy", "job_id": job["id"],
                     "generation_id": generation_id, "generation_path": str(generation_path),
                     "consumer_results": _publish_accepted_consumers(ledger, ledger.get(job["id"]))}
-        if (request_manifest.get("quality_policy_version") != QUALITY_POLICY_VERSION
-                or request_manifest.get("audit_prompt_sha256") != _sha(AUDIT_PROMPT_PATH.read_bytes())
+        provider = _quality_route(request_manifest)
+        if (request_manifest.get("audit_prompt_sha256") != _sha(_quality_prompt_path(provider).read_bytes())
                 or request_manifest.get("audit_schema_sha256") != _sha(_json_bytes(AUDIT_SCHEMA))):
             raise ValueError("code_or_prompt_changed_while_pending")
         if not isinstance(document, dict):
@@ -345,7 +410,8 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
                 "reserved_usd": job["reserved_microusd"] / 1_000_000}
     if job["kind"] not in {"audit", "verify"}:
         raise ValueError("unknown_quality_stage")
-    if (_sha(AUDIT_PROMPT_PATH.read_bytes()) != request_manifest["prompt_sha256"]
+    provider = "gemini" if request_manifest.get("provider") == QUALITY_PROVIDER else "luna"
+    if (_sha(_quality_prompt_path(provider).read_bytes()) != request_manifest["prompt_sha256"]
             or _sha(_json_bytes(AUDIT_SCHEMA)) != request_manifest["schema_sha256"]):
         raise ValueError("audit_code_or_prompt_changed_while_pending")
     root = ledger.get(job["root_job_id"])
@@ -368,9 +434,27 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
 
 
 def _quality_request_body(source_text: str, target: dict, *, kind: str,
-                          prior_findings: list[dict]) -> dict:
+                          prior_findings: list[dict], provider: str) -> dict:
     if kind not in {"audit", "verify"}:
         raise ValueError("invalid quality request kind")
+    if provider == "gemini":
+        # Direct Google GenerateContentRequest inside one inline Batch item.
+        # The source comes first in the stable user content, before the
+        # changing draft and final host-authored task. No tools or grounding.
+        return {
+            "systemInstruction": {"parts": [{"text": GEMINI_AUDIT_PROMPT_PATH.read_text(encoding="utf-8")}]},
+            "contents": [{"role": "user", "parts": [{"text": build_gemini_audit_input(
+                source_text, target, mode=kind, prior_findings=prior_findings)}]}],
+            "generationConfig": {
+                "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": AUDIT_SCHEMA}},
+                "maxOutputTokens": 16_000 if kind == "audit" else 8_000,
+                "thinkingConfig": {"thinkingLevel": "MEDIUM", "includeThoughts": False},
+                "candidateCount": 1,
+            },
+            "store": False,
+        }
+    if provider != "luna":
+        raise ValueError("unknown_quality_provider")
     return {
         "messages": [
             {"role": "system", "content": AUDIT_PROMPT_PATH.read_text(encoding="utf-8")},
@@ -385,28 +469,37 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
     }
 
 
-def _quality_stage_key(root: dict, kind: str, request_body: dict) -> str:
+def _quality_stage_key(root: dict, kind: str, request_body: dict, provider: str) -> str:
+    prompt_path = _quality_prompt_path(provider)
     return _sha(_json_bytes({
         "root_semantic_key": root["semantic_key"], "kind": kind,
         "request_sha256": _sha(_json_bytes(request_body)),
-        "prompt_sha256": _sha(AUDIT_PROMPT_PATH.read_bytes()),
+        "prompt_sha256": _sha(prompt_path.read_bytes()),
         "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
-        "quality_policy_version": QUALITY_POLICY_VERSION,
+        "quality_policy_version": (QUALITY_POLICY_VERSION if provider == "gemini"
+                                   else LEGACY_QUALITY_POLICY_VERSION),
+        "provider": provider,
     }))
 
 
 def _start_quality_stage(ledger: Ledger, root: dict, kind: str, target: dict,
-                         prior_findings: list[dict], client_factory) -> dict:
+                         prior_findings: list[dict], client_factory,
+                         gemini_client_factory=GeminiBatchClient) -> dict:
     """Reserve, record and submit one dependent call, never duplicating a POST."""
+    root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+    provider = _quality_route(root_manifest)
+    if provider == "gemini":
+        return _start_gemini_stage(ledger, root, kind, target, prior_findings,
+                                   gemini_client_factory)
     transcript_path = Path(root["output_dir"]) / "transcript.json"
     source_text, _, source_sha = load_source(transcript_path)
     if source_sha != root["source_sha256"]:
         raise ValueError("source_revision_changed_before_audit")
     request_body = _quality_request_body(source_text, target, kind=kind,
-                                         prior_findings=prior_findings)
+                                         prior_findings=prior_findings, provider="luna")
     request_bytes = _json_bytes(request_body)
     target_sha = _sha(_json_bytes(target))
-    semantic_key = _quality_stage_key(root, kind, request_body)
+    semantic_key = _quality_stage_key(root, kind, request_body, "luna")
     existing = ledger.stage(root["id"], kind)
     if existing is not None and existing["semantic_key"] != semantic_key:
         raise ValueError("quality_stage_identity_changed")
@@ -511,6 +604,142 @@ def _start_quality_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             guard.__exit__(None, None, None)
 
 
+def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
+                        prior_findings: list[dict], client_factory) -> dict:
+    """Use a separate paid Google judge key for audit and bounded repair.
+
+    A Batch POST is never repeated after an unknown outcome. The writer's
+    OpenRouter credential, scope and request remain separate from this stage.
+    """
+    from summary.gemini_v1.batch import BatchError as GeminiBatchError, batch_id_from_submit
+
+    root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+    pinned_scope = root_manifest.get("judge_project_scope")
+    if not isinstance(pinned_scope, str) or pinned_scope == "judge-unavailable":
+        return {"status": "unavailable", "reason": "judge_credential_required_at_writer_dispatch"}
+    transcript_path = Path(root["output_dir"]) / "transcript.json"
+    source_text, _, source_sha = load_source(transcript_path)
+    if source_sha != root["source_sha256"]:
+        raise ValueError("source_revision_changed_before_audit")
+    request_body = _quality_request_body(source_text, target, kind=kind,
+                                         prior_findings=prior_findings, provider="gemini")
+    request_bytes = _json_bytes(request_body)
+    target_sha = _sha(_json_bytes(target))
+    semantic_key = _quality_stage_key(root, kind, request_body, "gemini")
+    existing = ledger.stage(root["id"], kind)
+    if existing is not None and existing["semantic_key"] != semantic_key:
+        raise ValueError("quality_stage_identity_changed")
+    guard = None
+    stage = existing
+
+    def cancel_reserved(code: str) -> None:
+        current = ledger.get(stage["id"]) if stage is not None else None
+        if current is not None and current["status"] == "reserved":
+            ledger.cancel_before_submit(current["id"], code)
+
+    try:
+        store = _credential_store(ledger.root)
+        guard_context = credential_dispatch_guard(getattr(store, "path", ledger.root / "credentials.sqlite3"))
+        guard_context.__enter__()
+        guard = guard_context
+        if existing is None:
+            candidates = store.dispatch_candidates(role="judge")
+            selected = next((candidate for candidate in candidates
+                             if candidate.get("project_scope") == pinned_scope), None)
+            if selected is None:
+                return {"status": "unavailable", "reason": "judge_credential_required"}
+        else:
+            public = store.list()
+            selected = next((key for key in public["keys"] if key["id"] == existing["credential_id"]
+                             and key["version"] == existing["credential_version"]), None)
+            if selected is None:
+                cancel_reserved("judge_credential_changed")
+                return {"status": "unavailable", "reason": "judge_credential_changed"}
+        if (selected.get("project_scope") != pinned_scope
+                or not selected.get("paid_tier_confirmed")):
+            cancel_reserved("judge_policy_or_scope_changed")
+            return {"status": "unavailable", "reason": "judge_policy_or_scope_changed"}
+        token = store.reveal_for_dispatch(selected["id"], selected["version"], role="judge")
+        client = client_factory(token)
+        output_cap = request_body["generationConfig"]["maxOutputTokens"]
+        route = verify_gemini_batch_route(client, request_body, max_output_tokens=output_cap)
+        reserve = route.reserve_microusd()
+        decision = ledger.reserve(
+            semantic_key=semantic_key, source_sha256=source_sha,
+            output_dir=Path(root["output_dir"]), credential_id=selected["id"],
+            credential_version=selected["version"], workspace_id=pinned_scope,
+            max_cost_microusd=reserve, kind=kind, root_job_id=root["id"],
+        )
+        if decision.kind == "blocked":
+            return {"status": "unavailable", "reason": decision.reason}
+        stage = ledger.get(decision.job_id)
+        artifacts = Path(stage["artifact_dir"])
+        manifest = {
+            "job_id": stage["id"], "root_job_id": root["id"], "stage": kind,
+            "semantic_key": semantic_key, "source_sha256": source_sha,
+            "target_document_sha256": target_sha,
+            "request_sha256": _sha(request_bytes),
+            "prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
+            "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
+            "credential_id": stage["credential_id"],
+            "credential_version": stage["credential_version"],
+            "project_scope": pinned_scope, "model": GEMINI_MODEL,
+            "provider": QUALITY_PROVIDER, "quality_policy_version": QUALITY_POLICY_VERSION,
+            "privacy_mode": GEMINI_PRIVACY_MODE,
+            "cache_policy": "implicit_only_no_guaranteed_hit",
+            "reserve_microusd": stage["reserved_microusd"],
+            "counted_input_tokens": route.input_tokens,
+            "max_output_tokens": output_cap,
+        }
+        manifest_path = artifacts / "manifest.json"
+        if manifest_path.exists():
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if saved != manifest:
+                raise ValueError("saved_quality_manifest_changed")
+        else:
+            write_private_json(manifest_path, manifest)
+            write_private_json(artifacts / "request.json", request_body)
+        if stage["status"] != "reserved":
+            return {"status": stage["status"], "job_id": stage["id"]}
+        try:
+            token = store.reveal_for_dispatch(stage["credential_id"], stage["credential_version"], role="judge")
+        except CredentialError:
+            ledger.cancel_before_submit(stage["id"], "judge_credential_changed_before_post")
+            return {"status": "unavailable", "reason": "judge_credential_changed_before_post", "job_id": stage["id"]}
+        if not ledger.mark_submitting(stage["id"]):
+            return {"status": "submitting", "job_id": stage["id"]}
+        client = client_factory(token)
+        try:
+            reply = client.submit(stage["custom_id"], request_body)
+            write_private_json(artifacts / "submit_response.json", reply.body)
+            try:
+                remote_id = batch_id_from_submit(reply.body)
+            except ValueError:
+                remote_id = None
+            if not 200 <= reply.status_code < 300 or remote_id is None:
+                ledger.submission_result(stage["id"], remote_id=None,
+                                         error_code="unexpected_submit_response")
+                return {"status": "submission_unknown", "job_id": stage["id"]}
+            ledger.submission_result(stage["id"], remote_id=remote_id)
+            return {"status": "submitted", "job_id": stage["id"], "remote_id": remote_id}
+        except GeminiBatchError as exc:
+            definite = exc.code in {400, 401, 402, 403, 404, 422, 429}
+            ledger.submission_result(stage["id"], remote_id=None, error_code=exc.reason,
+                                     definite_rejection=definite)
+            write_private_json(artifacts / "submit_error.json", {
+                "code": exc.code, "reason": exc.reason, "retry_after": exc.retry_after,
+                "definite_rejection": definite,
+            })
+            return {"status": "rejected_before_submit" if definite else "submission_unknown",
+                    "job_id": stage["id"], "reason": exc.reason}
+    except (CredentialError, GeminiRouteBlocked, GeminiBatchError) as exc:
+        cancel_reserved("stage_preflight_unavailable")
+        return {"status": "unavailable", "reason": str(exc)[:120]}
+    finally:
+        if guard is not None:
+            guard.__exit__(None, None, None)
+
+
 def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: dict,
                       *, status: str, unresolved_count: int = 0,
                       reason: str | None = None) -> dict:
@@ -561,7 +790,8 @@ def _stage_timeout_reason(stage: dict) -> str | None:
     return None
 
 
-def _advance_quality(ledger: Ledger, root: dict, client_factory) -> dict:
+def _advance_quality(ledger: Ledger, root: dict, client_factory,
+                     gemini_client_factory=GeminiBatchClient) -> dict:
     """Advance one saved workflow; semantic uncertainty is published visibly."""
     artifacts = Path(root["artifact_dir"])
     transcript_path = Path(root["output_dir"]) / "transcript.json"
@@ -571,7 +801,8 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory) -> dict:
     draft = json.loads((artifacts / "draft_document.json").read_text(encoding="utf-8"))
     audit = ledger.stage(root["id"], "audit")
     if audit is None or audit["status"] == "reserved":
-        started = _start_quality_stage(ledger, root, "audit", draft, [], client_factory)
+        started = _start_quality_stage(ledger, root, "audit", draft, [], client_factory,
+                                       gemini_client_factory)
         if started["status"] == "unavailable":
             return _finalize_quality(ledger, root, draft, source_index,
                 status="audit_unavailable", reason=started.get("reason"))
@@ -602,7 +833,8 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory) -> dict:
     verify = ledger.stage(root["id"], "verify")
     if verify is None or verify["status"] == "reserved":
         started = _start_quality_stage(ledger, root, "verify", revised,
-                                       report["findings"], client_factory)
+                                       report["findings"], client_factory,
+                                       gemini_client_factory)
         if started["status"] == "unavailable":
             return _finalize_quality(ledger, root, revised, source_index,
                 status="verify_unavailable", unresolved_count=len(unresolved),
@@ -672,7 +904,8 @@ def _publish_accepted_consumers(ledger: Ledger, job: dict) -> list[dict]:
     return results
 
 
-def poll_once(*, private_root: Path, client_factory=BatchClient) -> list[dict]:
+def poll_once(*, private_root: Path, client_factory=BatchClient,
+              gemini_client_factory=GeminiBatchClient) -> list[dict]:
     """One bounded scheduler tick; never sleeps or submits a second POST."""
     ledger = Ledger(private_root)
     outcomes = []
@@ -692,6 +925,8 @@ def poll_once(*, private_root: Path, client_factory=BatchClient) -> list[dict]:
                              "consumer_results": _publish_accepted_consumers(ledger, job)})
         for job in ledger.pending_remote()[:4]:
             artifacts = Path(job["artifact_dir"])
+            manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
+            is_gemini = manifest.get("provider") == QUALITY_PROVIDER
             try:
                 store = _credential_store(private_root)
                 token = store.reveal_for_existing_job(job["credential_id"], job["credential_version"])
@@ -701,10 +936,10 @@ def poll_once(*, private_root: Path, client_factory=BatchClient) -> list[dict]:
                                                "remote_id": job["remote_id"]})
                 outcomes.append({"status": "credential_required", "job_id": job["id"], "remote_id": job["remote_id"]})
                 continue
-            client = client_factory(token)
+            client = (gemini_client_factory if is_gemini else client_factory)(token)
             try:
                 reply = client.get(job["remote_id"])
-            except BatchError as exc:
+            except (BatchError, GeminiBatchError) as exc:
                 delay = _poll_backoff(exc.retry_after)
                 ledger.defer_poll(job["id"], delay_seconds=delay, error_code=exc.reason)
                 _append_poll_event(artifacts, {"operation": "GET", "status": "error", "remote_id": job["remote_id"],
@@ -713,26 +948,53 @@ def poll_once(*, private_root: Path, client_factory=BatchClient) -> list[dict]:
                 outcomes.append({"status": "poll_error", "job_id": job["id"], "reason": exc.reason})
                 continue
             batch = reply.body
-            if batch.get("id") != job["remote_id"]:
+            if batch.get("name" if is_gemini else "id") != job["remote_id"]:
                 ledger.defer_poll(job["id"], delay_seconds=600, error_code="remote_identity_mismatch")
                 _append_poll_event(artifacts, {"operation": "GET", "status": "remote_identity_mismatch",
                                                "remote_id": job["remote_id"]})
                 outcomes.append({"status": "remote_identity_mismatch", "job_id": job["id"]})
                 continue
-            remote_status = batch.get("status")
+            remote_status = (normalize_gemini_batch_status(batch) if is_gemini
+                             else batch.get("status"))
+            if remote_status not in {"pending", "running", "validating", "in_progress",
+                                     "finalizing", "cancelling", *TERMINAL}:
+                ledger.defer_poll(job["id"], delay_seconds=600, error_code="unknown_remote_status")
+                _append_poll_event(artifacts, {"operation": "GET", "status": "unknown_remote_status",
+                                               "remote_id": job["remote_id"]})
+                outcomes.append({"status": "unknown_remote_status", "job_id": job["id"]})
+                continue
+            batch_stats = ((batch.get("metadata") or {}).get("batchStats")
+                           if is_gemini and isinstance(batch.get("metadata"), dict) else
+                           batch.get("request_counts"))
             _append_poll_event(artifacts, {"operation": "GET", "status": remote_status,
                                            "remote_id": job["remote_id"],
-                                           "request_counts": batch.get("request_counts"), "usage": batch.get("usage")})
+                                           "request_counts": batch_stats,
+                                           "usage": None if is_gemini else batch.get("usage")})
             if remote_status in TERMINAL:
                 write_private_json(artifacts / "batch_terminal.json", batch)
             else:
                 write_private_json(artifacts / "batch_progress.json", {
-                    "id": batch.get("id"), "status": remote_status,
-                    "request_counts": batch.get("request_counts"), "usage": batch.get("usage"),
+                    "id": batch.get("name" if is_gemini else "id"), "status": remote_status,
+                    "request_counts": batch_stats,
+                    "usage": None if is_gemini else batch.get("usage"),
                 })
             usage = batch.get("usage") or {}
-            ledger.poll_result(job["id"], remote_status, usage_cost_microusd=_cost_micros(usage),
-                               error_code=None if remote_status == "completed" else str(batch.get("error") or "")[:120] or None)
+            usage_cost = _cost_micros(usage)
+            if is_gemini:
+                usage = {}
+                if remote_status == "completed":
+                    try:
+                        _, usage = extract_one_gemini_completed(batch, job["custom_id"])
+                    except ValueError:
+                        # Keep the full reservation when per-item usage is not
+                        # trustworthy; the raw terminal operation is retained.
+                        pass
+                usage_cost = estimate_usage_cost_microusd(usage)
+            ledger_status = "in_progress" if is_gemini and remote_status in {"pending", "running"} else remote_status
+            ledger.poll_result(job["id"], ledger_status, usage_cost_microusd=usage_cost,
+                               error_code=(None if remote_status == "completed" else
+                                           "google_batch_" + remote_status if is_gemini else
+                                           str(batch.get("error") or "")[:120] or None))
             if remote_status == "completed":
                 try:
                     accepted = _finish_raw(ledger, ledger.get(job["id"]))
@@ -752,13 +1014,14 @@ def poll_once(*, private_root: Path, client_factory=BatchClient) -> list[dict]:
                     write_private_json(artifacts / "batch_delete.json", deletion.body)
                     _append_poll_event(artifacts, {"operation": "DELETE", "status": "completed",
                                                    "remote_id": job["remote_id"], "code": deletion.status_code})
-                except BatchError as exc:
+                except (BatchError, GeminiBatchError) as exc:
                     write_private_json(artifacts / "batch_delete_error.json", {"code": exc.code, "reason": exc.reason})
                     _append_poll_event(artifacts, {"operation": "DELETE", "status": "error",
                                                    "remote_id": job["remote_id"], "code": exc.code, "reason": exc.reason})
         for root in ledger.quality_pending():
             try:
-                outcomes.append(_advance_quality(ledger, root, client_factory))
+                outcomes.append(_advance_quality(ledger, root, client_factory,
+                                                 gemini_client_factory))
             except (OSError, RevisionConflict) as exc:
                 ledger.defer_quality(root["id"], delay_seconds=180,
                                      error_code=type(exc).__name__ + ":" + str(exc)[:100])

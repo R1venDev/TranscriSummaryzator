@@ -105,7 +105,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "9e91b259703fa4007002ffe53eca8cd4abb79351a2d672aed9598153cf5bfbed"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "907846c52a2aadb2a56e09efe15117bbca4f28b1259d455a135546262de86d87"
 
 
 def _stage_pipeline_sha256(source):
@@ -2749,6 +2749,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif action == "enabled":
                 with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
                     result = self.summary_credential_rpc("enabled", body)
+                status = 200
+            elif action == "judge-policy":
+                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                    result = self.summary_credential_rpc("judge_policy", body)
                 status = 200
             elif action == "delete":
                 with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
