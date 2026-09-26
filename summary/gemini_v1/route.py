@@ -1,140 +1,201 @@
-"""Read-only model/token preflight and conservative Gemini Batch accounting.
+"""Read-only OpenRouter Batch route and conservative budget preflight.
 
-Prices are Google's published paid Batch tariff for gemini-3.7-flash through
-2026-12-31: https://ai.google.dev/gemini-api/docs/pricing .  The reservation
-does not assume a cache hit.  Explicit cache is disabled in batch.py because
-its token-hour storage charge may exceed savings for dependent Batch calls.
+Live key-filtered catalog, exact model and Google Vertex endpoint are checked
+before private text is submitted. OpenRouter offers no free countTokens for the
+Chat route; input capacity/cost use a conservative UTF-8 byte upper bound.
+Actual batch `usage.cost` is authoritative when reported.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any
 
-from .batch import MODEL, MODEL_RESOURCE, BatchClient, canonical_request
+from .batch import MODEL, PROVIDER, BatchClient, canonical_request
+from ..luna_v1.ledger import JOB_CAP_MICROUSD
 
-
-INPUT_USD_PER_MILLION = Decimal("0.375")
-OUTPUT_USD_PER_MILLION = Decimal("1.875")  # Includes thinking tokens.
-PRICE_VALID_THROUGH = date(2026, 12, 31)
 RESERVE_SAFETY = Decimal("1.2")
+_CACHE_WRITE_FLOOR = Decimal("0.00000004167")  # Public :batch page, 2026-09-26.
 
 
 class RouteBlocked(RuntimeError):
-    """Safe reason code for a preflight failure, without source text."""
+    """Stable safe reason code; no request text in the error."""
 
 
-def _nonnegative_int(value: object) -> int | None:
-    if type(value) is int and value >= 0:
-        return value
-    if isinstance(value, str) and value.isascii() and value.isdecimal():
-        return int(value)
-    return None
+def _decimal(value: object, field: str) -> Decimal:
+    try:
+        number = Decimal(str(value))
+    except (TypeError, InvalidOperation):
+        raise RouteBlocked(f"missing_or_invalid_{field}") from None
+    if not number.is_finite() or number < 0:
+        raise RouteBlocked(f"missing_or_invalid_{field}")
+    return number
 
 
-def _microusd(cost: Decimal) -> int:
-    return int((cost * Decimal(1_000_000)).to_integral_value(rounding=ROUND_UP))
+def _positive_int(value: object) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 and type(value) is not bool else None
+
+
+def _microusd(cost_usd: Decimal) -> int:
+    return int((cost_usd * 1_000_000).to_integral_value(rounding=ROUND_UP))
 
 
 def estimate_usage_cost_microusd(usage: dict[str, Any] | None) -> int | None:
-    """Conservative token-priced charge estimate, or unknown.
+    """Use OpenRouter's billed Batch cost; unknown charge is never zeroed."""
+    if not isinstance(usage, dict) or "cost" not in usage:
+        return None
+    try:
+        return _microusd(_decimal(usage["cost"], "batch_cost"))
+    except RouteBlocked:
+        return None
 
-    Google returns no invoice amount in GenerateContentResponse.  We count
-    *all* prompt tokens at ordinary Batch input price, even if a cache hit is
-    reported.  This deliberately overstates rather than silently deducting an
-    unverified cache discount.  Unknown usage remains an unknown charge.
-    """
-    if not isinstance(usage, dict):
-        return None
-    prompt = _nonnegative_int(usage.get("promptTokenCount"))
-    total = _nonnegative_int(usage.get("totalTokenCount"))
-    candidates = _nonnegative_int(usage.get("candidatesTokenCount", 0))
-    thoughts = _nonnegative_int(usage.get("thoughtsTokenCount", 0))
-    cached = _nonnegative_int(usage.get("cachedContentTokenCount", 0))
-    if prompt is None or prompt < 1 or candidates is None or thoughts is None or cached is None or cached > prompt:
-        return None
-    if total is None and "candidatesTokenCount" not in usage:
-        return None
-    if total is not None and total < prompt:
-        return None
-    # totalTokenCount can include otherwise unnamed billable output tokens.
-    output = max(candidates + thoughts, (total - prompt) if total is not None else 0)
-    cost = (Decimal(prompt) * INPUT_USD_PER_MILLION
-            + Decimal(output) * OUTPUT_USD_PER_MILLION) / Decimal(1_000_000)
-    return _microusd(cost)
+
+def _tiers(pricing: dict[str, Any]) -> list[dict[str, Any]]:
+    overrides = pricing.get("overrides", [])
+    if not isinstance(overrides, list) or any(not isinstance(t, dict) for t in overrides):
+        raise RouteBlocked("pricing_overrides_unavailable")
+    return [pricing, *overrides]
+
+
+def _highest(tiers: list[dict[str, Any]], field: str, *aliases: str,
+             optional: bool = False) -> Decimal:
+    values = []
+    for tier in tiers:
+        present = next((name for name in (field, *aliases) if name in tier), None)
+        if present is None:
+            if optional:
+                values.append(Decimal(0))
+                continue
+            raise RouteBlocked(f"missing_or_invalid_{field}_price")
+        values.append(_decimal(tier[present], f"{field}_price"))
+    return max(values)
 
 
 @dataclass(frozen=True)
 class Route:
     model: str
-    model_version: str | None
     provider: str
+    workspace_id: str
     max_input_tokens: int
     max_output_tokens: int
-    counted_input_tokens: int
+    counted_input_tokens: int  # Conservative bound, not tokenizer measurement.
     requested_max_output_tokens: int
+    prompt_usd_per_token: Decimal
+    completion_usd_per_token: Decimal
+    cache_write_usd_per_token: Decimal
+    request_usd: Decimal
+    key_limit_remaining_usd: Decimal | None
 
     @property
     def input_tokens(self) -> int:
         return self.counted_input_tokens
 
     def reserve_microusd(self) -> int:
-        """Hold max-output cost plus 20% of the whole estimate before POST."""
-        cost = (Decimal(self.counted_input_tokens) * INPUT_USD_PER_MILLION
-                + Decimal(self.requested_max_output_tokens) * OUTPUT_USD_PER_MILLION)
-        return _microusd(cost * RESERVE_SAFETY / Decimal(1_000_000))
+        # No cache discount is assumed. Add a possible cache-write surcharge
+        # rather than substituting a cheaper tier for ordinary prompt input.
+        cost = (Decimal(self.counted_input_tokens) *
+                (self.prompt_usd_per_token + self.cache_write_usd_per_token)
+                + Decimal(self.requested_max_output_tokens) * self.completion_usd_per_token
+                + self.request_usd)
+        reserve = _microusd(cost * RESERVE_SAFETY)
+        if reserve < 1 or reserve > JOB_CAP_MICROUSD:
+            raise RouteBlocked("job_budget_exceeded")
+        if self.key_limit_remaining_usd is not None and cost * RESERVE_SAFETY > self.key_limit_remaining_usd:
+            raise RouteBlocked("key_budget_insufficient")
+        return reserve
 
     def actual_cost_microusd(self, usage: dict[str, Any] | None) -> int | None:
         return estimate_usage_cost_microusd(usage)
 
 
 def verify_batch_route(
-    client: BatchClient,
-    request_body: dict[str, Any],
-    *,
-    max_output_tokens: int,
-    as_of: date | None = None,
+    client: BatchClient, request_body: dict[str, Any], *,
+    max_output_tokens: int, as_of=None,
 ) -> Route:
-    """Free metadata/countTokens preflight for the exact Batch item body.
+    """Verify this key/model/endpoint and reserve a full-miss price bound.
 
-    These calls do not generate text.  countTokens still transfers the prompt
-    to Google, so the caller must apply its credential/privacy policy first.
+    `as_of` is retained for test/caller compatibility; live prices come from
+    current route metadata, not a calendar-dated tariff constant.
     """
-    if (as_of or date.today()) > PRICE_VALID_THROUGH:
-        raise RouteBlocked("gemini_batch_price_review_required")
     request = canonical_request(request_body)
-    if type(max_output_tokens) is not int or request["generationConfig"]["maxOutputTokens"] != max_output_tokens:
+    if (type(max_output_tokens) is not int
+            or request["max_completion_tokens"] != max_output_tokens):
         raise RouteBlocked("output_cap_mismatch")
-
-    model = client.model_details().body
-    if not isinstance(model, dict) or model.get("name") != MODEL_RESOURCE:
-        raise RouteBlocked("model_identity_unverified")
-    input_limit = _nonnegative_int(model.get("inputTokenLimit"))
-    output_limit = _nonnegative_int(model.get("outputTokenLimit"))
-    if input_limit is None or output_limit is None or input_limit < 1 or output_limit < 1:
+    key = client.current_key().body.get("data")
+    allowed = client.models_for_key().body.get("data")
+    model = client.model_details().body.get("data")
+    endpoint_data = client.model_endpoints().body.get("data")
+    if (not isinstance(key, dict) or not isinstance(allowed, list)
+            or not isinstance(model, dict) or not isinstance(endpoint_data, dict)):
+        raise RouteBlocked("route_metadata_unavailable")
+    if key.get("is_management_key") or key.get("is_provisioning_key"):
+        raise RouteBlocked("not_inference_key")
+    workspace_id = key.get("workspace_id")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise RouteBlocked("workspace_scope_unverified")
+    if not any(isinstance(item, dict) and item.get("id") == MODEL for item in allowed):
+        raise RouteBlocked("model_not_allowed_for_key")
+    if model.get("id") != MODEL or endpoint_data.get("id") != MODEL:
+        raise RouteBlocked("batch_model_identity_changed")
+    params = model.get("supported_parameters")
+    if not isinstance(params, list) or not {"response_format", "reasoning"}.issubset(set(params)):
+        raise RouteBlocked("required_parameters_unavailable")
+    endpoints = endpoint_data.get("endpoints")
+    if not isinstance(endpoints, list):
+        raise RouteBlocked("google_vertex_endpoint_unverified")
+    vertex = [item for item in endpoints if isinstance(item, dict) and (
+        item.get("tag") == PROVIDER or
+        (isinstance(item.get("tag"), str) and item["tag"].startswith(PROVIDER + "/")) or
+        item.get("provider_slug") == PROVIDER or
+        item.get("provider_name") == "Google Vertex")]
+    if len(vertex) != 1:
+        raise RouteBlocked("google_vertex_endpoint_unverified")
+    endpoint = vertex[0]
+    ep_params = endpoint.get("supported_parameters")
+    if isinstance(ep_params, list) and not {"response_format", "reasoning"}.issubset(set(ep_params)):
+        raise RouteBlocked("endpoint_parameters_unavailable")
+    context = _positive_int(model.get("context_length"))
+    top = model.get("top_provider")
+    output = _positive_int(top.get("max_completion_tokens")) if isinstance(top, dict) else None
+    endpoint_context = _positive_int(endpoint.get("context_length"))
+    endpoint_output = _positive_int(endpoint.get("max_completion_tokens"))
+    if context is None or output is None:
         raise RouteBlocked("model_limits_unverified")
-    methods = model.get("supportedGenerationMethods")
-    if isinstance(methods, list) and "generateContent" not in methods:
-        raise RouteBlocked("generate_content_unavailable")
-    if max_output_tokens < 1 or max_output_tokens > output_limit:
+    context = min(context, endpoint_context) if endpoint_context is not None else context
+    output = min(output, endpoint_output) if endpoint_output is not None else output
+    if max_output_tokens > output:
         raise RouteBlocked("output_capacity_exceeded")
-
-    counted = client.count_tokens(request).body
-    input_tokens = _nonnegative_int(counted.get("totalTokens") if isinstance(counted, dict) else None)
-    if input_tokens is None or input_tokens < 1:
-        raise RouteBlocked("token_count_unavailable")
-    # 20% headroom covers a small accounting mismatch without changing the
-    # actual prompt.  Gemini's input and output limits are separate.
-    if Decimal(input_tokens) * RESERVE_SAFETY > input_limit:
-        raise RouteBlocked("input_capacity_exceeded")
-    version = model.get("version")
+    # UTF-8 bytes exceed tokenizer tokens for this text/JSON request; reserve a
+    # further 20% for chat wrappers and accounting variation. A near-limit
+    # request blocks rather than being silently truncated.
+    serialized = json.dumps(request, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":")).encode("utf-8")
+    input_upper = (len(serialized) * 6 + 4) // 5
+    if input_upper + max_output_tokens > context:
+        raise RouteBlocked("context_capacity_exceeded")
+    model_pricing = model.get("pricing")
+    endpoint_pricing = endpoint.get("pricing")
+    if not isinstance(model_pricing, dict) or not isinstance(endpoint_pricing, dict):
+        raise RouteBlocked("pricing_unavailable")
+    tiers = [*_tiers(model_pricing), *_tiers(endpoint_pricing)]
+    prompt = _highest(tiers, "prompt")
+    completion = _highest(tiers, "completion")
+    cache_write = max(_CACHE_WRITE_FLOOR,
+                      _highest(tiers, "input_cache_write", "cache_write", optional=True))
+    request_usd = _highest(tiers, "request", optional=True)
+    remaining = key.get("limit_remaining")
     return Route(
-        model=MODEL,
-        model_version=version if isinstance(version, str) else None,
-        provider="google",
-        max_input_tokens=input_limit,
-        max_output_tokens=output_limit,
-        counted_input_tokens=input_tokens,
+        model=MODEL, provider=PROVIDER, workspace_id=workspace_id,
+        max_input_tokens=context - max_output_tokens,
+        max_output_tokens=output, counted_input_tokens=input_upper,
         requested_max_output_tokens=max_output_tokens,
+        prompt_usd_per_token=prompt, completion_usd_per_token=completion,
+        cache_write_usd_per_token=cache_write, request_usd=request_usd,
+        key_limit_remaining_usd=(_decimal(remaining, "key_remaining")
+                                 if remaining is not None else None),
     )

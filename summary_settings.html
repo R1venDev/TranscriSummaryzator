@@ -37,13 +37,13 @@
     <p class="muted">Проверка: бесплатный OpenRouter GET /api/v1/key. Статус не подтверждает права на Luna, тариф Batch или настройки приватности.</p>
     <div id="writerKeys">Загружаю…</div>
   </section>
-  <section class="card"><h2>Проверка и исправление · Google Gemini</h2>
+  <section class="card"><h2>Проверка и исправление · OpenRouter / Gemini 3.7 Flash</h2>
     <form id="judgeAddForm" class="add" autocomplete="off">
       <label>Название<input name="label" maxlength="80" required autocomplete="off"></label>
-      <label>Google Gemini API-ключ<input name="key" type="password" minlength="16" required autocomplete="new-password" spellcheck="false"></label>
+      <label>OpenRouter inference-ключ<input name="key" type="password" minlength="16" required autocomplete="new-password" spellcheck="false"></label>
       <button type="submit">Сохранить</button>
     </form>
-    <p class="muted">Проверка: бесплатный Google GET /v1beta/models. Она подтверждает ответ API, но не доступ к выбранной модели, Batch, кэшу, тариф или условия хранения. Для отправки приватной стенограммы отдельно подтвердите оплачиваемый проект этого ключа: <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noopener noreferrer">условия Google для free/paid tier</a>.</p>
+    <p class="muted">Проверка: бесплатный OpenRouter GET /api/v1/key. Уже сохранённый ключ можно проверить повторно без ввода заново. Проверка показывает workspace и лимит ключа, но не подтверждает доступ к Gemini, Batch, тариф или настройки приватности.</p>
     <div id="judgeKeys">Загружаю…</div>
   </section>
   <p class="warning">Секреты хранятся только на backend и никогда не возвращаются в браузер после сохранения. OpenRouter Batch хранит входы и результаты у шлюза до 30 дней; этот режим уже разрешён пользователем. Удаление сохранённого ключа не отзывает его у провайдера.</p>

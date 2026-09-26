@@ -21,7 +21,7 @@ from summary_credentials import CredentialError, CredentialStore, credential_dis
 
 FAKE_KEY_A = "sk-or-v1-fake-credential-0001"
 FAKE_KEY_B = "sk-or-v1-fake-credential-0002"
-FAKE_GOOGLE_KEY = "synthetic-google-api-key-0001"
+FAKE_JUDGE_KEY = "sk-or-v1-fake-judge-credential-0003"
 
 
 class FakeKeyResponse:
@@ -37,9 +37,10 @@ class FakeKeyResponse:
                                     "usage_weekly": 0.2}}).encode()
 
 
-class FakeGoogleModelsResponse(FakeKeyResponse):
+class FakeManagementKeyResponse(FakeKeyResponse):
     def read(self, _):
-        return json.dumps({"models": [{"name": "models/synthetic-gemini"}]}).encode()
+        return json.dumps({"data": {"workspace_id": "0df9e665-d932-5740-b2c7-b52af166bc11",
+                                    "is_management_key": True}}).encode()
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -83,53 +84,51 @@ class CredentialStoreTests(unittest.TestCase):
             events = db.execute("SELECT operation FROM credential_events").fetchall()
         self.assertEqual(events, [])
 
-    def test_judge_key_isolated_and_paid_project_attestation_required(self):
+    def test_judge_openrouter_key_isolated_and_recheckable_without_reentry(self):
         writer = self.store.add("Автор", FAKE_KEY_A)
-        judge = self.store.add("Проверяющий", FAKE_GOOGLE_KEY, role="judge")
+        judge = self.store.add("Проверяющий", FAKE_JUDGE_KEY, role="judge")
         requests = []
 
-        def google_open(request, **_kwargs):
+        def openrouter_open(request, **_kwargs):
             requests.append(request)
-            return FakeGoogleModelsResponse()
+            return FakeKeyResponse()
 
-        checked = self.store.check(judge["id"], opener=google_open)
+        # This is the state of a saved OpenRouter key previously checked against Google.
+        with self.store._connect() as db:
+            db.execute("UPDATE credentials SET status='error' WHERE id=?", (judge["id"],))
+        checked = self.store.check(judge["id"], opener=openrouter_open)
         self.assertEqual(checked["status"], "ready")
+        self.assertEqual(checked["workspace_id"], "0df9e665-d932-5740-b2c7-b52af166bc11")
+        self.assertEqual(checked["limit_remaining"], 0.8)
+        self.assertEqual(checked["version"], 1)
+        self.assertNotIn("paid_tier_confirmed", checked)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].get_method(), "GET")
-        self.assertEqual(requests[0].full_url,
-                         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1")
-        self.assertEqual(dict((name.lower(), value) for name, value in requests[0].header_items())["x-goog-api-key"],
-                         FAKE_GOOGLE_KEY)
-        self.assertNotIn(FAKE_GOOGLE_KEY, requests[0].full_url)
-        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
-        with self.assertRaises(CredentialError):
-            self.store.reveal_for_dispatch(judge["id"], 1, role="judge")
+        self.assertEqual(requests[0].full_url, "https://openrouter.ai/api/v1/key")
+        self.assertEqual(dict((name.lower(), value) for name, value in requests[0].header_items())["authorization"],
+                         "Bearer " + FAKE_JUDGE_KEY)
+        self.assertNotIn(FAKE_JUDGE_KEY, requests[0].full_url)
+        self.assertEqual(self.store.dispatch_candidates(role="judge")[0]["id"], judge["id"])
         with self.assertRaises(CredentialError):
             self.store.reveal_for_dispatch(judge["id"], 1)
         self.assertEqual(self.store.dispatch_candidates(), [])  # writer not checked yet
         self.store.check(writer["id"], opener=lambda *_args, **_kwargs: FakeKeyResponse())
         self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
-        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
-        with self.assertRaises(CredentialError):
-            self.store.set_judge_policy(writer["id"], paid_tier_confirmed=True,
-                                        project_scope="paid-project-1")
-        confirmed = self.store.set_judge_policy(judge["id"], paid_tier_confirmed=True,
-                                                project_scope="paid-project-1")
-        self.assertTrue(confirmed["paid_tier_confirmed"])
-        self.assertIsNotNone(confirmed["paid_tier_confirmed_at"])
-        self.assertEqual(self.store.dispatch_candidates(role="judge")[0]["id"], judge["id"])
         self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
         with self.assertRaises(CredentialError):
             self.store.set_order([writer["id"]], role="judge")
-        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 1, role="judge"), FAKE_GOOGLE_KEY)
-        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), self.store.path.read_bytes())
-        self.assertNotIn(FAKE_GOOGLE_KEY, json.dumps(self.store.list()))
-        self.store.set_judge_policy(judge["id"], paid_tier_confirmed=False, project_scope=None)
+        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 1, role="judge"), FAKE_JUDGE_KEY)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), self.store.path.read_bytes())
+        self.assertNotIn(FAKE_JUDGE_KEY, json.dumps(self.store.list()))
+        self.store.replace(judge["id"], FAKE_JUDGE_KEY)
         self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
-        self.store.set_judge_policy(judge["id"], paid_tier_confirmed=True,
-                                    project_scope="paid-project-1")
-        self.store.replace(judge["id"], FAKE_GOOGLE_KEY)
-        self.assertFalse(next(k for k in self.store.list()["keys"] if k["id"] == judge["id"])["paid_tier_confirmed"])
+        self.assertEqual(self.store.check(judge["id"], opener=openrouter_open)["status"], "ready")
+        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 2, role="judge"), FAKE_JUDGE_KEY)
+
+    def test_management_key_does_not_enter_inference_dispatch(self):
+        judge = self.store.add("Административный", FAKE_JUDGE_KEY, role="judge")
+        self.assertEqual(self.store.check(judge["id"], opener=lambda *_a, **_k: FakeManagementKeyResponse())["status"], "error")
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
 
     def test_existing_database_migrates_to_writer_without_changing_ciphertext(self):
         legacy_path = self.root / "legacy" / "credentials.sqlite3"
@@ -274,29 +273,25 @@ class AdminHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(raw)["result"]["revoked_upstream"])
 
-    def test_judge_admin_role_and_attestation_protected(self):
-        body = {"role": "judge", "label": "Gemini judge", "key": FAKE_GOOGLE_KEY}
+    def test_judge_admin_role_protected(self):
+        body = {"role": "judge", "label": "Gemini judge", "key": FAKE_JUDGE_KEY}
         status, _, _ = self.request("POST", "/api/summary/credentials/add", body, auth=False)
         self.assertEqual(status, 401)
         status, _, _ = self.request("POST", "/api/summary/credentials/add", body, origin=False)
         self.assertEqual(status, 403)
         status, raw, _ = self.request("POST", "/api/summary/credentials/add", body)
         self.assertEqual(status, 201)
-        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), raw)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), raw)
         identifier = json.loads(raw)["result"]["id"]
-        policy = {"id": identifier, "paid_tier_confirmed": True, "project_scope": "paid-project-1"}
-        status, _, _ = self.request("POST", "/api/summary/credentials/judge-policy", policy, origin=False)
-        self.assertEqual(status, 403)
-        status, raw, _ = self.request("POST", "/api/summary/credentials/judge-policy", policy)
-        self.assertEqual(status, 200)
-        self.assertTrue(json.loads(raw)["result"]["paid_tier_confirmed"])
         status, raw, _ = self.request("GET", "/api/summary/credentials")
         self.assertEqual(status, 200)
-        self.assertNotIn(FAKE_GOOGLE_KEY.encode(), raw)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), raw)
         self.assertEqual(json.loads(raw)["keys"][0]["role"], "judge")
+        self.assertEqual(json.loads(raw)["keys"][0]["id"], identifier)
         status, page, _ = self.request("GET", "/summary-settings")
         self.assertEqual(status, 200)
-        self.assertIn("Google Gemini".encode(), page)
+        self.assertIn("OpenRouter / Gemini".encode(), page)
+        self.assertNotIn("оплачиваемого Google-проекта".encode(), page)
 
 
 if __name__ == "__main__":

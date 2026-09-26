@@ -1,43 +1,42 @@
-"""One-item Google Gemini GenerateContent Batch transport.
+"""One-item Gemini judge through OpenRouter's Chat Completions Batch API.
 
-The caller owns durable intent/budget records.  In particular, a failed or
-unknown POST is never retried here: batch creation is not idempotent.
+Caller records intent and reserves budget before POST. An unknown POST is not
+retried here. OpenRouter retains Batch inputs and results until deletion or its
+retention limit. No direct Google API key is used.
 
-Contract: https://ai.google.dev/api/batch-api and
-https://ai.google.dev/gemini-api/docs/batch-api (v1beta, September 2026).
+Contract: https://openrouter.ai/docs/batch-quickstart
 """
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-
-API_BASE = "https://generativelanguage.googleapis.com/v1beta"
-MODEL = "gemini-3.7-flash"
-MODEL_RESOURCE = f"models/{MODEL}"
-MAX_INLINE_BYTES = 20_000_000  # Google's inline limit is under 20 MB.
+API_BASE = "https://openrouter.ai/api/v1"
+MODEL = "google/gemini-3.7-flash:batch"
+PROVIDER = "google-vertex"
+MAX_REQUEST_BYTES = 20_000_000
 MAX_RESPONSE_BYTES = 32_000_000
-_BATCH_NAME = re.compile(r"batches/[A-Za-z0-9_-]{1,128}\Z")
+_BATCH_ID = re.compile(r"batch[-_][A-Za-z0-9_-]{3,128}\Z")
 _CUSTOM_ID = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+_STATES = frozenset({"validating", "in_progress", "finalizing", "cancelling",
+                     "completed", "failed", "expired", "cancelled"})
 
 
 def valid_batch_id(value: object) -> bool:
-    return isinstance(value, str) and _BATCH_NAME.fullmatch(value) is not None
+    return isinstance(value, str) and _BATCH_ID.fullmatch(value) is not None
 
 
 class BatchError(RuntimeError):
-    """Redacted transport/provider error; never contains a request or API key."""
+    """Redacted transport/provider error without source or token."""
 
     def __init__(self, code: int | None, reason: str, retry_after: str | None = None):
-        super().__init__(f"Gemini Batch HTTP {code}: {reason}")
-        self.code = code
-        self.reason = reason
-        self.retry_after = retry_after
+        super().__init__(f"OpenRouter Batch HTTP {code}: {reason}")
+        self.code, self.reason, self.retry_after = code, reason, retry_after
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -52,50 +51,53 @@ class Reply:
 
 
 def canonical_request(request_body: dict[str, Any]) -> dict[str, Any]:
-    """Validate one text-only GenerateContentRequest and pin safe defaults.
-
-    The same result is used in countTokens and Batch submission, so a caller
-    cannot count one prompt and send a materially different one accidentally.
-    """
-    if not isinstance(request_body, dict) or not isinstance(request_body.get("contents"), list) or not request_body["contents"]:
-        raise ValueError("invalid_generate_request")
-    if request_body.get("model", MODEL_RESOURCE) != MODEL_RESOURCE:
-        raise ValueError("wrong_gemini_model")
-    if request_body.get("store", False) is not False:
-        raise ValueError("request_storage_not_disabled")
-    if "cachedContent" in request_body or "cached_content" in request_body:
-        raise ValueError("explicit_cache_not_enabled")
-    if "tools" in request_body or "toolConfig" in request_body:
-        raise ValueError("tools_not_allowed")
-    generation = request_body.get("generationConfig")
-    if not isinstance(generation, dict):
-        raise ValueError("generation_config_missing")
-    output_cap = generation.get("maxOutputTokens")
-    if type(output_cap) is not int or not 1 <= output_cap <= 65_536:
-        raise ValueError("invalid_output_cap")
-    # This route processes a compact text transcript only.  No file/media URI
-    # and no tool can cause a second, unbudgeted external data transfer.
-    for content in request_body["contents"]:
-        if not isinstance(content, dict) or not isinstance(content.get("parts"), list) or not content["parts"]:
-            raise ValueError("invalid_content")
-        for part in content["parts"]:
-            if not isinstance(part, dict) or set(part) != {"text"} or not isinstance(part["text"], str):
-                raise ValueError("text_only_required")
-    instruction = request_body.get("systemInstruction")
-    if instruction is not None:
-        if not isinstance(instruction, dict) or not isinstance(instruction.get("parts"), list) or not instruction["parts"]:
-            raise ValueError("invalid_system_instruction")
-        if any(not isinstance(part, dict) or set(part) != {"text"} or not isinstance(part["text"], str)
-               for part in instruction["parts"]):
+    """Accept only a text-only Chat judge request with strict JSON output."""
+    if not isinstance(request_body, dict):
+        raise ValueError("invalid_chat_request")
+    allowed = {"messages", "response_format", "max_completion_tokens",
+               "reasoning", "tool_choice", "plugins", "modalities"}
+    if set(request_body) - allowed:
+        raise ValueError("unapproved_chat_parameter")
+    messages = request_body.get("messages")
+    if (not isinstance(messages, list) or len(messages) != 2
+            or [m.get("role") if isinstance(m, dict) else None for m in messages]
+            != ["system", "user"]):
+        raise ValueError("invalid_messages")
+    for message in messages:
+        if (set(message) != {"role", "content"}
+                or not isinstance(message["content"], str)
+                or not message["content"].strip()):
             raise ValueError("text_only_required")
-    result = dict(request_body)
-    result["model"] = MODEL_RESOURCE
-    result["store"] = False  # Request-level override of project logging.
-    return result
+    cap = request_body.get("max_completion_tokens")
+    if type(cap) is not int or not 1 <= cap <= 65_536:
+        raise ValueError("invalid_output_cap")
+    fmt = request_body.get("response_format")
+    if (not isinstance(fmt, dict) or set(fmt) != {"type", "json_schema"}
+            or fmt["type"] != "json_schema"):
+        raise ValueError("structured_output_required")
+    schema = fmt["json_schema"]
+    if (not isinstance(schema, dict)
+            or set(schema) != {"name", "strict", "schema"}
+            or not isinstance(schema["name"], str) or not schema["name"]
+            or schema["strict"] is not True
+            or not isinstance(schema["schema"], dict)):
+        raise ValueError("invalid_output_schema")
+    if ("reasoning" in request_body
+            and (not isinstance(request_body["reasoning"], dict)
+                 or set(request_body["reasoning"]) != {"effort"}
+                 or request_body["reasoning"]["effort"] not in {"low", "medium", "high"})):
+        raise ValueError("invalid_reasoning_profile")
+    if request_body.get("tool_choice", "none") != "none":
+        raise ValueError("tools_not_allowed")
+    if request_body.get("plugins", []) != []:
+        raise ValueError("plugins_not_allowed")
+    if request_body.get("modalities", ["text"]) != ["text"]:
+        raise ValueError("text_only_required")
+    return dict(request_body)
 
 
 class BatchClient:
-    """HTTP client using a Gemini API key supplied by the secret store."""
+    """Selected OpenRouter inference key; never expose it in a URL or log."""
 
     def __init__(self, token: str, *, opener=None):
         if (not isinstance(token, str) or not token or not token.isascii()
@@ -106,17 +108,17 @@ class BatchClient:
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Reply:
         if not path.startswith("/") or ".." in path or "?" in path or "#" in path:
-            raise ValueError("invalid Gemini API path")
+            raise ValueError("invalid Batch API path")
         try:
-            data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            data = (None if payload is None else
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         except (TypeError, ValueError):
             raise ValueError("invalid_request_body") from None
-        if data is not None and len(data) >= MAX_INLINE_BYTES:
-            raise ValueError("batch_inline_payload_too_large")
+        if data is not None and len(data) >= MAX_REQUEST_BYTES:
+            raise ValueError("batch_payload_too_large")
         request = urllib.request.Request(
-            API_BASE + path,
-            data=data,
-            headers={"x-goog-api-key": self._token, "Content-Type": "application/json"},
+            API_BASE + path, data=data,
+            headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
             method=method,
         )
         try:
@@ -136,123 +138,63 @@ class BatchClient:
             if retry_after is not None and not re.fullmatch(r"[0-9]{1,8}", retry_after):
                 retry_after = None
             raise BatchError(exc.code, "request_rejected", retry_after) from None
-        except urllib.error.URLError:
-            raise BatchError(None, "transport_unknown") from None
-        except OSError:
+        except (urllib.error.URLError, OSError):
             raise BatchError(None, "transport_unknown") from None
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise BatchError(None, "malformed_response") from None
 
-    def model_details(self) -> Reply:
-        return self._request("GET", f"/{MODEL_RESOURCE}")
+    def current_key(self) -> Reply:
+        return self._request("GET", "/key")
 
-    def count_tokens(self, request_body: dict[str, Any]) -> Reply:
-        request = canonical_request(request_body)
-        # Count the same systemInstruction, contents and generationConfig that
-        # Batch will receive, not just the user-text subset.
-        return self._request(
-            "POST", f"/{MODEL_RESOURCE}:countTokens", {"generateContentRequest": request}
-        )
+    def models_for_key(self) -> Reply:
+        return self._request("GET", "/models/user")
+
+    def model_details(self) -> Reply:
+        return self._request("GET", "/model/google/gemini-3.7-flash:batch")
+
+    def model_endpoints(self) -> Reply:
+        # The endpoints API requires the variant colon percent-encoded in this
+        # path (the model-details API accepts an unescaped colon).
+        return self._request("GET", "/models/google/gemini-3.7-flash%3Abatch/endpoints")
 
     def submit(self, custom_id: str, request_body: dict[str, Any]) -> Reply:
         if not isinstance(custom_id, str) or _CUSTOM_ID.fullmatch(custom_id) is None:
             raise ValueError("invalid custom_id")
         request = canonical_request(request_body)
+        # OpenRouter stream-parses the object: headers must precede requests.
         payload = {
-            "batch": {
-                "display_name": f"transcri-{custom_id}",
-                "input_config": {
-                    "requests": {
-                        "requests": [{"request": request, "metadata": {"key": custom_id}}]
-                    }
-                },
-            }
+            "endpoint": "/v1/chat/completions", "model": MODEL,
+            "provider": {"only": [PROVIDER]}, "completion_window": "24h",
+            "requests": [{"custom_id": custom_id, "body": request}],
         }
-        try:
-            encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        except (TypeError, ValueError):
-            raise ValueError("invalid_request_body") from None
-        if len(encoded) >= MAX_INLINE_BYTES:
-            raise ValueError("batch_inline_payload_too_large")
-        return self._request("POST", f"/{MODEL_RESOURCE}:batchGenerateContent", payload)
+        return self._request("POST", "/batches", payload)
 
     def get(self, batch_id: str) -> Reply:
         if not valid_batch_id(batch_id):
             raise ValueError("invalid batch id")
-        reply = self._request("GET", f"/{batch_id}")
-        if reply.body.get("name") != batch_id:
+        reply = self._request("GET", f"/batches/{batch_id}")
+        if reply.body.get("id") != batch_id:
             raise BatchError(reply.status_code, "batch_identity_mismatch")
         return reply
 
-    def cancel(self, batch_id: str) -> Reply:
-        if not valid_batch_id(batch_id):
-            raise ValueError("invalid batch id")
-        return self._request("POST", f"/{batch_id}:cancel")
-
     def delete(self, batch_id: str) -> Reply:
-        """Forget job resource after terminal; API does not promise data erasure."""
         if not valid_batch_id(batch_id):
             raise ValueError("invalid batch id")
-        return self._request("DELETE", f"/{batch_id}")
+        return self._request("DELETE", f"/batches/{batch_id}")
 
 
 def batch_id_from_submit(body: dict[str, Any]) -> str:
-    name = body.get("name") if isinstance(body, dict) else None
-    if not valid_batch_id(name):
-        raise ValueError("batch_name_missing")
-    return name
-
-
-_STATES = {
-    "JOB_STATE_PENDING": "pending", "BATCH_STATE_PENDING": "pending",
-    "JOB_STATE_RUNNING": "running", "BATCH_STATE_RUNNING": "running",
-    "JOB_STATE_SUCCEEDED": "completed", "BATCH_STATE_SUCCEEDED": "completed",
-    "JOB_STATE_FAILED": "failed", "BATCH_STATE_FAILED": "failed",
-    "JOB_STATE_CANCELLED": "cancelled", "BATCH_STATE_CANCELLED": "cancelled",
-    "JOB_STATE_EXPIRED": "expired", "BATCH_STATE_EXPIRED": "expired",
-}
+    batch_id = body.get("id") if isinstance(body, dict) else None
+    if not valid_batch_id(batch_id):
+        raise ValueError("batch_id_missing")
+    return batch_id
 
 
 def normalize_batch_status(body: dict[str, Any]) -> str:
-    """Read both documented REST Operation and BatchJob view state shapes."""
     if not isinstance(body, dict):
         return "unknown"
-    if body.get("done") is False:
-        # An Operation cannot contain its response until done=true. Its
-        # metadata may already report a terminal batch state while the final
-        # operation result is still being assembled; keep polling for it.
-        return "running"
-    if body.get("done") is True and isinstance(body.get("error"), dict):
-        return "failed"
-    if body.get("done") is True and _inlined_items(body) is not None:
-        return "completed"
-    for container in (body, body.get("metadata"), body.get("response")):
-        if isinstance(container, dict) and container.get("state") in _STATES:
-            return _STATES[container["state"]]
-    return "unknown"
-
-
-def _inlined_items(body: dict[str, Any]) -> list[Any] | None:
-    # REST reference: Operation.response.output.inlinedResponses.inlinedResponses.
-    response = body.get("response")
-    if isinstance(response, dict):
-        output = response.get("output")
-        if isinstance(output, dict):
-            inline = output.get("inlinedResponses")
-            if isinstance(inline, list):
-                return inline
-            if isinstance(inline, dict) and isinstance(inline.get("inlinedResponses"), list):
-                return inline["inlinedResponses"]
-        inline = response.get("inlinedResponses")
-        if isinstance(inline, list):
-            return inline
-        if isinstance(inline, dict) and isinstance(inline.get("inlinedResponses"), list):
-            return inline["inlinedResponses"]
-    # BatchJob view in the guide: dest.inlinedResponses is the list.
-    dest = body.get("dest")
-    if isinstance(dest, dict) and isinstance(dest.get("inlinedResponses"), list):
-        return dest["inlinedResponses"]
-    return None
+    status = body.get("status")
+    return status if status in _STATES else "unknown"
 
 
 def extract_one_completed(
@@ -261,40 +203,36 @@ def extract_one_completed(
     manifest: dict[str, Any] | None = None,
     saved_request: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return matched raw GenerateContentResponse and its usageMetadata."""
+    """Return the exact chat response and actual Batch usage for one request."""
     if normalize_batch_status(batch) != "completed":
         raise ValueError("batch_not_completed")
-    if isinstance(batch.get("error"), dict):
-        raise ValueError("batch_failed")
-    items = _inlined_items(batch)
-    if items is None:
-        raise ValueError("batch_inline_results_missing")
-    matches = [item for item in items if isinstance(item, dict)
-               and isinstance(item.get("metadata"), dict)
-               and item["metadata"].get("key") == custom_id]
-    if len(matches) == 1:
-        item = matches[0]
-    elif (len(matches) == 0 and len(items) == 1 and isinstance(items[0], dict)
-          and items[0].get("metadata") is None
-          and valid_batch_id(expected_batch_id)
-          and batch.get("name") == expected_batch_id
-          and isinstance(manifest, dict) and isinstance(saved_request, dict)
-          and manifest.get("inline_request_count") == 1
-          and manifest.get("custom_id") == custom_id
-          and manifest.get("request_sha256") == hashlib.sha256(
-              json.dumps(saved_request, ensure_ascii=False, sort_keys=True,
-                         separators=(",", ":")).encode("utf-8")
-          ).hexdigest()):
-        # Google has returned an inline response without the request metadata.
-        # One persisted request, one result and the exact remote identity make
-        # positional recovery unambiguous; never use this for a multi-item job.
-        item = items[0]
-    else:
+    if expected_batch_id is not None and batch.get("id") != expected_batch_id:
+        raise ValueError("batch_identity_mismatch")
+    if batch.get("model") != MODEL or batch.get("endpoint") != "/v1/chat/completions":
+        raise ValueError("batch_route_mismatch")
+    if manifest is not None or saved_request is not None:
+        if not isinstance(manifest, dict) or not isinstance(saved_request, dict):
+            raise ValueError("saved_request_mismatch")
+        digest = hashlib.sha256(json.dumps(
+            saved_request, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        if (manifest.get("inline_request_count") != 1
+                or manifest.get("custom_id") != custom_id
+                or manifest.get("request_sha256") != digest):
+            raise ValueError("saved_request_mismatch")
+    results = batch.get("results")
+    if not isinstance(results, list):
+        raise ValueError("batch_results_missing")
+    matches = [item for item in results if isinstance(item, dict)
+               and item.get("custom_id") == custom_id]
+    if len(matches) != 1 or len(results) != 1:
         raise ValueError("batch_custom_id_mismatch")
+    item = matches[0]
     if item.get("error") is not None:
         raise ValueError("batch_item_failed")
-    response = item.get("response")
-    if not isinstance(response, dict):
+    wrapped = item.get("response")
+    if (not isinstance(wrapped, dict) or wrapped.get("status_code") != 200
+            or not isinstance(wrapped.get("body"), dict)):
         raise ValueError("batch_item_invalid")
-    usage = response.get("usageMetadata")
-    return response, usage if isinstance(usage, dict) else {}
+    usage = batch.get("usage")
+    return wrapped["body"], usage if isinstance(usage, dict) else {}

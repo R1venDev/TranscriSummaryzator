@@ -2750,10 +2750,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
                     result = self.summary_credential_rpc("enabled", body)
                 status = 200
-            elif action == "judge-policy":
-                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
-                    result = self.summary_credential_rpc("judge_policy", body)
-                status = 200
             elif action == "delete":
                 with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
                     active = self.summary_active_credential_jobs(body.get("id"))

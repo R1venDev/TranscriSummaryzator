@@ -62,9 +62,7 @@ function renderRole(role, keysNode) {
     const meta = document.createElement('div'); meta.className = 'meta';
     const checked = key.checked_at || 'не проверен';
     const remaining = key.limit_remaining == null ? 'неизвестен' : String(key.limit_remaining);
-    meta.textContent = role === 'writer'
-      ? `Версия ${key.version} · Проверен: ${checked} · Доступный лимит ключа: ${remaining} · Workspace: ${key.workspace_id || 'неизвестен'}. Проверка не подтверждает модель или ZDR.`
-      : `Версия ${key.version} · Проверен: ${checked} · Paid tier подтверждён администратором: ${key.paid_tier_confirmed ? 'да' : 'нет'} · Проект: ${key.project_scope || 'не указан'}. Проверка ключа не подтверждает paid tier.`;
+    meta.textContent = `Версия ${key.version} · Проверен: ${checked} · Доступный лимит ключа: ${remaining} · Workspace: ${key.workspace_id || 'неизвестен'}. Проверка не подтверждает модель, Batch или политику доступа.`;
     const controls = document.createElement('div'); controls.className = 'controls';
     controls.append(button('Проверить', () => post('check', {id: key.id})));
     if (!key.primary) controls.append(button('Сделать основным', () => post('order', {role, ids: [key.id, ...keys.filter(x => x.id !== key.id).map(x => x.id)]})));
@@ -91,26 +89,6 @@ function renderRole(role, keysNode) {
       finally { submit.disabled = false; }
     });
     item.append(head, meta, controls, form);
-    if (role === 'judge') {
-      const policy = document.createElement('form'); policy.className = 'replace';
-      const projectLabel = document.createElement('label'); projectLabel.textContent = 'ID или уникальная метка оплачиваемого Google-проекта';
-      const project = document.createElement('input'); project.maxLength = 128; project.required = true;
-      project.autocomplete = 'off'; project.value = key.project_scope || ''; projectLabel.append(project);
-      const attest = document.createElement('label'); attest.className = 'muted';
-      const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.style.width = 'auto'; checkbox.required = true;
-      attest.append(checkbox, document.createTextNode(' Подтверждаю, что именно этот ключ относится к оплачиваемому проекту Gemini API.'));
-      const save = document.createElement('button'); save.type = 'submit'; save.textContent = 'Подтвердить проект';
-      policy.append(projectLabel, attest, save);
-      policy.addEventListener('submit', async event => {
-        event.preventDefault(); save.disabled = true; message('');
-        try { await post('judge-policy', {id: key.id, paid_tier_confirmed: true, project_scope: project.value.trim()}); message('Подтверждение проекта сохранено'); }
-        catch (error) { message(error.message, true); }
-        finally { save.disabled = false; }
-      });
-      item.append(policy);
-      if (key.paid_tier_confirmed) item.append(button('Снять подтверждение проекта', () =>
-        post('judge-policy', {id: key.id, paid_tier_confirmed: false, project_scope: null})));
-    }
     keysNode.append(item);
   });
 }

@@ -160,17 +160,18 @@ class Ledger:
                         or root["source_sha256"] != source_sha256):
                     raise ValueError("invalid quality root or workspace")
                 if root["workspace_id"] != workspace_id:
-                    # A Gemini judge uses a separate Google project and key.
-                    # Only a root which selected this route before its writer
-                    # POST may spend against another credential scope. Legacy
-                    # Luna quality jobs remain pinned to the writer workspace.
+                    # The separately selected Gemini judge can use another
+                    # OpenRouter workspace only when the writer pinned that
+                    # exact scope before its own POST. Legacy Luna audit stays
+                    # in the writer workspace.
                     manifest_path = Path(root["artifact_dir"]) / "manifest.json"
                     try:
                         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                     except (OSError, ValueError) as exc:
                         raise ValueError("quality root manifest unavailable") from exc
-                    if (manifest.get("quality_provider") != "google_gemini"
-                            or manifest.get("quality_policy_version") != "gemini_judge_repair_v1"
+                    if (manifest.get("quality_provider") != "openrouter_gemini"
+                            or manifest.get("quality_policy_version") != "gemini_openrouter_judge_repair_v2"
+                            or manifest.get("judge_workspace_id") != workspace_id
                             or not isinstance(workspace_id, str) or not workspace_id
                             or credential_id == root["credential_id"]):
                         raise ValueError("invalid quality root or workspace")

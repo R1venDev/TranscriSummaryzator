@@ -26,9 +26,7 @@ from summary.gemini_v1 import GEMINI_AUDIT_PROMPT_PATH, build_gemini_audit_input
 from summary.gemini_v1.batch import BatchClient as GeminiBatchClient
 from summary.gemini_v1.batch import BatchError as GeminiBatchError
 from summary.gemini_v1.batch import extract_one_completed as extract_one_gemini_completed
-from summary.gemini_v1.batch import normalize_batch_status as normalize_gemini_batch_status
 from summary.gemini_v1.route import (RouteBlocked as GeminiRouteBlocked,
-                                     estimate_usage_cost_microusd,
                                      verify_batch_route as verify_gemini_batch_route)
 from .ledger import Ledger, usd_micros, write_private_json
 from .publication import publish_document
@@ -39,10 +37,10 @@ from .tasks import RevisionConflict, TaskStore
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
 REASONING_EFFORT = "medium"
 LEGACY_QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
-QUALITY_POLICY_VERSION = "gemini_judge_repair_v1"
-QUALITY_PROVIDER = "google_gemini"
-GEMINI_MODEL = "gemini-3.7-flash"
-GEMINI_PRIVACY_MODE = "google_paid_batch_retention_up_to_6w_store_false_user_authorized"
+QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v2"
+QUALITY_PROVIDER = "openrouter_gemini"
+GEMINI_MODEL = "google/gemini-3.7-flash:batch"
+GEMINI_PRIVACY_MODE = "openrouter_batch_30d_google_vertex_user_authorized"
 QUALITY_CREDENTIAL_WAIT_SECONDS = 30 * 60
 QUALITY_BATCH_WAIT_SECONDS = 26 * 60 * 60
 
@@ -182,7 +180,7 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
         selected = candidates[0]  # ordered primary; no automatic account hopping
         scope = selected.get("workspace_id") or ("unverified-key-version:" + selected["id"] + ":" + str(selected["version"]))
         judge_candidates = store.dispatch_candidates(role="judge")
-        judge_scope = (judge_candidates[0].get("project_scope") or "judge-unavailable") if judge_candidates else "judge-unavailable"
+        judge_scope = (judge_candidates[0].get("workspace_id") or "judge-unavailable") if judge_candidates else "judge-unavailable"
         semantic_key = _semantic_identity(source_sha, source_text, scope, prompt_sha,
                                           schema_sha, force_nonce, judge_scope)
         prior = ledger.attach_consumer(semantic_key, source_sha, output_dir)
@@ -217,7 +215,7 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "prompt_sha256": prompt_sha, "schema_sha256": schema_sha,
             "quality_policy_version": QUALITY_POLICY_VERSION,
             "quality_provider": QUALITY_PROVIDER,
-            "judge_project_scope": judge_scope,
+            "judge_workspace_id": judge_scope,
             "audit_model": GEMINI_MODEL,
             "audit_privacy_mode": GEMINI_PRIVACY_MODE,
             "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
@@ -276,6 +274,11 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
 
 
 def _cost_micros(usage: dict) -> int | None:
+    # BYOK batches report only OpenRouter's fee; the provider bills inference
+    # separately. Keeping the original reserve prevents that partial receipt
+    # from releasing application budget as if it were total spend.
+    if usage.get("is_byok") is True:
+        return None
     value = usage.get("cost")
     if value is None:
         return None
@@ -325,30 +328,27 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     submission = json.loads((artifacts / "submit_response.json").read_text(encoding="utf-8"))
     request_manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
     if request_manifest.get("provider") == QUALITY_PROVIDER:
-        if (submission.get("name") != job["remote_id"]
-                or batch.get("name") != job["remote_id"]):
+        if (submission.get("id") != job["remote_id"]
+                or batch.get("id") != job["remote_id"]
+                or submission.get("model") != GEMINI_MODEL
+                or batch.get("model") != GEMINI_MODEL):
             raise ValueError("gemini_batch_submission_identity_mismatch")
         saved_request = json.loads((artifacts / "request.json").read_text(encoding="utf-8"))
         body, usage = extract_one_gemini_completed(
             batch, job["custom_id"], expected_batch_id=job["remote_id"],
             manifest=request_manifest, saved_request=saved_request)
-        version = body.get("modelVersion")
-        if not isinstance(version, str) or not version.startswith(GEMINI_MODEL):
+        if body.get("model") not in {GEMINI_MODEL, GEMINI_MODEL.removesuffix(":batch")}:
             raise ValueError("gemini_response_model_mismatch")
-        candidates = body.get("candidates")
-        if (not isinstance(candidates, list) or len(candidates) != 1
-                or not isinstance(candidates[0], dict)):
-            raise ValueError("gemini_response_candidates_invalid")
-        candidate = candidates[0]
-        if candidate.get("finishReason") != "STOP":
+        choices = body.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ValueError("gemini_response_choices_invalid")
+        choice = choices[0]
+        if choice.get("finish_reason") != "stop":
             raise ValueError("gemini_response_not_terminal_stop")
-        content = candidate.get("content")
-        parts = content.get("parts") if isinstance(content, dict) else None
-        if (not isinstance(parts, list) or not parts
-                or any(not isinstance(part, dict) or not isinstance(part.get("text"), str)
-                       or part.get("thought") for part in parts)):
+        message = choice.get("message") or {}
+        if message.get("refusal") or not isinstance(message.get("content"), str):
             raise ValueError("gemini_response_text_invalid")
-        raw_text = "".join(part["text"] for part in parts)
+        raw_text = message["content"]
     else:
         if submission.get("id") != job["remote_id"] or batch.get("model") != submission.get("model"):
             raise ValueError("batch_submission_identity_mismatch")
@@ -441,20 +441,21 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
     if kind not in {"audit", "verify"}:
         raise ValueError("invalid quality request kind")
     if provider == "gemini":
-        # Direct Google GenerateContentRequest inside one inline Batch item.
-        # The source comes first in the stable user content, before the
-        # changing draft and final host-authored task. No tools or grounding.
+        # OpenRouter Chat Completions carries a Gemini-specific instruction.
+        # The transcript stays in a separate user message and receives no
+        # tools, web plugin, audio, or renderer output.
         return {
-            "systemInstruction": {"parts": [{"text": GEMINI_AUDIT_PROMPT_PATH.read_text(encoding="utf-8")}]},
-            "contents": [{"role": "user", "parts": [{"text": build_gemini_audit_input(
-                source_text, target, mode=kind, prior_findings=prior_findings)}]}],
-            "generationConfig": {
-                "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": AUDIT_SCHEMA}},
-                "maxOutputTokens": 16_000 if kind == "audit" else 8_000,
-                "thinkingConfig": {"thinkingLevel": "MEDIUM", "includeThoughts": False},
-                "candidateCount": 1,
-            },
-            "store": False,
+            "messages": [
+                {"role": "system", "content": GEMINI_AUDIT_PROMPT_PATH.read_text(encoding="utf-8")},
+                {"role": "user", "content": build_gemini_audit_input(
+                    source_text, target, mode=kind, prior_findings=prior_findings)},
+            ],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": AUDIT_SCHEMA_ID, "strict": True, "schema": AUDIT_SCHEMA,
+            }},
+            "max_completion_tokens": 16_000 if kind == "audit" else 8_000,
+            "reasoning": {"effort": "medium"},
+            "plugins": [],
         }
     if provider != "luna":
         raise ValueError("unknown_quality_provider")
@@ -609,15 +610,15 @@ def _start_quality_stage(ledger: Ledger, root: dict, kind: str, target: dict,
 
 def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
                         prior_findings: list[dict], client_factory) -> dict:
-    """Use a separate paid Google judge key for audit and bounded repair.
+    """Use a separate OpenRouter key for Gemini audit and bounded repair.
 
     A Batch POST is never repeated after an unknown outcome. The writer's
-    OpenRouter credential, scope and request remain separate from this stage.
+    credential and request remain separate from this stage.
     """
     from summary.gemini_v1.batch import BatchError as GeminiBatchError, batch_id_from_submit
 
     root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
-    pinned_scope = root_manifest.get("judge_project_scope")
+    pinned_scope = root_manifest.get("judge_workspace_id")
     if not isinstance(pinned_scope, str) or pinned_scope == "judge-unavailable":
         return {"status": "unavailable", "reason": "judge_credential_required_at_writer_dispatch"}
     transcript_path = Path(root["output_dir"]) / "transcript.json"
@@ -648,7 +649,7 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
         if existing is None:
             candidates = store.dispatch_candidates(role="judge")
             selected = next((candidate for candidate in candidates
-                             if candidate.get("project_scope") == pinned_scope), None)
+                             if candidate.get("workspace_id") == pinned_scope), None)
             if selected is None:
                 return {"status": "unavailable", "reason": "judge_credential_required"}
         else:
@@ -658,14 +659,16 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             if selected is None:
                 cancel_reserved("judge_credential_changed")
                 return {"status": "unavailable", "reason": "judge_credential_changed"}
-        if (selected.get("project_scope") != pinned_scope
-                or not selected.get("paid_tier_confirmed")):
+        if selected.get("workspace_id") != pinned_scope:
             cancel_reserved("judge_policy_or_scope_changed")
             return {"status": "unavailable", "reason": "judge_policy_or_scope_changed"}
         token = store.reveal_for_dispatch(selected["id"], selected["version"], role="judge")
         client = client_factory(token)
-        output_cap = request_body["generationConfig"]["maxOutputTokens"]
+        output_cap = request_body["max_completion_tokens"]
         route = verify_gemini_batch_route(client, request_body, max_output_tokens=output_cap)
+        if route.workspace_id != pinned_scope:
+            cancel_reserved("judge_route_workspace_changed")
+            return {"status": "unavailable", "reason": "judge_route_workspace_changed"}
         reserve = route.reserve_microusd()
         decision = ledger.reserve(
             semantic_key=semantic_key, source_sha256=source_sha,
@@ -687,10 +690,11 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
             "credential_id": stage["credential_id"],
             "credential_version": stage["credential_version"],
-            "project_scope": pinned_scope, "model": GEMINI_MODEL,
+            "workspace_id": pinned_scope, "model": GEMINI_MODEL,
             "provider": QUALITY_PROVIDER, "quality_policy_version": QUALITY_POLICY_VERSION,
             "privacy_mode": GEMINI_PRIVACY_MODE,
-            "cache_policy": "implicit_only_no_guaranteed_hit",
+            "provider_only": ["google-vertex"],
+            "cache_policy": "no_explicit_cache_full_miss_reserved",
             "reserve_microusd": stage["reserved_microusd"],
             "counted_input_tokens": route.input_tokens,
             "max_output_tokens": output_cap,
@@ -720,7 +724,7 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
                 remote_id = batch_id_from_submit(reply.body)
             except ValueError:
                 remote_id = None
-            if not 200 <= reply.status_code < 300 or remote_id is None:
+            if reply.status_code != 202 or remote_id is None:
                 ledger.submission_result(stage["id"], remote_id=None,
                                          error_code="unexpected_submit_response")
                 return {"status": "submission_unknown", "job_id": stage["id"]}
@@ -952,14 +956,13 @@ def poll_once(*, private_root: Path, client_factory=BatchClient,
                 outcomes.append({"status": "poll_error", "job_id": job["id"], "reason": exc.reason})
                 continue
             batch = reply.body
-            if batch.get("name" if is_gemini else "id") != job["remote_id"]:
+            if batch.get("id") != job["remote_id"]:
                 ledger.defer_poll(job["id"], delay_seconds=600, error_code="remote_identity_mismatch")
                 _append_poll_event(artifacts, {"operation": "GET", "status": "remote_identity_mismatch",
                                                "remote_id": job["remote_id"]})
                 outcomes.append({"status": "remote_identity_mismatch", "job_id": job["id"]})
                 continue
-            remote_status = (normalize_gemini_batch_status(batch) if is_gemini
-                             else batch.get("status"))
+            remote_status = batch.get("status")
             if remote_status not in {"pending", "running", "validating", "in_progress",
                                      "finalizing", "cancelling", *TERMINAL}:
                 ledger.defer_poll(job["id"], delay_seconds=600, error_code="unknown_remote_status")
@@ -967,40 +970,26 @@ def poll_once(*, private_root: Path, client_factory=BatchClient,
                                                "remote_id": job["remote_id"]})
                 outcomes.append({"status": "unknown_remote_status", "job_id": job["id"]})
                 continue
-            batch_stats = ((batch.get("metadata") or {}).get("batchStats")
-                           if is_gemini and isinstance(batch.get("metadata"), dict) else
-                           batch.get("request_counts"))
+            batch_stats = batch.get("request_counts")
             _append_poll_event(artifacts, {"operation": "GET", "status": remote_status,
                                            "remote_id": job["remote_id"],
                                            "request_counts": batch_stats,
-                                           "usage": None if is_gemini else batch.get("usage")})
+                                           "usage": batch.get("usage")})
             if remote_status in TERMINAL:
                 write_private_json(artifacts / "batch_terminal.json", batch)
             else:
                 write_private_json(artifacts / "batch_progress.json", {
-                    "id": batch.get("name" if is_gemini else "id"), "status": remote_status,
+                    "id": batch.get("id"), "status": remote_status,
                     "request_counts": batch_stats,
-                    "usage": None if is_gemini else batch.get("usage"),
+                    "usage": batch.get("usage"),
                 })
             usage = batch.get("usage") or {}
-            usage_cost = _cost_micros(usage)
-            if is_gemini:
-                usage = {}
-                if remote_status == "completed":
-                    try:
-                        saved_request = json.loads((artifacts / "request.json").read_text(encoding="utf-8"))
-                        _, usage = extract_one_gemini_completed(
-                            batch, job["custom_id"], expected_batch_id=job["remote_id"],
-                            manifest=manifest, saved_request=saved_request)
-                    except (OSError, ValueError, json.JSONDecodeError):
-                        # Keep the full reservation when per-item usage is not
-                        # trustworthy; the raw terminal operation is retained.
-                        pass
-                usage_cost = estimate_usage_cost_microusd(usage)
-            ledger_status = "in_progress" if is_gemini and remote_status in {"pending", "running"} else remote_status
-            ledger.poll_result(job["id"], ledger_status, usage_cost_microusd=usage_cost,
+            # Progress receipts may be partial. Spend the full reservation
+            # until the remote batch is terminal and total billing is known.
+            usage_cost = _cost_micros(usage) if remote_status in TERMINAL else None
+            ledger.poll_result(job["id"], remote_status, usage_cost_microusd=usage_cost,
                                error_code=(None if remote_status == "completed" else
-                                           "google_batch_" + remote_status if is_gemini else
+                                           "gemini_batch_" + remote_status if is_gemini else
                                            str(batch.get("error") or "")[:120] or None))
             if remote_status == "completed":
                 try:

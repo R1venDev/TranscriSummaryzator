@@ -28,7 +28,6 @@ from pathlib import Path
 
 
 KEY_INFO_URL = "https://openrouter.ai/api/v1/key"
-GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1"
 KEY_ROLES = frozenset({"writer", "judge"})
 LABEL_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,80}$")
 HASH_RE = re.compile(r"^scrypt\$([0-9]+)\$([0-9]+)\$([0-9]+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$")
@@ -247,9 +246,6 @@ class CredentialStore:
             "limit_remaining": row["limit_remaining"], "limit_reset": row["limit_reset"],
             "usage_weekly": row["usage_weekly"], "created_at": row["created_at"],
             "updated_at": row["updated_at"],
-            "paid_tier_confirmed": bool(row["paid_tier_confirmed"]) if row["role"] == "judge" else None,
-            "project_scope": row["project_scope"] if row["role"] == "judge" else None,
-            "paid_tier_confirmed_at": row["paid_tier_confirmed_at"] if row["role"] == "judge" else None,
         }
 
     @staticmethod
@@ -338,32 +334,6 @@ class CredentialStore:
             self._event(db, actor, row, "enable" if enabled else "disable_new_dispatch")
         return self._public(row)
 
-    def set_judge_policy(self, identifier: str, *, paid_tier_confirmed: bool,
-                         project_scope: str | None, actor="admin"):
-        """Record an admin's paid-project attestation; metadata GET cannot prove it."""
-        if not isinstance(paid_tier_confirmed, bool):
-            raise CredentialError("Неверное подтверждение платного проекта")
-        if paid_tier_confirmed:
-            if (not isinstance(project_scope, str) or not re.fullmatch(
-                    r"[A-Za-z0-9][A-Za-z0-9._:-]{2,127}", project_scope)):
-                raise CredentialError("Укажите ID или уникальную метку оплачиваемого проекта")
-        else:
-            project_scope = None
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = self._required(db, identifier)
-            if row["role"] != "judge":
-                raise CredentialError("Подтверждение проекта доступно только для judge-ключа")
-            stamp = _utcnow()
-            db.execute("""UPDATE credentials SET paid_tier_confirmed=?,project_scope=?,
-                          paid_tier_confirmed_at=?,updated_at=? WHERE id=?""",
-                       (int(paid_tier_confirmed), project_scope,
-                        stamp if paid_tier_confirmed else None, stamp, identifier))
-            changed = self._required(db, identifier)
-            self._event(db, actor, changed,
-                        "confirm_judge_paid_project" if paid_tier_confirmed else "clear_judge_paid_project")
-        return self._public(changed)
-
     def delete(self, identifier: str, active_jobs: int, actor="admin"):
         if active_jobs:
             raise CredentialError("Ключ используется незавершённым запросом; сначала завершите его или отключите новые отправки")
@@ -380,8 +350,7 @@ class CredentialStore:
             raise CredentialError("Неизвестная роль ключа")
         with self._connect() as db:
             rows = db.execute("""SELECT * FROM credentials WHERE role=? AND enabled=1 AND status='ready'
-                                 AND (?='writer' OR (paid_tier_confirmed=1 AND project_scope IS NOT NULL))
-                                 ORDER BY priority,id""", (role, role)).fetchall()
+                                 ORDER BY priority,id""", (role,)).fetchall()
         return [self._public(r) for r in rows]
 
     def reveal_for_dispatch(self, identifier: str, version: int, *, role="writer") -> str:
@@ -390,8 +359,7 @@ class CredentialStore:
         with self._connect() as db:
             row = self._required(db, identifier)
         if (row["role"] != role or not row["enabled"] or row["status"] != "ready"
-                or row["version"] != version or (role == "judge" and
-                (not row["paid_tier_confirmed"] or not row["project_scope"]))):
+                or row["version"] != version):
             raise CredentialError("Ключ недоступен для новой отправки")
         try:
             return self.cipher.decrypt(row["ciphertext"]).decode("ascii")
@@ -417,33 +385,24 @@ class CredentialStore:
             token = self.cipher.decrypt(row["ciphertext"]).decode("ascii")
         except Exception as exc:
             raise CredentialError("Не удалось открыть ключ; проверьте master key") from exc
-        if row["role"] == "judge":
-            request = urllib.request.Request(GOOGLE_MODELS_URL, headers={
-                "x-goog-api-key": token, "Accept": "application/json"})
-        else:
-            request = urllib.request.Request(KEY_INFO_URL, headers={
-                "Authorization": "Bearer " + token, "Accept": "application/json"})
+        request = urllib.request.Request(KEY_INFO_URL, headers={
+            "Authorization": "Bearer " + token, "Accept": "application/json"})
         status, values = "error", {}
         try:
             with (opener or urllib.request.build_opener(_NoRedirect()).open)(request, timeout=8) as response:
-                max_bytes = 262144 if row["role"] == "judge" else 16384
+                max_bytes = 16384
                 raw = response.read(max_bytes + 1)
                 if len(raw) > max_bytes:
                     raise CredentialError("Слишком большой ответ проверки ключа")
                 payload = json.loads(raw)
-                if row["role"] == "judge":
-                    models = payload.get("models") if isinstance(payload, dict) else None
-                    if not isinstance(models, list) or not models:
-                        raise CredentialError("Список моделей Gemini недоступен")
-                    status = "ready"
-                else:
-                    data = payload.get("data") if isinstance(payload, dict) else None
-                    if not isinstance(data, dict):
-                        raise CredentialError("Неожиданный ответ проверки ключа")
-                    values = _safe_key_metadata(data)
-                    remaining = values.get("limit_remaining")
-                    status = ("error" if values.get("workspace_id") is None else
-                              "exhausted" if isinstance(remaining, (int, float)) and remaining <= 0 else "ready")
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if not isinstance(data, dict):
+                    raise CredentialError("Неожиданный ответ проверки ключа")
+                values = _safe_key_metadata(data)
+                remaining = values.get("limit_remaining")
+                status = ("error" if values.get("workspace_id") is None or
+                          data.get("is_management_key") is True or data.get("is_provisioning_key") is True else
+                          "exhausted" if isinstance(remaining, (int, float)) and remaining <= 0 else "ready")
         except urllib.error.HTTPError as exc:
             status = "invalid" if exc.code == 401 else "rate_limited" if exc.code == 429 else "error"
             exc.close()
@@ -489,10 +448,6 @@ def _rpc_main():
             result = store.set_order(body.get("ids"), role=body.get("role", "writer"))
         elif operation == "enabled":
             result = store.set_enabled(body.get("id"), body.get("enabled"))
-        elif operation == "judge_policy":
-            result = store.set_judge_policy(body.get("id"),
-                paid_tier_confirmed=body.get("paid_tier_confirmed"),
-                project_scope=body.get("project_scope"))
         elif operation == "delete":
             result = store.delete(body.get("id"), active_jobs=body.get("active_jobs", 0))
         else:
