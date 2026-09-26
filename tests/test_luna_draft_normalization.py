@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 from summary.luna_v1 import load_source, validate_document
 from summary.luna_v1.batch import Reply
-from summary.luna_v1.engine import (_advance_quality, _normalize_null_optional_field_sources,
+from summary.luna_v1.engine import (INVENTORY_V2_QUALITY_POLICY_VERSION,
+                                    _advance_quality, _normalize_null_optional_field_sources,
                                     poll_once, submit)
 from summary.luna_v1.ledger import Ledger
 from tests.test_gemini_engine import FakeGemini, TwoRoleStore
@@ -96,6 +97,7 @@ class DraftNormalizationTests(unittest.TestCase):
             FakeGemini.submissions = {}
             FakeGemini.mode = "no_patch"
             with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
+                 patch("summary.luna_v1.engine.QUALITY_POLICY_VERSION", INVENTORY_V2_QUALITY_POLICY_VERSION), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=writer_route), \
                  patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route):
                 started = submit(transcript_path=output / "transcript.json", output_dir=output,

@@ -98,6 +98,29 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(allowed.kind, "new")
             ledger.close()
 
+    def test_six_dispatches_are_shared_by_writer_and_all_quality_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            base = dict(source_sha256="b" * 64, output_dir=root / "meeting",
+                        credential_id="key-1", credential_version=1,
+                        workspace_id="workspace-1", max_cost_microusd=1_000)
+            parent = ledger.reserve(semantic_key="a" * 64, **base)
+            self.assertTrue(ledger.mark_submitting(parent.job_id))
+            for number, kind in enumerate(("inventory_1", "inventory_2",
+                                           "inventory_3", "reconcile", "verify"), 1):
+                child = ledger.reserve(semantic_key=f"{number:064x}", kind=kind,
+                                       root_job_id=parent.job_id, **base)
+                self.assertEqual(child.kind, "new")
+                self.assertTrue(ledger.mark_submitting(child.job_id))
+            blocked = ledger.reserve(semantic_key="f" * 64, kind="audit",
+                                     root_job_id=parent.job_id, **base)
+            self.assertEqual(blocked.reason, "logical_job_dispatch_limit")
+            self.assertEqual(ledger.db.execute(
+                "SELECT SUM(dispatches) FROM jobs WHERE root_job_id=?",
+                (parent.job_id,)).fetchone()[0], 6)
+            ledger.close()
+
     def test_exact_batch_shape_and_custom_id_result_mapping(self):
         opener = _Opener()
         reply = BatchClient("fictional-test-token", opener=opener).submit("summary-001", {"messages": [{"role": "user", "content": "тест"}]})

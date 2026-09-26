@@ -200,10 +200,20 @@ def validate_audit(report: dict, draft: dict, source_index: dict, *, mode: str =
             raise ValueError(f"{where}: invalid status")
         if finding["status"] == "repaired" and not indices:
             raise ValueError(f"{where}: repaired finding needs a patch")
+        if affected_targets and finding["status"] == "unresolved" and not indices:
+            # An unresolved issue may have no safe patch, but a patch aimed at
+            # that very claim may not be left orphaned by dropping its link.
+            if any((patch["section"], patch["index"]) in affected_targets
+                   and patch["operation"] in {"replace", "remove"}
+                   for patch in patches):
+                raise ValueError(f"{where}: affected claim has an unlinked corrective patch")
         # The kind names the source problem, not whether the draft asserts a
         # conflicting claim. For example an unknown executor can be a role
         # finding even when the draft prudently leaves assignee null.
-        if affected_targets:
+        # An unresolved source-linked defect must remain visible even when no
+        # mechanically safe correction exists. Require replacement/removal of
+        # every affected item only when the report claims it was repaired.
+        if affected_targets and (finding["status"] == "repaired" or indices):
             linked_patches = {
                 (patches[pointer]["section"], patches[pointer]["index"]): patches[pointer]
                 for pointer in indices

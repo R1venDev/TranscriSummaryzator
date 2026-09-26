@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from summary.gemini_v1.batch import MODEL as GEMINI_MODEL, RESOLVED_MODEL, Reply as GeminiReply
 from summary.gemini_v1.audit_v2 import GEMINI_AUDIT_SCHEMA_ID_V2
-from summary.luna_v1.engine import (_cost_micros, _finish_raw, _quality_contract,
+from summary.luna_v1.engine import (INVENTORY_V2_QUALITY_POLICY_VERSION,
+                                    _cost_micros, _finish_raw, _quality_contract,
                                     _quality_route, poll_once, submit)
 from summary.luna_v1.audit import AUDIT_SCHEMA, AUDIT_SCHEMA_ID
 from summary.luna_v1.ledger import Ledger
@@ -155,6 +156,7 @@ class GeminiEngineTests(unittest.TestCase):
             FakeGemini.mode = mode
             FakeGemini.remote_model = remote_model
             with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
+                 patch("summary.luna_v1.engine.QUALITY_POLICY_VERSION", INVENTORY_V2_QUALITY_POLICY_VERSION), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=writer_route), \
                  patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route):
                 started = submit(transcript_path=source, output_dir=output,

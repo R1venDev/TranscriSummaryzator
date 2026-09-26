@@ -14,6 +14,8 @@ WEEK_SECONDS = 7 * 24 * 60 * 60
 WEEK_CAP_MICROUSD = 1_000_000
 JOB_CAP_MICROUSD = 100_000
 MAX_DISPATCHES_PER_JOB = 6
+QUALITY_STAGE_KINDS = frozenset({"audit", "verify", "inventory_1", "inventory_2",
+                                 "inventory_3", "reconcile"})
 
 
 def usd_micros(amount: float) -> int:
@@ -137,7 +139,7 @@ class Ledger:
                 root_job_id: str | None = None) -> StartDecision:
         if not (0 < max_cost_microusd <= JOB_CAP_MICROUSD):
             return StartDecision("blocked", None, "job_budget_exceeded")
-        if kind not in {"summary", "audit", "verify"} or (kind == "summary") != (root_job_id is None):
+        if kind not in {"summary", *QUALITY_STAGE_KINDS} or (kind == "summary") != (root_job_id is None):
             raise ValueError("invalid summary stage identity")
         if len(semantic_key) != 64 or len(source_sha256) != 64:
             raise ValueError("invalid semantic identity")
@@ -173,6 +175,7 @@ class Ledger:
                             or manifest.get("quality_policy_version") not in {
                                 "gemini_openrouter_judge_repair_v2",
                                 "gemini_openrouter_judge_repair_v3_source_inventory",
+                                "gemini_openrouter_source_inventory_reconcile_v1",
                             }
                             or manifest.get("judge_workspace_id") != workspace_id
                             or not isinstance(workspace_id, str) or not workspace_id
@@ -185,6 +188,13 @@ class Ledger:
                 if group_cost + max_cost_microusd > JOB_CAP_MICROUSD:
                     self.db.execute("ROLLBACK")
                     return StartDecision("blocked", None, "logical_job_budget_exceeded")
+                group_dispatches = self.db.execute(
+                    "SELECT COALESCE(SUM(dispatches),0) FROM jobs WHERE root_job_id=?",
+                    (root_job_id,),
+                ).fetchone()[0]
+                if group_dispatches >= MAX_DISPATCHES_PER_JOB:
+                    self.db.execute("ROLLBACK")
+                    return StartDecision("blocked", None, "logical_job_dispatch_limit")
             spent = self.db.execute(
                 "SELECT COALESCE(SUM(CASE WHEN billed_microusd IS NULL THEN reserved_microusd ELSE billed_microusd END),0) "
                 "FROM jobs WHERE created_at>=? AND status NOT IN ('rejected_before_submit', 'cancelled_before_submit')",
@@ -225,7 +235,7 @@ class Ledger:
         return dict(row) if row else None
 
     def stage(self, root_job_id: str, kind: str) -> dict | None:
-        if kind not in {"audit", "verify"}:
+        if kind not in QUALITY_STAGE_KINDS:
             raise ValueError("invalid quality stage")
         row = self.db.execute("SELECT * FROM jobs WHERE root_job_id=? AND kind=? ORDER BY created_at LIMIT 1",
                               (root_job_id, kind)).fetchone()
@@ -246,7 +256,7 @@ class Ledger:
 
     def stage_completed(self, job_id: str, report_path: Path) -> None:
         changed = self.db.execute("UPDATE jobs SET status='stage_complete',accepted_document_path=?,updated_at=? "
-                                  "WHERE id=? AND kind IN ('audit','verify') AND status='completed_raw'",
+                                  "WHERE id=? AND kind IN ('audit','verify','inventory_1','inventory_2','inventory_3','reconcile') AND status='completed_raw'",
                                   (str(report_path), time.time(), job_id))
         if changed.rowcount != 1:
             raise ValueError("invalid stage completion transition")
@@ -320,8 +330,15 @@ class Ledger:
     def mark_submitting(self, job_id: str) -> bool:
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT status,dispatches FROM jobs WHERE id=?", (job_id,)).fetchone()
+            row = self.db.execute("SELECT status,dispatches,root_job_id FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not row or row["status"] != "reserved" or row["dispatches"] >= MAX_DISPATCHES_PER_JOB:
+                self.db.execute("ROLLBACK")
+                return False
+            group_dispatches = self.db.execute(
+                "SELECT COALESCE(SUM(dispatches),0) FROM jobs WHERE root_job_id=?",
+                (row["root_job_id"],),
+            ).fetchone()[0]
+            if group_dispatches >= MAX_DISPATCHES_PER_JOB:
                 self.db.execute("ROLLBACK")
                 return False
             self.db.execute("UPDATE jobs SET status='submitting',dispatches=dispatches+1,updated_at=? WHERE id=?", (time.time(), job_id))

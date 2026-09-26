@@ -114,6 +114,15 @@ class LunaContractTests(unittest.TestCase):
         self.assertIn("локально исправила ошибки", rendered["summary.md"])
         self.assertIn("не проходил повторную модельную проверку", rendered["summary.fragment.html"])
 
+    def test_reconciled_status_is_not_mislabeled_incomplete(self):
+        quality = {"status": "model_reconciled_checked",
+                   "unresolved_count": 0, "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertNotIn("Автоматическая смысловая проверка завершилась не полностью",
+                         rendered["summary.md"])
+        self.assertEqual(rendered["summary.json"]["quality_review"]["status"],
+                         "model_reconciled_checked")
+
     def test_html_escapes_model_and_source_and_links_actual_time(self):
         rendered = render_document(_document(), self.index)
         for name in ("summary.html", "summary.fragment.html"):
