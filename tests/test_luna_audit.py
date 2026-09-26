@@ -11,7 +11,7 @@ from pathlib import Path
 from summary.luna_v1 import SCHEMA_ID, load_source, validate_document
 from summary.luna_v1.audit import (
     AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID, apply_audit,
-    build_audit_input, source_windows, validate_audit,
+    build_audit_input, coverage_warnings, source_windows, validate_audit,
 )
 
 
@@ -230,7 +230,30 @@ class LunaAuditTests(unittest.TestCase):
             validate_audit(report, self.draft, self.index)
         report = self._report()
         report["coverage"][1]["finding_indices"] = []
-        with self.assertRaisesRegex(ValueError, "omission finding"):
+        self.assertIs(validate_audit(report, self.draft, self.index), report)
+        self.assertEqual(coverage_warnings(report, self.index), [
+            {"code": "coverage_without_omission", "coverage_index": 1}])
+
+    def test_verify_coverage_bookkeeping_does_not_discard_valid_correction(self):
+        report = self._report()
+        report["coverage"][1]["finding_indices"].append(1)
+        report["coverage"][2]["draft_coverage"] = "partial"
+        report["findings"][1]["kind"] = "number"
+        original = copy.deepcopy(report)
+        self.assertIs(validate_audit(report, self.draft, self.index, mode="verify"), report)
+        self.assertEqual(coverage_warnings(report, self.index), [
+            {"code": "finding_outside_window", "coverage_index": 1, "finding_index": 1},
+            {"code": "coverage_without_omission", "coverage_index": 2},
+        ])
+        revised, unresolved = apply_audit(self.draft, report, self.index, mode="verify")
+        self.assertEqual(revised["tasks"][1]["title"], "Проверить Y")
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(report, original)
+
+    def test_coverage_bookkeeping_still_requires_existing_finding_index(self):
+        report = self._report()
+        report["coverage"][0]["finding_indices"] = [99]
+        with self.assertRaisesRegex(ValueError, "unknown finding index"):
             validate_audit(report, self.draft, self.index)
 
     def test_can_repair_parseable_structurally_invalid_draft(self):

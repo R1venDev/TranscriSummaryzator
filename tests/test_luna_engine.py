@@ -189,6 +189,48 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(json.loads((generation / "run_manifest.json").read_text())
                              ["quality_review"]["status"], "audit_unavailable")
 
+    def test_inconsistent_audit_coverage_cannot_publish_as_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outputs" / "meeting"
+            output.mkdir(parents=True)
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "01.01.2030 — Синтетическая встреча.mkv", "duration_seconds": 8,
+                "speakers": {"p1": "А"},
+                "utterances": [{"start": 0.2, "end": 7.3, "speaker": "p1",
+                                "text": "Предлагаю проверить X или Y, не оба."}],
+            }, ensure_ascii=False))
+            private = root / "state" / "summary_private"
+            route = SimpleNamespace(
+                reserve_microusd=lambda payload, **kwargs: 20_000,
+                workspace_id="synthetic-workspace",
+                prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
+                cache_write_usd_per_token="0.0000000625", request_usd="0",
+            )
+
+            def inconsistent_coverage(_payload, report):
+                report["coverage"][0]["draft_coverage"] = "missing"
+                return report
+
+            FakeClient.submit_calls = 0
+            FakeClient.report_factory = inconsistent_coverage
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+                submit(transcript_path=source, output_dir=output,
+                       private_root=private, client_factory=FakeClient)
+            for expected in ("draft_ready", "stage_complete"):
+                arm_poll(private)
+                events = fake_poll(private, route)
+                self.assertIn(expected, {event["status"] for event in events})
+            self.assertEqual(FakeClient.submit_calls, 2)
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            review = json.loads((generation / "run_manifest.json").read_text())["quality_review"]
+            self.assertEqual(review["status"], "coverage_incomplete")
+            self.assertEqual(review["coverage_warning_count"], 1)
+            self.assertIn("полнота проверки не подтверждена", (generation / "summary.md").read_text())
+
     def test_omitted_action_is_added_and_verify_downgrades_uncertain_claim_before_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -15,7 +15,7 @@ from .contract import SCHEMA_ID, validate_document
 
 
 AUDIT_SCHEMA_ID = "luna_summary_audit_v1"
-AUDIT_PROMPT_PATH = Path(__file__).with_name("prompt_audit_v1.md")
+AUDIT_PROMPT_PATH = Path(__file__).with_name("prompt_audit_v2.md")
 AUDIT_SCHEMA = json.loads(Path(__file__).with_name("output_schema_audit_v1.json").read_text(encoding="utf-8"))
 _ARRAY_SECTIONS = ("main", "timecodes", "tasks", "questions", "technical", "ideas", "verification", "chapters")
 _SECTIONS = ("meeting",) + _ARRAY_SECTIONS
@@ -226,7 +226,6 @@ def validate_audit(report: dict, draft: dict, source_index: dict, *, mode: str =
     windows = source_windows(source_index)
     if not isinstance(coverage, list) or len(coverage) != len(windows):
         raise ValueError("audit: one coverage row is required for each source window")
-    all_ids = list(source_index["by_id"])
     for number, (row, expected) in enumerate(zip(coverage, windows)):
         where = f"coverage[{number}]"
         _exact_keys(row, {"window_id", "start_id", "end_id", "salient", "draft_coverage", "finding_indices"}, where)
@@ -239,14 +238,37 @@ def validate_audit(report: dict, draft: dict, source_index: dict, *, mode: str =
         links = row["finding_indices"]
         if not isinstance(links, list) or len(set(_index(item, f"{where}.finding_indices") for item in links)) != len(links):
             raise ValueError(f"{where}: invalid finding indices")
-        members = set(all_ids[all_ids.index(expected["start_id"]):all_ids.index(expected["end_id"]) + 1])
         for linked in links:
-            if linked >= len(findings) or not (set(findings[linked]["source_ids"]) & members):
-                raise ValueError(f"{where}: finding is not supported within its window")
-        if row["draft_coverage"] in {"partial", "missing"} and not any(
-                findings[linked]["kind"] == "omission" for linked in links):
-            raise ValueError(f"{where}: partial or missing coverage needs an omission finding")
+            if linked >= len(findings):
+                raise ValueError(f"{where}: unknown finding index")
+        # Window links and coverage labels are model bookkeeping. They do not
+        # drive patches or the published document, so a mistaken association
+        # must not discard otherwise valid source-referenced corrections. Call
+        # coverage_warnings after validation to retain these diagnostics.
     return report
+
+
+def coverage_warnings(report: dict, source_index: dict) -> list[dict]:
+    """Describe nonfatal coverage bookkeeping errors in a validated report.
+
+    Call after validate_audit; finding source IDs and patch targets are already
+    checked there. This function never alters the model's report.
+    """
+    windows = source_windows(source_index)
+    all_ids = list(source_index["by_id"])
+    warnings = []
+    for number, (row, expected) in enumerate(zip(report["coverage"], windows)):
+        members = set(all_ids[all_ids.index(expected["start_id"]):all_ids.index(expected["end_id"]) + 1])
+        for linked in row["finding_indices"]:
+            if not (set(report["findings"][linked]["source_ids"]) & members):
+                warnings.append({"code": "finding_outside_window", "coverage_index": number,
+                                 "finding_index": linked})
+        if row["draft_coverage"] in {"partial", "missing"} and not any(
+                report["findings"][linked]["kind"] == "omission"
+                and set(report["findings"][linked]["source_ids"]) & members
+                for linked in row["finding_indices"]):
+            warnings.append({"code": "coverage_without_omission", "coverage_index": number})
+    return warnings
 
 
 def _annotate_unresolved(document: dict, findings: list[dict]) -> None:

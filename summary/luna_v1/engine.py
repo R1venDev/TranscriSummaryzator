@@ -19,7 +19,8 @@ from scripts.summary_credentials import CredentialError, CredentialStore, creden
 
 from . import PROMPT_PATH, SCHEMA, SCHEMA_ID, load_source, validate_document
 from .audit import (AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID,
-                    apply_audit, build_audit_input, validate_audit)
+                    apply_audit, build_audit_input, coverage_warnings,
+                    validate_audit)
 from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_completed, valid_batch_id
 from .ledger import Ledger, usd_micros, write_private_json
 from .publication import publish_document
@@ -29,7 +30,7 @@ from .tasks import RevisionConflict, TaskStore
 
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
 REASONING_EFFORT = "medium"
-QUALITY_POLICY_VERSION = "luna_auto_audit_v1"
+QUALITY_POLICY_VERSION = "luna_auto_audit_v2"
 QUALITY_CREDENTIAL_WAIT_SECONDS = 30 * 60
 QUALITY_BATCH_WAIT_SECONDS = 26 * 60 * 60
 
@@ -356,6 +357,9 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     if _sha(_json_bytes(target)) != request_manifest["target_document_sha256"]:
         raise ValueError("audit_target_changed")
     validate_audit(document, target, source_index, mode=job["kind"])
+    warnings = coverage_warnings(document, source_index)
+    if warnings:
+        write_private_json(artifacts / "coverage_warnings.json", {"warnings": warnings})
     report_file = artifacts / "audit_report.json"
     write_private_json(report_file, document)
     ledger.stage_completed(job["id"], report_file)
@@ -515,8 +519,19 @@ def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: 
     request_manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
     audit = ledger.stage(root["id"], "audit")
     verify = ledger.stage(root["id"], "verify")
+    coverage_warning_count = 0
+    for stage in (audit, verify):
+        if stage is None:
+            continue
+        warning_file = Path(stage["artifact_dir"]) / "coverage_warnings.json"
+        if warning_file.exists():
+            coverage_warning_count += len(json.loads(warning_file.read_text(encoding="utf-8"))["warnings"])
+    if coverage_warning_count and status == "checked":
+        status = "coverage_incomplete"
+        reason = "coverage_report_inconsistent"
     quality_review = {
         "status": status, "unresolved_count": unresolved_count,
+        "coverage_warning_count": coverage_warning_count,
         "reason": reason, "audit_job_id": audit["id"] if audit else None,
         "verify_job_id": verify["id"] if verify else None,
     }

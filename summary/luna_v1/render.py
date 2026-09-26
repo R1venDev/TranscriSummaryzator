@@ -222,12 +222,17 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
         count = quality_review.get("unresolved_count", 0)
         if status == "unresolved":
             notice = f"Автоматическая проверка оставила {count} вопрос(ов); они отмечены в разделе «Требует проверки источника»."
+        elif status == "coverage_incomplete":
+            notice = "Автоматический отчёт о покрытии содержит несогласованные строки; полнота проверки не подтверждена."
         elif status == "postverify_corrected_unchecked":
             notice = "После итоговой проверки внесено ещё одно адресное исправление; локально проверены его формат и ссылки, но смысл повторно не проверялся Luna."
             if count:
                 notice += f" Осталось {count} вопрос(ов) в разделе «Требует проверки источника»."
         else:
             notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
+        warning_count = quality_review.get("coverage_warning_count", 0)
+        if warning_count and status != "coverage_incomplete":
+            notice += f" В отчёте о покрытии есть {warning_count} несогласованных строк(и); полнота проверки не подтверждена."
         md.extend([f"**Качество конспекта:** {_md(notice)}", ""])
         fragment.append(f"<p class=\"summary-quality-notice\"><strong>Качество конспекта:</strong> {_html(notice)}</p>")
 
