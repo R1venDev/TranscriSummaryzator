@@ -107,6 +107,13 @@ class LunaContractTests(unittest.TestCase):
         self.assertIsNone(rendered["tasks.json"][0]["assignee"])
         self.assertEqual(rendered["summary.json"]["source_sha256"], self.sha)
 
+    def test_source_reviewed_recovery_is_visibly_unverified(self):
+        quality = {"status": "source_reviewed_local_correction_unverified",
+                   "unresolved_count": 0, "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertIn("локально исправила ошибки", rendered["summary.md"])
+        self.assertIn("не проходил повторную модельную проверку", rendered["summary.fragment.html"])
+
     def test_html_escapes_model_and_source_and_links_actual_time(self):
         rendered = render_document(_document(), self.index)
         for name in ("summary.html", "summary.fragment.html"):

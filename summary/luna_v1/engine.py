@@ -10,6 +10,7 @@ import json
 import math
 import os
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from email.utils import parsedate_to_datetime
@@ -52,6 +53,44 @@ def _json_bytes(value) -> bytes:
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _normalize_null_optional_field_sources(document: dict, source_index: dict) -> tuple[dict, list[dict]]:
+    """Drop only known, out-of-task evidence for an unset optional task field.
+
+    This changes source metadata, never task content or a populated field. An
+    unknown source ID is left in place so normal validation still rejects it.
+    """
+    tasks = document.get("tasks")
+    if not isinstance(tasks, list):
+        return document, []
+    normalized = deepcopy(document)
+    removals = []
+    known = source_index.get("by_id", {})
+    for number, task in enumerate(normalized["tasks"]):
+        if not isinstance(task, dict):
+            continue
+        source_ids = task.get("source_ids")
+        field_sources = task.get("field_sources")
+        if (not isinstance(source_ids, list)
+                or not all(isinstance(source_id, str) for source_id in source_ids)
+                or not isinstance(field_sources, dict)):
+            continue
+        task_sources = set(source_ids)
+        for field in ("assignee", "due", "priority", "recipient"):
+            references = field_sources.get(field)
+            if task.get(field) is not None or not isinstance(references, list):
+                continue
+            if not all(isinstance(source_id, str) for source_id in references):
+                continue
+            removed = [source_id for source_id in references
+                       if source_id not in task_sources and source_id in known]
+            if removed:
+                field_sources[field] = [source_id for source_id in references
+                                        if source_id in task_sources or source_id not in known]
+                removals.append({"task_index": number, "field": field,
+                                 "removed_source_ids": removed})
+    return (normalized, removals) if removals else (document, [])
 
 
 def _quality_route(manifest: dict) -> str:
@@ -406,8 +445,27 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
         except (ValueError, KeyError, TypeError) as exc:
             # A parseable draft can still be repaired by the separate audit.
             # Preserve the exact failure and never treat it as an accepted hit.
-            write_private_json(artifacts / "draft_validation.json", {
-                "status": "invalid", "reason": type(exc).__name__ + ":" + str(exc)[:200]})
+            original_reason = type(exc).__name__ + ":" + str(exc)[:200]
+            normalized, removals = _normalize_null_optional_field_sources(document, source_index)
+            if removals:
+                write_private_json(artifacts / "draft_normalization.json", {
+                    "rule": "known_orphan_source_for_null_optional_task_field_v1",
+                    "original_document_sha256": _sha(_json_bytes(document)),
+                    "normalized_document_sha256": _sha(_json_bytes(normalized)),
+                    "original_validation_error": original_reason,
+                    "removals": removals,
+                })
+                document = normalized
+            try:
+                validate_document(document, source_index)
+            except (ValueError, KeyError, TypeError) as current_exc:
+                write_private_json(artifacts / "draft_validation.json", {
+                    "status": "invalid", "original_reason": original_reason,
+                    "reason": type(current_exc).__name__ + ":" + str(current_exc)[:200]})
+            else:
+                write_private_json(artifacts / "draft_validation.json", {
+                    "status": "normalized", "original_reason": original_reason,
+                    "normalization": "draft_normalization.json"})
         write_private_json(artifacts / "draft_document.json", document)
         ledger.mark_quality_pending(job["id"])
         return {"status": "draft_ready", "job_id": job["id"],
@@ -833,9 +891,16 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
     try:
         revised, unresolved = apply_audit(draft, report, source_index, mode="audit")
     except (ValueError, json.JSONDecodeError) as exc:
-        write_private_json(artifacts / "audit_apply_error.json", {"reason": str(exc)[:200]})
+        failure_origin = "invalid_audit_patch"
+        if not report.get("patches"):
+            try:
+                validate_document(draft, source_index)
+            except (ValueError, KeyError, TypeError):
+                failure_origin = "invalid_draft_unrepaired"
+        write_private_json(artifacts / "audit_apply_error.json", {
+            "reason": str(exc)[:200], "failure_origin": failure_origin})
         return _finalize_quality(ledger, root, draft, source_index,
-            status="audit_unavailable", reason="invalid_audit_patch")
+            status="audit_unavailable", reason=failure_origin)
     write_private_json(artifacts / "revised_document.json", revised)
     if not report["patches"]:
         return _finalize_quality(ledger, root, revised, source_index,

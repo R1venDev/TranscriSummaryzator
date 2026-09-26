@@ -198,7 +198,10 @@ class SavedAuditRecoveryTests(unittest.TestCase):
         class FakeStore:
             path = self.private / "credentials.sqlite3"
 
-            def dispatch_candidates(self):
+            def dispatch_candidates(self, *, role="writer"):
+                if role == "judge":
+                    return []
+                assert role == "writer"
                 return [{"id": "fake-credential", "version": 1,
                          "workspace_id": "synthetic-workspace"}]
 
