@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import unittest
 import urllib.error
@@ -176,6 +177,9 @@ class GeminiBatchTests(unittest.TestCase):
                                                         "response": generated}]}}
         self.assertEqual(extract_one_completed(direct_lro, "audit-001")[0], generated)
         self.assertEqual(normalize_batch_status({"done": False, "metadata": {"state": "BATCH_STATE_RUNNING"}}), "running")
+        self.assertEqual(normalize_batch_status({"done": False, "metadata": {"state": "BATCH_STATE_SUCCEEDED"}}), "running")
+        self.assertEqual(normalize_batch_status({"done": True, "metadata": {"state": "BATCH_STATE_RUNNING"},
+                                                 "response": direct_lro["response"]}), "completed")
         self.assertEqual(normalize_batch_status({"done": True, "error": {"code": 13}}), "failed")
         with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
             extract_one_completed(lro, "wrong")
@@ -183,6 +187,46 @@ class GeminiBatchTests(unittest.TestCase):
             {"metadata": {"key": "audit-001"}, "response": generated})
         with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
             extract_one_completed(lro, "audit-001")
+
+    def test_single_inline_result_without_metadata_requires_saved_request_proof(self):
+        request = canonical_request(_request())
+        custom_id = "audit-001"
+        batch_id = "batches/abc123"
+        manifest = {
+            "inline_request_count": 1,
+            "custom_id": custom_id,
+            "request_sha256": hashlib.sha256(json.dumps(
+                request, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+        }
+        result = {"candidates": [], "usageMetadata": {"promptTokenCount": 100}}
+        batch = {"name": batch_id, "done": True,
+                 "response": {"output": {"inlinedResponses": {"inlinedResponses": [
+                     {"response": result}]}}}}
+        with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
+            extract_one_completed(batch, custom_id)
+        self.assertIs(extract_one_completed(
+            batch, custom_id, expected_batch_id=batch_id,
+            manifest=manifest, saved_request=request)[0], result)
+        for changed in (
+            {"expected_batch_id": "batches/other", "manifest": manifest,
+             "saved_request": request},
+            {"expected_batch_id": batch_id, "manifest": dict(manifest, inline_request_count=2),
+             "saved_request": request},
+            {"expected_batch_id": batch_id, "manifest": manifest,
+             "saved_request": dict(request, store=True)},
+        ):
+            with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
+                extract_one_completed(batch, custom_id, **changed)
+        batch["response"]["output"]["inlinedResponses"]["inlinedResponses"].append({"response": result})
+        with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
+            extract_one_completed(batch, custom_id, expected_batch_id=batch_id,
+                                  manifest=manifest, saved_request=request)
+        batch["response"]["output"]["inlinedResponses"]["inlinedResponses"] = [
+            {"metadata": {"key": "other"}, "response": result}]
+        with self.assertRaisesRegex(ValueError, "custom_id_mismatch"):
+            extract_one_completed(batch, custom_id, expected_batch_id=batch_id,
+                                  manifest=manifest, saved_request=request)
 
     def test_unknown_usage_is_not_zero_and_cache_discount_not_assumed(self):
         self.assertIsNone(estimate_usage_cost_microusd(None))

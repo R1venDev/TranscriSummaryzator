@@ -328,7 +328,10 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
         if (submission.get("name") != job["remote_id"]
                 or batch.get("name") != job["remote_id"]):
             raise ValueError("gemini_batch_submission_identity_mismatch")
-        body, usage = extract_one_gemini_completed(batch, job["custom_id"])
+        saved_request = json.loads((artifacts / "request.json").read_text(encoding="utf-8"))
+        body, usage = extract_one_gemini_completed(
+            batch, job["custom_id"], expected_batch_id=job["remote_id"],
+            manifest=request_manifest, saved_request=saved_request)
         version = body.get("modelVersion")
         if not isinstance(version, str) or not version.startswith(GEMINI_MODEL):
             raise ValueError("gemini_response_model_mismatch")
@@ -679,6 +682,7 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             "semantic_key": semantic_key, "source_sha256": source_sha,
             "target_document_sha256": target_sha,
             "request_sha256": _sha(request_bytes),
+            "custom_id": stage["custom_id"], "inline_request_count": 1,
             "prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
             "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
             "credential_id": stage["credential_id"],
@@ -984,8 +988,11 @@ def poll_once(*, private_root: Path, client_factory=BatchClient,
                 usage = {}
                 if remote_status == "completed":
                     try:
-                        _, usage = extract_one_gemini_completed(batch, job["custom_id"])
-                    except ValueError:
+                        saved_request = json.loads((artifacts / "request.json").read_text(encoding="utf-8"))
+                        _, usage = extract_one_gemini_completed(
+                            batch, job["custom_id"], expected_batch_id=job["remote_id"],
+                            manifest=manifest, saved_request=saved_request)
+                    except (OSError, ValueError, json.JSONDecodeError):
                         # Keep the full reservation when per-item usage is not
                         # trustworthy; the raw terminal operation is retained.
                         pass

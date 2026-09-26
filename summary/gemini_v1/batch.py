@@ -9,6 +9,7 @@ https://ai.google.dev/gemini-api/docs/batch-api (v1beta, September 2026).
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import urllib.error
 import urllib.request
@@ -216,15 +217,18 @@ def normalize_batch_status(body: dict[str, Any]) -> str:
     """Read both documented REST Operation and BatchJob view state shapes."""
     if not isinstance(body, dict):
         return "unknown"
+    if body.get("done") is False:
+        # An Operation cannot contain its response until done=true. Its
+        # metadata may already report a terminal batch state while the final
+        # operation result is still being assembled; keep polling for it.
+        return "running"
     if body.get("done") is True and isinstance(body.get("error"), dict):
         return "failed"
+    if body.get("done") is True and _inlined_items(body) is not None:
+        return "completed"
     for container in (body, body.get("metadata"), body.get("response")):
         if isinstance(container, dict) and container.get("state") in _STATES:
             return _STATES[container["state"]]
-    # A finished LRO with a response may have no state; require a recognized
-    # inline output before treating it as complete.
-    if body.get("done") is True and _inlined_items(body) is not None:
-        return "completed"
     return "unknown"
 
 
@@ -251,7 +255,12 @@ def _inlined_items(body: dict[str, Any]) -> list[Any] | None:
     return None
 
 
-def extract_one_completed(batch: dict[str, Any], custom_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def extract_one_completed(
+    batch: dict[str, Any], custom_id: str, *,
+    expected_batch_id: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    saved_request: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return matched raw GenerateContentResponse and its usageMetadata."""
     if normalize_batch_status(batch) != "completed":
         raise ValueError("batch_not_completed")
@@ -263,9 +272,25 @@ def extract_one_completed(batch: dict[str, Any], custom_id: str) -> tuple[dict[s
     matches = [item for item in items if isinstance(item, dict)
                and isinstance(item.get("metadata"), dict)
                and item["metadata"].get("key") == custom_id]
-    if len(matches) != 1:
+    if len(matches) == 1:
+        item = matches[0]
+    elif (len(matches) == 0 and len(items) == 1 and isinstance(items[0], dict)
+          and items[0].get("metadata") is None
+          and valid_batch_id(expected_batch_id)
+          and batch.get("name") == expected_batch_id
+          and isinstance(manifest, dict) and isinstance(saved_request, dict)
+          and manifest.get("inline_request_count") == 1
+          and manifest.get("custom_id") == custom_id
+          and manifest.get("request_sha256") == hashlib.sha256(
+              json.dumps(saved_request, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+          ).hexdigest()):
+        # Google has returned an inline response without the request metadata.
+        # One persisted request, one result and the exact remote identity make
+        # positional recovery unambiguous; never use this for a multi-item job.
+        item = items[0]
+    else:
         raise ValueError("batch_custom_id_mismatch")
-    item = matches[0]
     if item.get("error") is not None:
         raise ValueError("batch_item_failed")
     response = item.get("response")

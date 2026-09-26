@@ -82,7 +82,7 @@ class FakeGemini:
         return GeminiReply(200, {"name": name, "done": True,
             "metadata": {"state": "JOB_STATE_SUCCEEDED", "batchStats": {"requestCount": "1"}},
             "response": {"inlinedResponses": {"inlinedResponses": [{
-                "metadata": {"key": custom_id}, "response": response}]}}})
+                "response": response}]}}})
 
     def delete(self, name):
         return GeminiReply(204, {})
