@@ -34,7 +34,8 @@ def _bytes(name: str, value) -> bytes:
 def _verify_staged_target(target: Path, *, generation_id: str, document: dict,
                           source_sha: str, semantic_key: str, job_id: str,
                           remote_batch_id: str, credential_id: str,
-                          prompt_sha256: str, schema_sha256: str) -> dict:
+                          prompt_sha256: str, schema_sha256: str,
+                          quality_review: dict | None = None) -> dict:
     """A prior crash may have sealed the target before switching the pointer."""
     manifest = json.loads((target / "generation_manifest.json").read_text(encoding="utf-8"))
     digests = manifest.get("artifact_sha256")
@@ -59,6 +60,8 @@ def _verify_staged_target(target: Path, *, generation_id: str, document: dict,
     }
     if any(run.get(key) != value for key, value in expected_run.items()):
         raise ValueError("staged_generation_identity_mismatch")
+    if run.get("quality_review") != quality_review:
+        raise ValueError("staged_generation_quality_mismatch")
     if hashlib.sha256(_bytes("model_document.json", document)).hexdigest() != digests["model_document.json"]:
         raise ValueError("staged_generation_document_mismatch")
     return manifest
@@ -88,13 +91,14 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
                      prompt_sha256: str, schema_sha256: str,
                      effective_tasks: list[dict] | None = None,
                      generation_id: str | None = None,
+                     quality_review: dict | None = None,
                      before_pointer: Callable[[], None] | None = None) -> tuple[str, Path]:
     """Commit a complete generation or leave the old pointer untouched."""
     validate_document(document, source_index)
     original_sha = source_index["source_sha256"]
     if hashlib.sha256(Path(transcript_path).read_bytes()).hexdigest() != original_sha:
         raise ValueError("source_changed_before_publication")
-    rendered = render_document(document, source_index, effective_tasks)
+    rendered = render_document(document, source_index, effective_tasks, quality_review)
     target_parent = Path(output_dir) / "summary_generations"
     target_parent.mkdir(parents=True, exist_ok=True)
     generation_id = generation_id or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
@@ -106,7 +110,8 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
         staged = _verify_staged_target(target, generation_id=generation_id, document=document,
             source_sha=original_sha, semantic_key=semantic_key, job_id=job_id,
             remote_batch_id=remote_batch_id, credential_id=credential_id,
-            prompt_sha256=prompt_sha256, schema_sha256=schema_sha256)
+            prompt_sha256=prompt_sha256, schema_sha256=schema_sha256,
+            quality_review=quality_review)
         pointer_path = Path(output_dir) / "summary_current.json"
         if pointer_path.exists():
             current = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -145,6 +150,7 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
             "credential_id": credential_id,
             "prompt_sha256": prompt_sha256,
             "schema_sha256": schema_sha256,
+            "quality_review": quality_review,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         rendered["run_manifest.json"] = run_manifest

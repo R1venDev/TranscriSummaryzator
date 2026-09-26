@@ -187,7 +187,8 @@ def _transcript_html(index: dict) -> str:
     )
 
 
-def render_document(document: dict, source_index: dict, effective_tasks: list[dict] | None = None) -> dict:
+def render_document(document: dict, source_index: dict, effective_tasks: list[dict] | None = None,
+                    quality_review: dict | None = None) -> dict:
     """Return md/html/json/tasks built from a single effective state.
 
     ``effective_tasks`` is the backend's versioned projection of user edits.
@@ -202,6 +203,8 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
     effective["meeting"]["participants_by_transcript"] = list(source_index.get("participants", []))
     effective["meeting"]["unattributed_speech"] = bool(source_index.get("unattributed_speech"))
     effective["source_sha256"] = source_index["source_sha256"]
+    if quality_review is not None:
+        effective["quality_review"] = deepcopy(quality_review)
 
     md: list[str] = []
     fragment: list[str] = []
@@ -214,6 +217,24 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
     participants = ", ".join(people) if people else "Не определены"
     md.extend([f"**Участники по транскрипции:** {_md(participants)}", ""])
     fragment.append(f"<p><strong>Участники по транскрипции:</strong> {_html(participants)}</p>")
+    if quality_review is not None and quality_review.get("status") != "checked":
+        status = quality_review.get("status")
+        count = quality_review.get("unresolved_count", 0)
+        if status == "unresolved":
+            notice = f"Автоматическая проверка оставила {count} вопрос(ов); они отмечены в разделе «Требует проверки источника»."
+        elif status == "coverage_incomplete":
+            notice = "Автоматический отчёт о покрытии содержит несогласованные строки; полнота проверки не подтверждена."
+        elif status == "postverify_corrected_unchecked":
+            notice = "После итоговой проверки внесено ещё одно адресное исправление; локально проверены его формат и ссылки, но смысл повторно не проверялся Luna."
+            if count:
+                notice += f" Осталось {count} вопрос(ов) в разделе «Требует проверки источника»."
+        else:
+            notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
+        warning_count = quality_review.get("coverage_warning_count", 0)
+        if warning_count and status != "coverage_incomplete":
+            notice += f" В отчёте о покрытии есть {warning_count} несогласованных строк(и); полнота проверки не подтверждена."
+        md.extend([f"**Качество конспекта:** {_md(notice)}", ""])
+        fragment.append(f"<p class=\"summary-quality-notice\"><strong>Качество конспекта:</strong> {_html(notice)}</p>")
 
     def heading(text: str) -> None:
         md.extend([f"## {text}", ""])

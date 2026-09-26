@@ -86,7 +86,9 @@ class Ledger:
             next_poll_at REAL,
             error_code TEXT,
             accepted_document_path TEXT,
-            generation_id TEXT
+            generation_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'summary',
+            root_job_id TEXT
           );
           CREATE TABLE IF NOT EXISTS consumers (
             semantic_key TEXT NOT NULL,
@@ -113,6 +115,12 @@ class Ledger:
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE consumers ADD COLUMN {name} {definition}")
+            job_columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+            if "kind" not in job_columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'summary'")
+            if "root_job_id" not in job_columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN root_job_id TEXT")
+            self.db.execute("UPDATE jobs SET root_job_id=id WHERE root_job_id IS NULL")
             self.db.execute("COMMIT")
         except Exception:
             if self.db.in_transaction:
@@ -125,9 +133,12 @@ class Ledger:
 
     def reserve(self, *, semantic_key: str, source_sha256: str, output_dir: Path,
                 credential_id: str, credential_version: int, workspace_id: str | None,
-                max_cost_microusd: int) -> StartDecision:
+                max_cost_microusd: int, kind: str = "summary",
+                root_job_id: str | None = None) -> StartDecision:
         if not (0 < max_cost_microusd <= JOB_CAP_MICROUSD):
             return StartDecision("blocked", None, "job_budget_exceeded")
+        if kind not in {"summary", "audit", "verify"} or (kind == "summary") != (root_job_id is None):
+            raise ValueError("invalid summary stage identity")
         if len(semantic_key) != 64 or len(source_sha256) != 64:
             raise ValueError("invalid semantic identity")
         now = time.time()
@@ -135,13 +146,27 @@ class Ledger:
         try:
             prior = self.db.execute("SELECT * FROM jobs WHERE semantic_key=?", (semantic_key,)).fetchone()
             if prior:
-                self.db.execute("""INSERT INTO consumers (semantic_key,output_dir,updated_at) VALUES (?,?,?)
-                    ON CONFLICT(semantic_key,output_dir) DO UPDATE SET updated_at=excluded.updated_at""",
-                    (semantic_key, str(output_dir), now))
+                if kind == "summary":
+                    self.db.execute("""INSERT INTO consumers (semantic_key,output_dir,updated_at) VALUES (?,?,?)
+                        ON CONFLICT(semantic_key,output_dir) DO UPDATE SET updated_at=excluded.updated_at""",
+                        (semantic_key, str(output_dir), now))
                 self.db.execute("COMMIT")
                 if prior["status"] == "accepted":
                     return StartDecision("accepted", prior["id"])
                 return StartDecision("pending", prior["id"], prior["status"])
+            if root_job_id is not None:
+                root = self.db.execute("SELECT * FROM jobs WHERE id=?", (root_job_id,)).fetchone()
+                if (root is None or root["kind"] != "summary"
+                        or root["source_sha256"] != source_sha256
+                        or root["workspace_id"] != workspace_id):
+                    raise ValueError("invalid quality root or workspace")
+                group_cost = self.db.execute("""SELECT COALESCE(SUM(
+                    CASE WHEN billed_microusd IS NULL THEN reserved_microusd ELSE billed_microusd END),0)
+                    FROM jobs WHERE root_job_id=? AND status NOT IN
+                    ('rejected_before_submit','cancelled_before_submit')""", (root_job_id,)).fetchone()[0]
+                if group_cost + max_cost_microusd > JOB_CAP_MICROUSD:
+                    self.db.execute("ROLLBACK")
+                    return StartDecision("blocked", None, "logical_job_budget_exceeded")
             spent = self.db.execute(
                 "SELECT COALESCE(SUM(CASE WHEN billed_microusd IS NULL THEN reserved_microusd ELSE billed_microusd END),0) "
                 "FROM jobs WHERE created_at>=? AND status NOT IN ('rejected_before_submit', 'cancelled_before_submit')",
@@ -151,18 +176,20 @@ class Ledger:
                 self.db.execute("ROLLBACK")
                 return StartDecision("blocked", None, "weekly_budget_exceeded")
             job_id = uuid.uuid4().hex
+            group_id = root_job_id or job_id
             artifact_dir = self.root / "jobs" / job_id
-            custom_id = "summary-" + job_id
+            custom_id = kind + "-" + job_id
             self.db.execute("""INSERT INTO jobs
               (id,semantic_key,source_sha256,output_dir,artifact_dir,status,
                credential_id,credential_version,workspace_id,custom_id,remote_id,
-               reserved_microusd,billed_microusd,dispatches,created_at,updated_at)
-              VALUES (?,?,?,?,?,'reserved',?,?,?,?,NULL,?,NULL,0,?,?)""",
+               reserved_microusd,billed_microusd,dispatches,created_at,updated_at,kind,root_job_id)
+              VALUES (?,?,?,?,?,'reserved',?,?,?,?,NULL,?,NULL,0,?,?,?,?)""",
               (job_id, semantic_key, source_sha256, str(output_dir), str(artifact_dir),
                credential_id, credential_version, workspace_id, custom_id,
-               max_cost_microusd, now, now))
-            self.db.execute("INSERT INTO consumers (semantic_key,output_dir,updated_at) VALUES (?,?,?)",
-                            (semantic_key, str(output_dir), now))
+               max_cost_microusd, now, now, kind, group_id))
+            if kind == "summary":
+                self.db.execute("INSERT INTO consumers (semantic_key,output_dir,updated_at) VALUES (?,?,?)",
+                                (semantic_key, str(output_dir), now))
             self.db.execute("COMMIT")
             _secure_dir(artifact_dir)
             return StartDecision("new", job_id)
@@ -178,6 +205,45 @@ class Ledger:
     def by_semantic_key(self, semantic_key: str) -> dict | None:
         row = self.db.execute("SELECT * FROM jobs WHERE semantic_key=?", (semantic_key,)).fetchone()
         return dict(row) if row else None
+
+    def stage(self, root_job_id: str, kind: str) -> dict | None:
+        if kind not in {"audit", "verify"}:
+            raise ValueError("invalid quality stage")
+        row = self.db.execute("SELECT * FROM jobs WHERE root_job_id=? AND kind=? ORDER BY created_at LIMIT 1",
+                              (root_job_id, kind)).fetchone()
+        return dict(row) if row else None
+
+    def quality_pending(self, *, now: float | None = None) -> list[dict]:
+        now = time.time() if now is None else now
+        return [dict(row) for row in self.db.execute(
+            "SELECT * FROM jobs WHERE kind='summary' AND status='quality_pending' "
+            "AND (next_poll_at IS NULL OR next_poll_at<=?) ORDER BY created_at", (now,))]
+
+    def mark_quality_pending(self, job_id: str) -> None:
+        changed = self.db.execute("UPDATE jobs SET status='quality_pending',updated_at=? "
+                                  "WHERE id=? AND kind='summary' AND status='completed_raw'",
+                                  (time.time(), job_id))
+        if changed.rowcount != 1:
+            raise ValueError("invalid draft transition")
+
+    def stage_completed(self, job_id: str, report_path: Path) -> None:
+        changed = self.db.execute("UPDATE jobs SET status='stage_complete',accepted_document_path=?,updated_at=? "
+                                  "WHERE id=? AND kind IN ('audit','verify') AND status='completed_raw'",
+                                  (str(report_path), time.time(), job_id))
+        if changed.rowcount != 1:
+            raise ValueError("invalid stage completion transition")
+
+    def defer_quality(self, job_id: str, *, delay_seconds: int, error_code: str) -> None:
+        if not 30 <= delay_seconds <= 3600:
+            raise ValueError("invalid quality retry delay")
+        self.db.execute("UPDATE jobs SET next_poll_at=?,error_code=?,updated_at=? "
+                        "WHERE id=? AND kind='summary' AND status='quality_pending'",
+                        (time.time() + delay_seconds, error_code[:120], time.time(), job_id))
+
+    def failed_quality(self, job_id: str, code: str) -> None:
+        self.db.execute("UPDATE jobs SET status='failed_validation',error_code=?,updated_at=? "
+                        "WHERE id=? AND kind='summary' AND status='quality_pending'",
+                        (code[:120], time.time(), job_id))
 
     def attach_consumer(self, semantic_key: str, source_sha256: str, output_dir: Path) -> dict | None:
         """Persist a same-input consumer before returning an in-flight job."""
@@ -307,10 +373,74 @@ class Ledger:
             raise
 
     def accepted(self, job_id: str, document_path: Path, generation_id: str) -> None:
-        changed = self.db.execute("UPDATE jobs SET status='accepted',accepted_document_path=?,generation_id=?,updated_at=? WHERE id=? AND status='completed_raw'",
+        changed = self.db.execute("UPDATE jobs SET status='accepted',accepted_document_path=?,generation_id=?,updated_at=? WHERE id=? AND kind='summary' AND status IN ('completed_raw','quality_pending')",
             (str(document_path), generation_id, time.time(), job_id))
         if changed.rowcount != 1:
             raise ValueError("invalid accepted transition")
+
+    def accept_recovered_failed(self, job_id: str, *, audit_job_id: str,
+                                expected_error_code: str, document_path: Path,
+                                generation_id: str) -> bool:
+        """Commit one locally recovered, already published summary without another dispatch.
+
+        The original failed result and its error remain in private artifacts and
+        the recovery intent.  Jobs and the primary consumer move together in a
+        single conditional transaction.  A repeated call is an exact no-op.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["kind"] != "summary":
+                raise ValueError("recovery root is missing")
+            consumer = self.db.execute(
+                "SELECT * FROM consumers WHERE semantic_key=? AND output_dir=?",
+                (row["semantic_key"], row["output_dir"]),
+            ).fetchone()
+            if consumer is None:
+                raise ValueError("recovery consumer is missing")
+            if row["status"] == "accepted":
+                if (row["accepted_document_path"] != str(document_path)
+                        or row["generation_id"] != generation_id
+                        or consumer["status"] != "published"
+                        or consumer["generation_id"] != generation_id):
+                    raise ValueError("a different recovery is already accepted")
+                self.db.execute("COMMIT")
+                return False
+            audit = self.db.execute("SELECT * FROM jobs WHERE id=?", (audit_job_id,)).fetchone()
+            verify = self.db.execute(
+                "SELECT id FROM jobs WHERE root_job_id=? AND kind='verify'", (job_id,),
+            ).fetchone()
+            if (row["status"] != "failed_validation"
+                    or row["error_code"] != expected_error_code
+                    or row["accepted_document_path"] is not None
+                    or row["generation_id"] is not None
+                    or Path(document_path).parent != Path(row["artifact_dir"])
+                    or consumer["status"] != "pending"
+                    or audit is None or audit["kind"] != "audit"
+                    or audit["root_job_id"] != job_id
+                    or audit["status"] != "stage_complete" or verify is not None):
+                raise ValueError("recovery state changed before acceptance")
+            now = time.time()
+            changed = self.db.execute(
+                "UPDATE jobs SET status='accepted',accepted_document_path=?,generation_id=?,"
+                "error_code=NULL,updated_at=? WHERE id=? AND status='failed_validation' AND error_code=?",
+                (str(document_path), generation_id, now, job_id, expected_error_code),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("recovery root transition lost")
+            changed = self.db.execute(
+                "UPDATE consumers SET status='published',generation_id=?,error_code=NULL,updated_at=? "
+                "WHERE semantic_key=? AND output_dir=? AND status='pending'",
+                (generation_id, now, row["semantic_key"], row["output_dir"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("recovery consumer transition lost")
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
 
     def failed_validation(self, job_id: str, code: str) -> None:
         self.db.execute("UPDATE jobs SET status='failed_validation',error_code=?,updated_at=? WHERE id=? AND status='completed_raw'",

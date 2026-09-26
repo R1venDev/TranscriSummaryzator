@@ -10,9 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from summary.luna_v1 import SCHEMA_ID, load_source
+from summary.luna_v1.audit import AUDIT_SCHEMA_ID
 from summary.luna_v1.batch import Reply
 from summary.luna_v1.engine import poll_once, submit
 from summary.luna_v1.ledger import Ledger
+from summary.luna_v1.route import RouteBlocked
 from summary.luna_v1.tasks import TaskStore
 
 
@@ -30,6 +32,8 @@ class FakeStore:
 class FakeClient:
     submit_calls = 0
     request_body = None
+    submissions = {}
+    report_factory = None
 
     def __init__(self, token):
         assert token == "synthetic-secret-never-sent"
@@ -38,11 +42,13 @@ class FakeClient:
         self.__class__.submit_calls += 1
         self.__class__.custom_id = custom_id
         self.__class__.request_body = request_body
-        return Reply(202, {"id": "batch-synthetic001", "status": "validating",
+        batch_id = f"batch-synthetic{self.__class__.submit_calls:03d}"
+        self.__class__.submissions[batch_id] = (custom_id, request_body)
+        return Reply(202, {"id": batch_id, "status": "validating",
                            "model": "openai/gpt-6-luna-20260922"})
 
     def get(self, batch_id):
-        assert batch_id == "batch-synthetic001"
+        custom_id, request_body = self.__class__.submissions[batch_id]
         document = {
             "schema_version": SCHEMA_ID,
             "meeting": {"topic": "Проверка данных", "project": None},
@@ -60,11 +66,24 @@ class FakeClient:
                           "summary": "Обсудили проверку альтернатив.", "source_ids": ["U00001"],
                           "details": []}],
         }
+        if request_body["response_format"]["json_schema"]["name"] == AUDIT_SCHEMA_ID:
+            payload = json.loads(request_body["messages"][1]["content"])
+            document = {
+                "schema_version": AUDIT_SCHEMA_ID,
+                "coverage": [{
+                    "window_id": window["window_id"], "start_id": window["start_id"],
+                    "end_id": window["end_id"], "salient": "Проверена альтернатива X или Y.",
+                    "draft_coverage": "covered", "finding_indices": [],
+                } for window in payload["SOURCE_WINDOWS"]],
+                "findings": [], "patches": [],
+            }
+            if self.__class__.report_factory is not None:
+                document = self.__class__.report_factory(payload, document)
         return Reply(200, {
             "id": batch_id, "status": "completed", "model": "openai/gpt-6-luna-20260922",
             "usage": {"cost": 0.003,
             "prompt_tokens": 300, "completion_tokens": 900},
-            "results": [{"custom_id": self.__class__.custom_id,
+            "results": [{"custom_id": custom_id,
                          "response": {"status_code": 200, "body": {
                              "model": "openai/gpt-6-luna-20260922",
                              "choices": [{"finish_reason": "stop", "message": {
@@ -76,7 +95,226 @@ class FakeClient:
         return Reply(200, {"id": batch_id, "deletion": {"openrouter": "deleted"}})
 
 
+def arm_poll(private):
+    ledger = Ledger(private)
+    ledger.db.execute("UPDATE jobs SET next_poll_at=0")
+    ledger.close()
+
+
+def fake_poll(private, route):
+    with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+         patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+        return poll_once(private_root=private, client_factory=FakeClient)
+
+
 class EngineTests(unittest.TestCase):
+    def test_pre_migration_batch_finishes_without_new_audit_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outputs" / "meeting"
+            output.mkdir(parents=True)
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "01.01.2030 — Синтетическая встреча.mkv", "duration_seconds": 8,
+                "speakers": {"p1": "А"},
+                "utterances": [{"start": 0.2, "end": 7.3, "speaker": "p1",
+                                "text": "Предлагаю проверить X или Y, не оба."}],
+            }, ensure_ascii=False))
+            private = root / "state" / "summary_private"
+            route = SimpleNamespace(
+                reserve_microusd=lambda payload, **kwargs: 20_000,
+                workspace_id="synthetic-workspace",
+                prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
+                cache_write_usd_per_token="0.0000000625", request_usd="0",
+            )
+            FakeClient.submit_calls = 0
+            FakeClient.report_factory = None
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+                started = submit(transcript_path=source, output_dir=output,
+                                 private_root=private, client_factory=FakeClient)
+            self.assertEqual(started["status"], "submitted")
+            ledger = Ledger(private)
+            job = ledger.get(started["job_id"])
+            manifest_path = Path(job["artifact_dir"]) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            for field in ("quality_policy_version", "audit_prompt_sha256", "audit_schema_sha256"):
+                manifest.pop(field)
+            manifest_path.write_text(json.dumps(manifest))
+            ledger.db.execute("UPDATE jobs SET next_poll_at=0 WHERE id=?", (job["id"],))
+            ledger.close()
+            events = fake_poll(private, route)
+            self.assertIn("accepted_legacy", {event["status"] for event in events})
+            self.assertEqual(FakeClient.submit_calls, 1)
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            self.assertIsNone(json.loads((generation / "run_manifest.json").read_text())["quality_review"])
+
+    def test_audit_unavailable_still_publishes_with_visible_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outputs" / "meeting"
+            output.mkdir(parents=True)
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "01.01.2030 — Синтетическая встреча.mkv", "duration_seconds": 8,
+                "speakers": {"p1": "А"},
+                "utterances": [{"start": 0.2, "end": 7.3, "speaker": "p1",
+                                "text": "Предлагаю проверить X или Y, не оба."}],
+            }, ensure_ascii=False))
+            private = root / "state" / "summary_private"
+            route = SimpleNamespace(
+                reserve_microusd=lambda payload, **kwargs: 20_000,
+                workspace_id="synthetic-workspace",
+                prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
+                cache_write_usd_per_token="0.0000000625", request_usd="0",
+            )
+            FakeClient.submit_calls = 0
+            FakeClient.report_factory = None
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+                submit(transcript_path=source, output_dir=output,
+                       private_root=private, client_factory=FakeClient)
+            arm_poll(private)
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route",
+                       side_effect=RouteBlocked("audit_route_unavailable")):
+                events = poll_once(private_root=private, client_factory=FakeClient)
+            self.assertIn("accepted", {event["status"] for event in events})
+            self.assertEqual(FakeClient.submit_calls, 1)
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            self.assertIn("Автоматическая смысловая проверка завершилась не полностью",
+                          (generation / "summary.md").read_text())
+            self.assertEqual(json.loads((generation / "run_manifest.json").read_text())
+                             ["quality_review"]["status"], "audit_unavailable")
+
+    def test_invalid_audit_coverage_links_do_not_discard_or_look_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outputs" / "meeting"
+            output.mkdir(parents=True)
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "01.01.2030 — Синтетическая встреча.mkv", "duration_seconds": 8,
+                "speakers": {"p1": "А"},
+                "utterances": [{"start": 0.2, "end": 7.3, "speaker": "p1",
+                                "text": "Предлагаю проверить X или Y, не оба."}],
+            }, ensure_ascii=False))
+            private = root / "state" / "summary_private"
+            route = SimpleNamespace(
+                reserve_microusd=lambda payload, **kwargs: 20_000,
+                workspace_id="synthetic-workspace",
+                prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
+                cache_write_usd_per_token="0.0000000625", request_usd="0",
+            )
+
+            def inconsistent_coverage(_payload, report):
+                report["coverage"][0]["draft_coverage"] = "missing"
+                report["coverage"][0]["finding_indices"] = [99]
+                return report
+
+            FakeClient.submit_calls = 0
+            FakeClient.report_factory = inconsistent_coverage
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+                started = submit(transcript_path=source, output_dir=output,
+                                 private_root=private, client_factory=FakeClient)
+            for expected in ("draft_ready", "stage_complete"):
+                arm_poll(private)
+                events = fake_poll(private, route)
+                self.assertIn(expected, {event["status"] for event in events})
+            self.assertEqual(FakeClient.submit_calls, 2)
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            review = json.loads((generation / "run_manifest.json").read_text())["quality_review"]
+            self.assertEqual(review["status"], "coverage_incomplete")
+            self.assertEqual(review["coverage_warning_count"], 2)
+            ledger = Ledger(private)
+            audit = ledger.stage(started["job_id"], "audit")
+            self.assertEqual(audit["status"], "stage_complete")
+            warnings = json.loads((Path(audit["artifact_dir"]) / "coverage_warnings.json").read_text())["warnings"]
+            ledger.close()
+            self.assertEqual([item["code"] for item in warnings],
+                             ["unknown_finding_index", "coverage_without_omission"])
+            self.assertIn("полнота проверки не подтверждена", (generation / "summary.md").read_text())
+
+    def test_omitted_action_is_added_and_verify_downgrades_uncertain_claim_before_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "outputs" / "meeting"
+            output.mkdir(parents=True)
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "01.01.2030 — Синтетическая встреча.mkv", "duration_seconds": 12,
+                "speakers": {"p1": "А"},
+                "utterances": [
+                    {"start": 0.2, "end": 5.0, "speaker": "p1", "text": "Предлагаю проверить X или Y, не оба."},
+                    {"start": 5.2, "end": 11.0, "speaker": "p1", "text": "Ещё предлагаю записать результат проверки в журнал."},
+                ],
+            }, ensure_ascii=False))
+            private = root / "state" / "summary_private"
+            route = SimpleNamespace(
+                reserve_microusd=lambda payload, **kwargs: 20_000,
+                workspace_id="synthetic-workspace",
+                prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
+                cache_write_usd_per_token="0.0000000625", request_usd="0",
+            )
+
+            def reports(payload, default):
+                if payload["MODE"] == "audit":
+                    task = {
+                        "title": "Записать результат проверки в журнал",
+                        "description": "После проверки выбранного варианта X или Y записать результат в журнал.",
+                        "discussion_status": "proposed", "assignee": None, "due": None,
+                        "priority": None, "recipient": None, "source_ids": ["U00002"],
+                        "field_sources": {"action": ["U00002"], "assignee": [], "due": [],
+                                          "priority": [], "recipient": [], "discussion_status": ["U00002"]},
+                    }
+                    default["coverage"][1]["draft_coverage"] = "missing"
+                    default["coverage"][1]["finding_indices"] = [0]
+                    default["findings"] = [{
+                        "severity": "major", "kind": "omission", "description": "Пропущена запись результата в журнал.",
+                        "source_ids": ["U00002"], "status": "repaired", "affected": [], "patch_indices": [0],
+                    }]
+                    default["patches"] = [{"section": "tasks", "operation": "insert", "index": 1,
+                                          "item_json": json.dumps(task, ensure_ascii=False)}]
+                else:
+                    item = {"text": "Предложена проверка одного из вариантов X или Y; принятие не установлено.",
+                            "source_ids": ["U00001"]}
+                    default["findings"] = [{
+                        "severity": "major", "kind": "modality", "description": "Принятие проверки не подтверждено.",
+                        "source_ids": ["U00001"], "status": "unresolved",
+                        "affected": [{"section": "main", "index": 0}], "patch_indices": [0],
+                    }]
+                    default["patches"] = [{"section": "main", "operation": "replace", "index": 0,
+                                          "item_json": json.dumps(item, ensure_ascii=False)}]
+                return default
+
+            FakeClient.submit_calls = 0
+            FakeClient.report_factory = reports
+            with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
+                started = submit(transcript_path=source, output_dir=output,
+                                 private_root=private, client_factory=FakeClient)
+            self.assertEqual(started["status"], "submitted")
+            for expected in ("draft_ready", "stage_complete", "stage_complete"):
+                arm_poll(private)
+                events = fake_poll(private, route)
+                self.assertIn(expected, {event["status"] for event in events})
+            self.assertEqual(FakeClient.submit_calls, 3)
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            cards = json.loads((generation / "tasks.json").read_text())
+            self.assertEqual(len(cards), 2)
+            self.assertEqual(cards[1]["assignee"], None)
+            markdown = (generation / "summary.md").read_text()
+            self.assertIn("записать результат в журнал", markdown)
+            self.assertIn("принятие не установлено", markdown)
+            self.assertIn("Автоматическая проверка:", markdown)
+            self.assertEqual(json.loads((generation / "run_manifest.json").read_text())
+                             ["quality_review"]["status"], "postverify_corrected_unchecked")
+
     def test_one_dispatch_then_terminal_publication_and_zero_call_reuse(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,8 +329,9 @@ class EngineTests(unittest.TestCase):
             }, ensure_ascii=False))
             private = root / "state" / "summary_private"
             FakeClient.submit_calls = 0
+            FakeClient.report_factory = None
             route = SimpleNamespace(
-                reserve_microusd=lambda payload: 20_000,
+                reserve_microusd=lambda payload, **kwargs: 20_000,
                 workspace_id="synthetic-workspace",
                 prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
                 cache_write_usd_per_token="0.0000000625", request_usd="0",
@@ -115,10 +354,15 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(FakeClient.submit_calls, 1)
                 ledger = Ledger(private)
                 self.assertEqual(len(ledger.consumers(shared["semantic_key"])), 2)
-                ledger.db.execute("UPDATE jobs SET next_poll_at=0")
                 ledger.close()
-                terminal = poll_once(private_root=private, client_factory=FakeClient)
-                self.assertEqual(terminal[0]["status"], "accepted")
+                arm_poll(private)
+                first = fake_poll(private, route)
+                self.assertIn("draft_ready", {item["status"] for item in first})
+                self.assertFalse((output / "summary_current.json").exists())
+                self.assertEqual(FakeClient.submit_calls, 2)
+                arm_poll(private)
+                terminal = fake_poll(private, route)
+                self.assertIn("accepted", {item["status"] for item in terminal})
                 pointer = json.loads((output / "summary_current.json").read_text())
                 generation = output / "summary_generations" / pointer["generation_id"]
                 self.assertIn("**Исполнитель:** Не назначен", (generation / "summary.md").read_text())
@@ -134,15 +378,15 @@ class EngineTests(unittest.TestCase):
                 restarted.db.execute("UPDATE consumers SET status='pending',generation_id=NULL WHERE semantic_key=? AND output_dir=?",
                     (shared["semantic_key"], str(pending_output)))
                 restarted.close()
-                recovered_consumer = poll_once(private_root=private, client_factory=FakeClient)
+                recovered_consumer = fake_poll(private, route)
                 self.assertEqual(recovered_consumer[0]["status"], "consumer_recovery")
                 self.assertEqual(recovered_consumer[0]["consumer_results"][0]["status"], "published")
                 self.assertTrue((pending_output / "summary_current.json").is_file())
-                self.assertEqual(FakeClient.submit_calls, 1)
+                self.assertEqual(FakeClient.submit_calls, 2)
                 again = submit(transcript_path=source, output_dir=output,
                                private_root=private, client_factory=FakeClient)
                 self.assertEqual(again["status"], "accepted_cache_hit")
-                self.assertEqual(FakeClient.submit_calls, 1)
+                self.assertEqual(FakeClient.submit_calls, 2)
                 second_output = root / "outputs" / "other-consumer"
                 second_output.mkdir()
                 second_source = second_output / "transcript.json"
@@ -151,7 +395,7 @@ class EngineTests(unittest.TestCase):
                                 private_root=private, client_factory=FakeClient)
                 self.assertEqual(reused["status"], "accepted_cache_hit")
                 self.assertEqual(reused["new_generations"], 0)
-                self.assertEqual(FakeClient.submit_calls, 1)
+                self.assertEqual(FakeClient.submit_calls, 2)
                 second_pointer = json.loads((second_output / "summary_current.json").read_text())
                 second_generation = second_output / "summary_generations" / second_pointer["generation_id"]
                 self.assertEqual(json.loads((second_generation / "tasks.json").read_text())[0]["assignee"], None)
@@ -172,18 +416,21 @@ class EngineTests(unittest.TestCase):
             }, ensure_ascii=False))
             private = root / "state" / "summary_private"
             route = SimpleNamespace(
-                reserve_microusd=lambda payload: 20_000,
+                reserve_microusd=lambda payload, **kwargs: 20_000,
                 workspace_id="synthetic-workspace",
                 prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
                 cache_write_usd_per_token="0.0000000625", request_usd="0",
             )
             FakeClient.submit_calls = 0
+            FakeClient.report_factory = None
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
                 started = submit(transcript_path=source, output_dir=output,
                                  private_root=private, client_factory=FakeClient)
             self.assertEqual(started["status"], "submitted")
-            ledger = Ledger(private); ledger.db.execute("UPDATE jobs SET next_poll_at=0"); ledger.close()
+            arm_poll(private)
+            self.assertIn("draft_ready", {item["status"] for item in fake_poll(private, route)})
+            arm_poll(private)
             from summary.luna_v1 import publication
             real_replace = os.replace
 
@@ -193,18 +440,19 @@ class EngineTests(unittest.TestCase):
                 return real_replace(source_path, destination)
 
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route), \
                  patch.object(publication.os, "replace", side_effect=fail_pointer):
                 interrupted = poll_once(private_root=private, client_factory=FakeClient)
-            self.assertEqual(interrupted[0]["status"], "publication_pending_retry")
+            self.assertIn("quality_pending_retry", {item["status"] for item in interrupted})
             self.assertFalse((output / "summary_current.json").exists())
             ledger = Ledger(private)
-            self.assertEqual(ledger.get(started["job_id"])["status"], "completed_raw")
+            self.assertEqual(ledger.get(started["job_id"])["status"], "quality_pending")
             ledger.db.execute("UPDATE jobs SET next_poll_at=0")
             ledger.close()
-            recovered = poll_once(private_root=private, client_factory=FakeClient)
-            self.assertEqual(recovered[0]["status"], "accepted")
+            recovered = fake_poll(private, route)
+            self.assertIn("accepted", {item["status"] for item in recovered})
             self.assertTrue((output / "summary_current.json").is_file())
-            self.assertEqual(FakeClient.submit_calls, 1)
+            self.assertEqual(FakeClient.submit_calls, 2)
 
     def test_task_edit_race_rebuilds_sealed_projection_from_saved_raw_without_post(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -220,12 +468,13 @@ class EngineTests(unittest.TestCase):
             }, ensure_ascii=False))
             private = root / "state" / "summary_private"
             route = SimpleNamespace(
-                reserve_microusd=lambda payload: 20_000,
+                reserve_microusd=lambda payload, **kwargs: 20_000,
                 workspace_id="synthetic-workspace",
                 prompt_usd_per_token="0.00000005", completion_usd_per_token="0.00000025",
                 cache_write_usd_per_token="0.0000000625", request_usd="0",
             )
             FakeClient.submit_calls = 0
+            FakeClient.report_factory = None
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
                 started = submit(transcript_path=source, output_dir=output,
@@ -236,7 +485,9 @@ class EngineTests(unittest.TestCase):
             _, source_index, source_sha = load_source(source)
             store = TaskStore(private / "tasks.sqlite3")
             action_id = store.reconcile(source_sha, document["tasks"])[0]["action_id"]
-            ledger = Ledger(private); ledger.db.execute("UPDATE jobs SET next_poll_at=0"); ledger.close()
+            arm_poll(private)
+            self.assertIn("draft_ready", {item["status"] for item in fake_poll(private, route)})
+            arm_poll(private)
             original_commit = TaskStore.commit_reconcile
             edited = []
 
@@ -247,23 +498,24 @@ class EngineTests(unittest.TestCase):
                 return original_commit(task_store, plan)
 
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
+                 patch("summary.luna_v1.engine.verify_batch_route", return_value=route), \
                  patch.object(TaskStore, "commit_reconcile", commit_after_edit):
                 interrupted = poll_once(private_root=private, client_factory=FakeClient)
-            self.assertEqual(interrupted[0]["status"], "publication_pending_retry")
-            self.assertEqual(interrupted[0]["reason"], "RevisionConflict")
+            self.assertIn("quality_pending_retry", {item["status"] for item in interrupted})
+            self.assertIn("RevisionConflict", {item.get("reason") for item in interrupted})
             self.assertFalse((output / "summary_current.json").exists())
             ledger = Ledger(private)
-            self.assertEqual(ledger.get(started["job_id"])["status"], "completed_raw")
+            self.assertEqual(ledger.get(started["job_id"])["status"], "quality_pending")
             ledger.db.execute("UPDATE jobs SET next_poll_at=0")
             ledger.close()
-            recovered = poll_once(private_root=private, client_factory=FakeClient)
-            self.assertEqual(recovered[0]["status"], "accepted")
+            recovered = fake_poll(private, route)
+            self.assertIn("accepted", {item["status"] for item in recovered})
             pointer = json.loads((output / "summary_current.json").read_text())
             sealed = output / "summary_generations" / pointer["generation_id"]
             self.assertIn("Вручную уточнённая синтетическая задача.", (sealed / "summary.md").read_text())
             self.assertEqual(json.loads((sealed / "tasks.json").read_text())[0]["revision"], 1)
             self.assertEqual(len(list((output / "summary_generations").glob(".superseded-*"))), 1)
-            self.assertEqual(FakeClient.submit_calls, 1)
+            self.assertEqual(FakeClient.submit_calls, 2)
 
 
 if __name__ == "__main__":
