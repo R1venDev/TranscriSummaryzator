@@ -128,6 +128,30 @@ class LunaContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "assignee and its source references disagree"):
             validate_document(doc, self.index)
 
+    def test_null_optional_fields_can_retain_evidence_of_uncertainty(self):
+        doc = _document()
+        task = doc["tasks"][0]
+        for field in ("assignee", "due", "priority", "recipient"):
+            task["field_sources"][field] = ["U00001"]
+        self.assertIs(validate_document(doc, self.index), doc)
+        exported = render_document(doc, self.index)["tasks.json"][0]
+        self.assertIsNone(exported["due"])
+        self.assertEqual(exported["field_sources"]["due"], ["U00001"])
+
+    def test_populated_optional_fields_still_require_valid_evidence(self):
+        for field, value in (("assignee", "@Алекс"), ("due", "К следующему разу"),
+                             ("priority", "Высокий"), ("recipient", "@Алекс")):
+            with self.subTest(field=field):
+                doc = _document()
+                doc["tasks"][0][field] = value
+                with self.assertRaisesRegex(ValueError, f"{field} and its source references disagree"):
+                    validate_document(doc, self.index)
+
+        doc = _document()
+        doc["tasks"][0]["field_sources"]["due"] = ["U00002"]
+        with self.assertRaisesRegex(ValueError, "field evidence is absent from task sources"):
+            validate_document(doc, self.index)
+
     def test_effective_manual_edit_keeps_action_id_and_sealed_evidence(self):
         doc = _document()
         generated = render_document(doc, self.index)["tasks.json"]

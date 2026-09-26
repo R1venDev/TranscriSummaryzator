@@ -378,6 +378,70 @@ class Ledger:
         if changed.rowcount != 1:
             raise ValueError("invalid accepted transition")
 
+    def accept_recovered_failed(self, job_id: str, *, audit_job_id: str,
+                                expected_error_code: str, document_path: Path,
+                                generation_id: str) -> bool:
+        """Commit one locally recovered, already published summary without another dispatch.
+
+        The original failed result and its error remain in private artifacts and
+        the recovery intent.  Jobs and the primary consumer move together in a
+        single conditional transaction.  A repeated call is an exact no-op.
+        """
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["kind"] != "summary":
+                raise ValueError("recovery root is missing")
+            consumer = self.db.execute(
+                "SELECT * FROM consumers WHERE semantic_key=? AND output_dir=?",
+                (row["semantic_key"], row["output_dir"]),
+            ).fetchone()
+            if consumer is None:
+                raise ValueError("recovery consumer is missing")
+            if row["status"] == "accepted":
+                if (row["accepted_document_path"] != str(document_path)
+                        or row["generation_id"] != generation_id
+                        or consumer["status"] != "published"
+                        or consumer["generation_id"] != generation_id):
+                    raise ValueError("a different recovery is already accepted")
+                self.db.execute("COMMIT")
+                return False
+            audit = self.db.execute("SELECT * FROM jobs WHERE id=?", (audit_job_id,)).fetchone()
+            verify = self.db.execute(
+                "SELECT id FROM jobs WHERE root_job_id=? AND kind='verify'", (job_id,),
+            ).fetchone()
+            if (row["status"] != "failed_validation"
+                    or row["error_code"] != expected_error_code
+                    or row["accepted_document_path"] is not None
+                    or row["generation_id"] is not None
+                    or Path(document_path).parent != Path(row["artifact_dir"])
+                    or consumer["status"] != "pending"
+                    or audit is None or audit["kind"] != "audit"
+                    or audit["root_job_id"] != job_id
+                    or audit["status"] != "stage_complete" or verify is not None):
+                raise ValueError("recovery state changed before acceptance")
+            now = time.time()
+            changed = self.db.execute(
+                "UPDATE jobs SET status='accepted',accepted_document_path=?,generation_id=?,"
+                "error_code=NULL,updated_at=? WHERE id=? AND status='failed_validation' AND error_code=?",
+                (str(document_path), generation_id, now, job_id, expected_error_code),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("recovery root transition lost")
+            changed = self.db.execute(
+                "UPDATE consumers SET status='published',generation_id=?,error_code=NULL,updated_at=? "
+                "WHERE semantic_key=? AND output_dir=? AND status='pending'",
+                (generation_id, now, row["semantic_key"], row["output_dir"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("recovery consumer transition lost")
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
     def failed_validation(self, job_id: str, code: str) -> None:
         self.db.execute("UPDATE jobs SET status='failed_validation',error_code=?,updated_at=? WHERE id=? AND status='completed_raw'",
             (code, time.time(), job_id))
