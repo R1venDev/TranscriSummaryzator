@@ -86,7 +86,8 @@ def read_current(output_dir: Path, transcript_path: Path, task_db: Path,
     action_ids = [item.get("action_id") if isinstance(item, dict) else None for item in sealed_tasks]
     store = TaskStore(task_db)
     effective = store.effective_for_sealed(source_sha256, document["tasks"], action_ids)
-    rendered = render_document(document, source_index, effective)
+    rendered = render_document(document, source_index, effective,
+                               run_manifest.get("quality_review"))
     refs = {}
     for task in effective:
         refs[task["action_id"]] = [

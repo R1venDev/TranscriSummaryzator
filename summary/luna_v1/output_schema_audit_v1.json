@@ -1,0 +1,65 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "string", "enum": ["luna_summary_audit_v1"]},
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "window_id": {"type": "string"},
+          "start_id": {"type": "string"},
+          "end_id": {"type": "string"},
+          "salient": {"type": "string"},
+          "draft_coverage": {"type": "string", "enum": ["covered", "partial", "missing", "no_material_item"]},
+          "finding_indices": {"type": "array", "items": {"type": "integer"}}
+        },
+        "required": ["window_id", "start_id", "end_id", "salient", "draft_coverage", "finding_indices"]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {"type": "string", "enum": ["critical", "major", "minor"]},
+          "kind": {"type": "string", "enum": ["unsupported_claim", "omission", "role", "modality", "alternative", "condition", "number", "time", "late_correction", "duplication", "other"]},
+          "description": {"type": "string"},
+          "source_ids": {"type": "array", "items": {"type": "string"}},
+          "affected": {
+            "type": "array",
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "section": {"type": "string", "enum": ["meeting", "main", "timecodes", "tasks", "questions", "technical", "ideas", "verification", "chapters"]},
+                "index": {"type": "integer"}
+              },
+              "required": ["section", "index"]
+            }
+          },
+          "status": {"type": "string", "enum": ["repaired", "unresolved"]},
+          "patch_indices": {"type": "array", "items": {"type": "integer"}}
+        },
+        "required": ["severity", "kind", "description", "source_ids", "affected", "status", "patch_indices"]
+      }
+    },
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "section": {"type": "string", "enum": ["meeting", "main", "timecodes", "tasks", "questions", "technical", "ideas", "verification", "chapters"]},
+          "operation": {"type": "string", "enum": ["insert", "replace", "remove"]},
+          "index": {"type": "integer"},
+          "item_json": {"type": ["string", "null"]}
+        },
+        "required": ["section", "operation", "index", "item_json"]
+      }
+    }
+  },
+  "required": ["schema_version", "coverage", "findings", "patches"]
+}

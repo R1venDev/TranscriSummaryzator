@@ -73,6 +73,31 @@ class LedgerTests(unittest.TestCase):
             )
             self.assertEqual(blocked.reason, "weekly_budget_exceeded")
 
+    def test_quality_calls_share_one_logical_job_cap_and_do_not_create_consumers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            base = dict(source_sha256="b" * 64, output_dir=root / "meeting",
+                        credential_id="key-1", credential_version=1,
+                        workspace_id="workspace-1")
+            parent = ledger.reserve(semantic_key="a" * 64,
+                                    max_cost_microusd=50_000, **base)
+            audit = ledger.reserve(semantic_key="c" * 64,
+                                   max_cost_microusd=30_000, kind="audit",
+                                   root_job_id=parent.job_id, **base)
+            self.assertEqual(audit.kind, "new")
+            self.assertEqual(ledger.consumers("c" * 64), [])
+            blocked = ledger.reserve(semantic_key="d" * 64,
+                                     max_cost_microusd=30_000, kind="verify",
+                                     root_job_id=parent.job_id, **base)
+            self.assertEqual(blocked.reason, "logical_job_budget_exceeded")
+            ledger.db.execute("UPDATE jobs SET billed_microusd=10000 WHERE id=?", (parent.job_id,))
+            allowed = ledger.reserve(semantic_key="d" * 64,
+                                     max_cost_microusd=30_000, kind="verify",
+                                     root_job_id=parent.job_id, **base)
+            self.assertEqual(allowed.kind, "new")
+            ledger.close()
+
     def test_exact_batch_shape_and_custom_id_result_mapping(self):
         opener = _Opener()
         reply = BatchClient("fictional-test-token", opener=opener).submit("summary-001", {"messages": [{"role": "user", "content": "тест"}]})
