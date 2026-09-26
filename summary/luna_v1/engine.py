@@ -25,6 +25,7 @@ from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_complet
 from summary.gemini_v1 import GEMINI_AUDIT_PROMPT_PATH, build_gemini_audit_input
 from summary.gemini_v1.batch import BatchClient as GeminiBatchClient
 from summary.gemini_v1.batch import BatchError as GeminiBatchError
+from summary.gemini_v1.batch import BATCH_MODEL_IDS as GEMINI_BATCH_MODEL_IDS
 from summary.gemini_v1.batch import extract_one_completed as extract_one_gemini_completed
 from summary.gemini_v1.route import (RouteBlocked as GeminiRouteBlocked,
                                      verify_batch_route as verify_gemini_batch_route)
@@ -330,14 +331,14 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     if request_manifest.get("provider") == QUALITY_PROVIDER:
         if (submission.get("id") != job["remote_id"]
                 or batch.get("id") != job["remote_id"]
-                or submission.get("model") != GEMINI_MODEL
-                or batch.get("model") != GEMINI_MODEL):
+                or submission.get("model") not in GEMINI_BATCH_MODEL_IDS
+                or batch.get("model") != submission.get("model")):
             raise ValueError("gemini_batch_submission_identity_mismatch")
         saved_request = json.loads((artifacts / "request.json").read_text(encoding="utf-8"))
         body, usage = extract_one_gemini_completed(
             batch, job["custom_id"], expected_batch_id=job["remote_id"],
             manifest=request_manifest, saved_request=saved_request)
-        if body.get("model") not in {GEMINI_MODEL, GEMINI_MODEL.removesuffix(":batch")}:
+        if body.get("model") not in GEMINI_BATCH_MODEL_IDS | {GEMINI_MODEL.removesuffix(":batch")}:
             raise ValueError("gemini_response_model_mismatch")
         choices = body.get("choices")
         if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
@@ -453,7 +454,7 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": AUDIT_SCHEMA_ID, "strict": True, "schema": AUDIT_SCHEMA,
             }},
-            "max_completion_tokens": 16_000 if kind == "audit" else 8_000,
+            "max_completion_tokens": 10_000 if kind == "audit" else 8_000,
             "reasoning": {"effort": "medium"},
             "plugins": [],
         }
@@ -697,6 +698,7 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             "cache_policy": "no_explicit_cache_full_miss_reserved",
             "reserve_microusd": stage["reserved_microusd"],
             "counted_input_tokens": route.input_tokens,
+            "context_bound_tokens": route.context_bound_tokens,
             "max_output_tokens": output_cap,
         }
         manifest_path = artifacts / "manifest.json"

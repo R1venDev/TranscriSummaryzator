@@ -18,6 +18,10 @@ from typing import Any
 
 API_BASE = "https://openrouter.ai/api/v1"
 MODEL = "google/gemini-3.7-flash:batch"
+# OpenRouter resolves this pinned Batch alias to this exact model revision in
+# the submit and terminal Batch metadata.
+RESOLVED_MODEL = "google/gemini-3.7-flash-20260813"
+BATCH_MODEL_IDS = frozenset({MODEL, RESOLVED_MODEL})
 PROVIDER = "google-vertex"
 MAX_REQUEST_BYTES = 20_000_000
 MAX_RESPONSE_BYTES = 32_000_000
@@ -208,7 +212,7 @@ def extract_one_completed(
         raise ValueError("batch_not_completed")
     if expected_batch_id is not None and batch.get("id") != expected_batch_id:
         raise ValueError("batch_identity_mismatch")
-    if batch.get("model") != MODEL or batch.get("endpoint") != "/v1/chat/completions":
+    if batch.get("model") not in BATCH_MODEL_IDS or batch.get("endpoint") != "/v1/chat/completions":
         raise ValueError("batch_route_mismatch")
     if manifest is not None or saved_request is not None:
         if not isinstance(manifest, dict) or not isinstance(saved_request, dict):

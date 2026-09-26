@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from summary.gemini_v1.batch import Reply as GeminiReply
-from summary.luna_v1.engine import _cost_micros, poll_once, submit
+from summary.gemini_v1.batch import MODEL as GEMINI_MODEL, RESOLVED_MODEL, Reply as GeminiReply
+from summary.luna_v1.engine import _cost_micros, _finish_raw, poll_once, submit
 from summary.luna_v1.ledger import Ledger
 from tests.test_luna_engine import FakeClient, arm_poll
 
@@ -35,6 +35,7 @@ class FakeGemini:
     submissions = {}
     submit_calls = 0
     mode = "patch"
+    remote_model = GEMINI_MODEL
 
     def __init__(self, token):
         assert token == "synthetic-openrouter-judge"
@@ -45,7 +46,7 @@ class FakeGemini:
         self.__class__.submissions[name] = (custom_id, request_body)
         return GeminiReply(202, {"id": name, "status": "validating",
                                  "endpoint": "/v1/chat/completions",
-                                 "model": "google/gemini-3.7-flash:batch"})
+                                 "model": self.__class__.remote_model})
 
     def get(self, name):
         custom_id, request = self.__class__.submissions[name]
@@ -76,15 +77,15 @@ class FakeGemini:
                                   "status": "repaired", "patch_indices": [0]}]
             report["patches"] = [{"section": "tasks", "operation": "insert",
                                   "index": 1, "item_json": json.dumps(task, ensure_ascii=False)}]
-        response = {"model": "google/gemini-3.7-flash:batch", "choices": [{
+        response = {"model": GEMINI_MODEL, "choices": [{
             "message": {"role": "assistant", "content": json.dumps(report, ensure_ascii=False)},
             "finish_reason": "stop"}], "usage": {"prompt_tokens": 400,
                 "completion_tokens": 350, "total_tokens": 750}}
         return GeminiReply(200, {"id": name, "status": "completed",
             "endpoint": "/v1/chat/completions",
-            "model": "google/gemini-3.7-flash:batch",
+            "model": self.__class__.remote_model,
             "request_counts": {"total": 1, "completed": 1, "failed": 0},
-            "usage": {"cost": 0.000807, "prompt_tokens": 400,
+            "usage": {"cost": 0.000807, "is_byok": False, "prompt_tokens": 400,
                       "completion_tokens": 350, "total_tokens": 750},
             "results": [{"custom_id": custom_id, "response": {
                 "status_code": 200, "body": response}, "error": None}]})
@@ -98,7 +99,7 @@ class GeminiEngineTests(unittest.TestCase):
         self.assertIsNone(_cost_micros({"cost": 0.000001, "is_byok": True}))
         self.assertEqual(_cost_micros({"cost": 0.000807, "is_byok": False}), 807)
 
-    def test_writer_then_openrouter_gemini_audit_patch_verify_and_zero_call_reuse(self):
+    def _assert_writer_then_openrouter_gemini_audit(self, remote_model):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "meeting"
@@ -116,13 +117,15 @@ class GeminiEngineTests(unittest.TestCase):
                 completion_usd_per_token="0.00000025",
                 cache_write_usd_per_token="0.0000000625", request_usd="0")
             judge_route = SimpleNamespace(reserve_microusd=lambda: 25_000,
-                                          input_tokens=1500, workspace_id="judge-workspace")
+                                          input_tokens=1500, context_bound_tokens=2100,
+                                          workspace_id="judge-workspace")
             FakeClient.submit_calls = 0
             FakeClient.submissions = {}
             FakeClient.report_factory = None
             FakeGemini.submit_calls = 0
             FakeGemini.submissions = {}
             FakeGemini.mode = "patch"
+            FakeGemini.remote_model = remote_model
             with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=writer_route), \
                  patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route):
@@ -149,6 +152,16 @@ class GeminiEngineTests(unittest.TestCase):
             self.assertEqual((audit["credential_id"], verify["credential_id"]),
                              ("judge-key", "judge-key"))
             self.assertEqual(audit["billed_microusd"], 807)
+            for quality_job in (audit, verify):
+                artifacts = Path(quality_job["artifact_dir"])
+                submission = json.loads((artifacts / "submit_response.json").read_text())
+                terminal = json.loads((artifacts / "batch_terminal.json").read_text())
+                self.assertEqual((submission["model"], terminal["model"]),
+                                 (remote_model, remote_model))
+                self.assertEqual(submission["endpoint"], "/v1/chat/completions")
+                self.assertEqual(terminal["endpoint"], "/v1/chat/completions")
+                self.assertEqual(terminal["results"][0]["response"]["body"]["model"], GEMINI_MODEL)
+                self.assertIs(terminal["usage"]["is_byok"], False)
             ledger.close()
             pointer = json.loads((output / "summary_current.json").read_text())
             generation = output / "summary_generations" / pointer["generation_id"]
@@ -161,6 +174,32 @@ class GeminiEngineTests(unittest.TestCase):
             request = FakeGemini.submissions[next(iter(FakeGemini.submissions))][1]
             self.assertEqual(request["response_format"]["type"], "json_schema")
             self.assertEqual(request["plugins"], [])
+
+    def test_writer_then_existing_gemini_batch_alias(self):
+        self._assert_writer_then_openrouter_gemini_audit(GEMINI_MODEL)
+
+    def test_writer_then_resolved_gemini_revision_audit_patch_verify_and_reuse(self):
+        self._assert_writer_then_openrouter_gemini_audit(RESOLVED_MODEL)
+
+    def test_unrelated_or_mixed_gemini_batch_model_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory)
+            (artifacts / "manifest.json").write_text(json.dumps({"provider": "openrouter_gemini"}))
+            job = {"artifact_dir": str(artifacts), "remote_id": "batch_abc123",
+                   "custom_id": "audit-001"}
+            for submission_model, terminal_model in (
+                ("google/gemini-3.7-flash-20260814", "google/gemini-3.7-flash-20260814"),
+                (GEMINI_MODEL, RESOLVED_MODEL),
+            ):
+                with self.subTest(submission_model=submission_model, terminal_model=terminal_model):
+                    (artifacts / "submit_response.json").write_text(json.dumps({
+                        "id": job["remote_id"], "model": submission_model,
+                        "endpoint": "/v1/chat/completions"}))
+                    (artifacts / "batch_terminal.json").write_text(json.dumps({
+                        "id": job["remote_id"], "model": terminal_model,
+                        "endpoint": "/v1/chat/completions", "status": "completed"}))
+                    with self.assertRaisesRegex(ValueError, "gemini_batch_submission_identity_mismatch"):
+                        _finish_raw(None, job)
 
 
 if __name__ == "__main__":

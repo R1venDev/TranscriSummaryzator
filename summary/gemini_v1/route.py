@@ -2,8 +2,9 @@
 
 Live key-filtered catalog, exact model and Google Vertex endpoint are checked
 before private text is submitted. OpenRouter offers no free countTokens for the
-Chat route; input capacity/cost use a conservative UTF-8 byte upper bound.
-Actual batch `usage.cost` is authoritative when reported.
+Chat route. Capacity uses a generous UTF-8 bound; cost uses a documented
+estimate with a character floor and explicit margin. Terminal batch usage is
+authoritative when it includes the provider charge.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from ..luna_v1.ledger import JOB_CAP_MICROUSD
 
 RESERVE_SAFETY = Decimal("1.2")
 _CACHE_WRITE_FLOOR = Decimal("0.00000004167")  # Public :batch page, 2026-09-26.
+_CHAT_WRAPPER_MARGIN = 2048
 
 
 class RouteBlocked(RuntimeError):
@@ -83,7 +85,8 @@ class Route:
     workspace_id: str
     max_input_tokens: int
     max_output_tokens: int
-    counted_input_tokens: int  # Conservative bound, not tokenizer measurement.
+    counted_input_tokens: int  # Cost estimate, not tokenizer measurement.
+    context_bound_tokens: int  # Separate conservative capacity bound.
     requested_max_output_tokens: int
     prompt_usd_per_token: Decimal
     completion_usd_per_token: Decimal
@@ -170,13 +173,18 @@ def verify_batch_route(
     output = min(output, endpoint_output) if endpoint_output is not None else output
     if max_output_tokens > output:
         raise RouteBlocked("output_capacity_exceeded")
-    # UTF-8 bytes exceed tokenizer tokens for this text/JSON request; reserve a
-    # further 20% for chat wrappers and accounting variation. A near-limit
-    # request blocks rather than being silently truncated.
-    serialized = json.dumps(request, ensure_ascii=False, sort_keys=True,
-                            separators=(",", ":")).encode("utf-8")
-    input_upper = (len(serialized) * 6 + 4) // 5
-    if input_upper + max_output_tokens > context:
+    serialized_text = json.dumps(request, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"))
+    byte_count = len(serialized_text.encode("utf-8"))
+    # Capacity is guarded independently of pricing. The cost estimate uses
+    # at least one token per Unicode character and at least three per four
+    # UTF-8 bytes, plus wrapper margin. On the saved Russian Gemini smoke,
+    # this exceeded observed prompt tokens by more than fourfold; it is an
+    # estimate, not an exact tokenizer upper bound. Actual usage replaces the
+    # reservation only after the batch is terminal and is not BYOK.
+    context_upper = (byte_count * 6 + 4) // 5
+    estimated_input = max(len(serialized_text), (byte_count * 3 + 3) // 4) + _CHAT_WRAPPER_MARGIN
+    if context_upper + max_output_tokens > context:
         raise RouteBlocked("context_capacity_exceeded")
     model_pricing = model.get("pricing")
     endpoint_pricing = endpoint.get("pricing")
@@ -192,7 +200,8 @@ def verify_batch_route(
     return Route(
         model=MODEL, provider=PROVIDER, workspace_id=workspace_id,
         max_input_tokens=context - max_output_tokens,
-        max_output_tokens=output, counted_input_tokens=input_upper,
+        max_output_tokens=output, counted_input_tokens=estimated_input,
+        context_bound_tokens=context_upper,
         requested_max_output_tokens=max_output_tokens,
         prompt_usd_per_token=prompt, completion_usd_per_token=completion,
         cache_write_usd_per_token=cache_write, request_usd=request_usd,

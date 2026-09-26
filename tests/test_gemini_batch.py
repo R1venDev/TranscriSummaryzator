@@ -8,7 +8,7 @@ import unittest
 import urllib.error
 
 from summary.gemini_v1.batch import (
-    BatchClient, BatchError, MODEL, PROVIDER, batch_id_from_submit,
+    BatchClient, BatchError, MODEL, PROVIDER, RESOLVED_MODEL, batch_id_from_submit,
     canonical_request, extract_one_completed, normalize_batch_status,
     valid_batch_id,
 )
@@ -123,6 +123,28 @@ class GeminiBatchTests(unittest.TestCase):
         self.assertGreater(route.reserve_microusd(), 18_000)
         self.assertLess(route.reserve_microusd(), 25_000)
 
+    def test_long_mixed_russian_request_reserves_within_cap_without_ascii_underestimate(self):
+        # Mirrors the size mix of a long technical transcript without using
+        # any private source or its expected answer in the repository.
+        request = _request()
+        request["messages"][1]["content"] = "A" * 75_000 + "Ж" * 45_000
+        request["max_completion_tokens"] = 10_000
+        route = verify_batch_route(BatchClient("fake", opener=_Opener(*_route_replies())),
+                                   request, max_output_tokens=10_000)
+        self.assertGreater(route.context_bound_tokens, route.input_tokens)
+        self.assertLess(route.reserve_microusd(), 100_000)
+
+        ascii_request = _request()
+        ascii_request["messages"][1]["content"] = "A" * 200_000
+        ascii_request["max_completion_tokens"] = 10_000
+        ascii_route = verify_batch_route(BatchClient("fake", opener=_Opener(*_route_replies())),
+                                         ascii_request, max_output_tokens=10_000)
+        serialized = json.dumps(ascii_request, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+        self.assertGreaterEqual(ascii_route.input_tokens, len(serialized))
+        with self.assertRaisesRegex(RouteBlocked, "job_budget_exceeded"):
+            ascii_route.reserve_microusd()
+
     def test_wrong_workspace_model_endpoint_capacity_or_price_fails_closed(self):
         request = _request()
         cases = []
@@ -201,6 +223,18 @@ class GeminiBatchTests(unittest.TestCase):
         body, usage = extract_one_completed(batch, "audit-001", expected_batch_id="batch_abc123",
                                             manifest=manifest, saved_request=request)
         self.assertEqual(body, response)
+        resolved = dict(batch, model=RESOLVED_MODEL)
+        self.assertEqual(extract_one_completed(
+            resolved, "audit-001", expected_batch_id="batch_abc123",
+            manifest=manifest, saved_request=request), (response, batch["usage"]))
+        with self.assertRaisesRegex(ValueError, "batch_route_mismatch"):
+            extract_one_completed(dict(resolved, endpoint="/v1/other"),
+                                  "audit-001", expected_batch_id="batch_abc123",
+                                  manifest=manifest, saved_request=request)
+        with self.assertRaisesRegex(ValueError, "batch_route_mismatch"):
+            extract_one_completed(dict(resolved, model="google/gemini-3.7-flash-20260814"),
+                                  "audit-001", expected_batch_id="batch_abc123",
+                                  manifest=manifest, saved_request=request)
         self.assertEqual(estimate_usage_cost_microusd(usage), 24504)
         self.assertIsNone(estimate_usage_cost_microusd({"prompt_tokens": 5}))
         self.assertEqual(normalize_batch_status({"status": "in_progress"}), "in_progress")
