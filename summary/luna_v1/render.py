@@ -231,6 +231,9 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
         elif status == "source_reviewed_local_correction_unverified":
             notice = ("После автоматической проверки инженерная сверка обнаружила и локально исправила ошибки по исходным репликам. "
                       "Исправленный вариант не проходил повторную модельную проверку; полнота всей встречи не подтверждена.")
+        elif status == "model_audit_unverified":
+            notice = ("Автоматическая проверка сопоставила значимые пункты с черновиком, "
+                      "но её перечень и смысловая полнота не подтверждены независимой источниковой проверкой.")
         else:
             notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
         warning_count = quality_review.get("coverage_warning_count", 0)

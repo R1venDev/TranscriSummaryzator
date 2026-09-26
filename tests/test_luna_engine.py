@@ -106,13 +106,16 @@ def arm_poll(private):
 def pin_legacy_quality(private, job_id):
     """Existing Luna quality attempts keep their recorded v3 route."""
     import hashlib
-    from summary.luna_v1.audit import AUDIT_PROMPT_PATH
+    from summary.luna_v1.audit import AUDIT_PROMPT_PATH, AUDIT_SCHEMA
     ledger = Ledger(private)
     job = ledger.get(job_id)
     manifest_path = Path(job["artifact_dir"]) / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["quality_policy_version"] = "luna_auto_audit_v3"
     manifest["audit_prompt_sha256"] = hashlib.sha256(AUDIT_PROMPT_PATH.read_bytes()).hexdigest()
+    manifest["audit_schema_sha256"] = hashlib.sha256(json.dumps(
+        AUDIT_SCHEMA, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
     for key in ("quality_provider", "judge_project_scope", "audit_model", "audit_privacy_mode"):
         manifest.pop(key, None)
     manifest_path.write_text(json.dumps(manifest))

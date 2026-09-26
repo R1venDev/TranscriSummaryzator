@@ -170,7 +170,10 @@ class Ledger:
                     except (OSError, ValueError) as exc:
                         raise ValueError("quality root manifest unavailable") from exc
                     if (manifest.get("quality_provider") != "openrouter_gemini"
-                            or manifest.get("quality_policy_version") != "gemini_openrouter_judge_repair_v2"
+                            or manifest.get("quality_policy_version") not in {
+                                "gemini_openrouter_judge_repair_v2",
+                                "gemini_openrouter_judge_repair_v3_source_inventory",
+                            }
                             or manifest.get("judge_workspace_id") != workspace_id
                             or not isinstance(workspace_id, str) or not workspace_id
                             or credential_id == root["credential_id"]):

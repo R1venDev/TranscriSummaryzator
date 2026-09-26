@@ -24,6 +24,12 @@ from .audit import (AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID,
                     validate_audit)
 from .batch import BatchClient, BatchError, MODEL, TERMINAL, extract_one_completed, valid_batch_id
 from summary.gemini_v1 import GEMINI_AUDIT_PROMPT_PATH, build_gemini_audit_input
+from summary.gemini_v1.audit_v2 import (GEMINI_AUDIT_PROMPT_PATH_V2,
+                                       GEMINI_AUDIT_SCHEMA_V2,
+                                       GEMINI_AUDIT_SCHEMA_ID_V2,
+                                       coverage_warnings_gemini_v2,
+                                       legacy_report_v1,
+                                       validate_gemini_audit_v2)
 from summary.gemini_v1.batch import BatchClient as GeminiBatchClient
 from summary.gemini_v1.batch import BatchError as GeminiBatchError
 from summary.gemini_v1.batch import BATCH_MODEL_IDS as GEMINI_BATCH_MODEL_IDS
@@ -39,7 +45,8 @@ from .tasks import RevisionConflict, TaskStore
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
 REASONING_EFFORT = "medium"
 LEGACY_QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
-QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v2"
+PREVIOUS_GEMINI_QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v2"
+QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v3_source_inventory"
 QUALITY_PROVIDER = "openrouter_gemini"
 GEMINI_MODEL = "google/gemini-3.7-flash:batch"
 GEMINI_PRIVACY_MODE = "openrouter_batch_30d_google_vertex_user_authorized"
@@ -98,17 +105,25 @@ def _quality_route(manifest: dict) -> str:
     policy = manifest.get("quality_policy_version")
     if policy == LEGACY_QUALITY_POLICY_VERSION and not manifest.get("quality_provider"):
         return "luna"
-    if policy == QUALITY_POLICY_VERSION and manifest.get("quality_provider") == QUALITY_PROVIDER:
+    if (policy in {PREVIOUS_GEMINI_QUALITY_POLICY_VERSION, QUALITY_POLICY_VERSION}
+            and manifest.get("quality_provider") == QUALITY_PROVIDER):
         return "gemini"
     raise ValueError("unknown_quality_policy")
 
 
-def _quality_prompt_path(provider: str) -> Path:
+def _quality_contract(provider: str, policy: str | None = None) -> tuple[Path, dict, str]:
     if provider == "luna":
-        return AUDIT_PROMPT_PATH
+        return AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID
     if provider == "gemini":
-        return GEMINI_AUDIT_PROMPT_PATH
+        if policy == PREVIOUS_GEMINI_QUALITY_POLICY_VERSION:
+            return GEMINI_AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID
+        if policy in {None, QUALITY_POLICY_VERSION}:
+            return GEMINI_AUDIT_PROMPT_PATH_V2, GEMINI_AUDIT_SCHEMA_V2, GEMINI_AUDIT_SCHEMA_ID_V2
     raise ValueError("unknown_quality_provider")
+
+
+def _quality_prompt_path(provider: str, policy: str | None = None) -> Path:
+    return _quality_contract(provider, policy)[0]
 
 
 def _request_body(source_text: str) -> dict:
@@ -144,8 +159,8 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
         "quality_provider": QUALITY_PROVIDER,
         "audit_model": GEMINI_MODEL,
         "audit_privacy_mode": GEMINI_PRIVACY_MODE,
-        "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
-        "audit_schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
+        "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH_V2.read_bytes()),
+        "audit_schema_sha256": _sha(_json_bytes(GEMINI_AUDIT_SCHEMA_V2)),
         "force_nonce": force_nonce,
     }
     return _sha(_json_bytes(material))
@@ -258,8 +273,8 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "judge_workspace_id": judge_scope,
             "audit_model": GEMINI_MODEL,
             "audit_privacy_mode": GEMINI_PRIVACY_MODE,
-            "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
-            "audit_schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
+            "audit_prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH_V2.read_bytes()),
+            "audit_schema_sha256": _sha(_json_bytes(GEMINI_AUDIT_SCHEMA_V2)),
             "request_sha256": _sha(serialized_request),
             "reserve_microusd": reserve_micros,
             "pricing": {
@@ -435,8 +450,10 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
                     "generation_id": generation_id, "generation_path": str(generation_path),
                     "consumer_results": _publish_accepted_consumers(ledger, ledger.get(job["id"]))}
         provider = _quality_route(request_manifest)
-        if (request_manifest.get("audit_prompt_sha256") != _sha(_quality_prompt_path(provider).read_bytes())
-                or request_manifest.get("audit_schema_sha256") != _sha(_json_bytes(AUDIT_SCHEMA))):
+        quality_prompt, quality_schema, _ = _quality_contract(
+            provider, request_manifest["quality_policy_version"])
+        if (request_manifest.get("audit_prompt_sha256") != _sha(quality_prompt.read_bytes())
+                or request_manifest.get("audit_schema_sha256") != _sha(_json_bytes(quality_schema))):
             raise ValueError("code_or_prompt_changed_while_pending")
         if not isinstance(document, dict):
             raise ValueError("draft_document_not_object")
@@ -473,8 +490,10 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     if job["kind"] not in {"audit", "verify"}:
         raise ValueError("unknown_quality_stage")
     provider = "gemini" if request_manifest.get("provider") == QUALITY_PROVIDER else "luna"
-    if (_sha(_quality_prompt_path(provider).read_bytes()) != request_manifest["prompt_sha256"]
-            or _sha(_json_bytes(AUDIT_SCHEMA)) != request_manifest["schema_sha256"]):
+    stage_policy = request_manifest.get("quality_policy_version")
+    stage_prompt, stage_schema, _ = _quality_contract(provider, stage_policy)
+    if (_sha(stage_prompt.read_bytes()) != request_manifest["prompt_sha256"]
+            or _sha(_json_bytes(stage_schema)) != request_manifest["schema_sha256"]):
         raise ValueError("audit_code_or_prompt_changed_while_pending")
     root = ledger.get(job["root_job_id"])
     if root is None or root["source_sha256"] != source_sha:
@@ -484,8 +503,12 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
     target = json.loads(target_bytes)
     if _sha(_json_bytes(target)) != request_manifest["target_document_sha256"]:
         raise ValueError("audit_target_changed")
-    validate_audit(document, target, source_index, mode=job["kind"])
-    warnings = coverage_warnings(document, source_index)
+    if provider == "gemini" and stage_policy == QUALITY_POLICY_VERSION:
+        validate_gemini_audit_v2(document, target, source_index, mode=job["kind"])
+        warnings = coverage_warnings_gemini_v2(document, source_index, target)
+    else:
+        validate_audit(document, target, source_index, mode=job["kind"])
+        warnings = coverage_warnings(document, source_index)
     if warnings:
         write_private_json(artifacts / "coverage_warnings.json", {"warnings": warnings})
     report_file = artifacts / "audit_report.json"
@@ -496,21 +519,23 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
 
 
 def _quality_request_body(source_text: str, target: dict, *, kind: str,
-                          prior_findings: list[dict], provider: str) -> dict:
+                          prior_findings: list[dict], provider: str,
+                          policy: str | None = None) -> dict:
     if kind not in {"audit", "verify"}:
         raise ValueError("invalid quality request kind")
     if provider == "gemini":
         # OpenRouter Chat Completions carries a Gemini-specific instruction.
         # The transcript stays in a separate user message and receives no
         # tools, web plugin, audio, or renderer output.
+        prompt_path, schema, schema_id = _quality_contract(provider, policy)
         return {
             "messages": [
-                {"role": "system", "content": GEMINI_AUDIT_PROMPT_PATH.read_text(encoding="utf-8")},
+                {"role": "system", "content": prompt_path.read_text(encoding="utf-8")},
                 {"role": "user", "content": build_gemini_audit_input(
                     source_text, target, mode=kind, prior_findings=prior_findings)},
             ],
             "response_format": {"type": "json_schema", "json_schema": {
-                "name": AUDIT_SCHEMA_ID, "strict": True, "schema": AUDIT_SCHEMA,
+                "name": schema_id, "strict": True, "schema": schema,
             }},
             "max_completion_tokens": 10_000 if kind == "audit" else 8_000,
             "reasoning": {"effort": "medium"},
@@ -532,15 +557,18 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
     }
 
 
-def _quality_stage_key(root: dict, kind: str, request_body: dict, provider: str) -> str:
-    prompt_path = _quality_prompt_path(provider)
+def _quality_stage_key(root: dict, kind: str, request_body: dict, provider: str,
+                       policy: str | None = None) -> str:
+    prompt_path, schema, _ = _quality_contract(provider, policy)
     return _sha(_json_bytes({
         "root_semantic_key": root["semantic_key"], "kind": kind,
         "request_sha256": _sha(_json_bytes(request_body)),
         "prompt_sha256": _sha(prompt_path.read_bytes()),
-        "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
-        "quality_policy_version": (QUALITY_POLICY_VERSION if provider == "gemini"
-                                   else LEGACY_QUALITY_POLICY_VERSION),
+        "schema_sha256": _sha(_json_bytes(schema)),
+        "quality_policy_version": (
+            (policy or QUALITY_POLICY_VERSION) if provider == "gemini"
+            else LEGACY_QUALITY_POLICY_VERSION
+        ),
         "provider": provider,
     }))
 
@@ -677,6 +705,8 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     from summary.gemini_v1.batch import BatchError as GeminiBatchError, batch_id_from_submit
 
     root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+    policy = root_manifest["quality_policy_version"]
+    prompt_path, schema, _ = _quality_contract("gemini", policy)
     pinned_scope = root_manifest.get("judge_workspace_id")
     if not isinstance(pinned_scope, str) or pinned_scope == "judge-unavailable":
         return {"status": "unavailable", "reason": "judge_credential_required_at_writer_dispatch"}
@@ -685,10 +715,11 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     if source_sha != root["source_sha256"]:
         raise ValueError("source_revision_changed_before_audit")
     request_body = _quality_request_body(source_text, target, kind=kind,
-                                         prior_findings=prior_findings, provider="gemini")
+                                         prior_findings=prior_findings, provider="gemini",
+                                         policy=policy)
     request_bytes = _json_bytes(request_body)
     target_sha = _sha(_json_bytes(target))
-    semantic_key = _quality_stage_key(root, kind, request_body, "gemini")
+    semantic_key = _quality_stage_key(root, kind, request_body, "gemini", policy)
     existing = ledger.stage(root["id"], kind)
     if existing is not None and existing["semantic_key"] != semantic_key:
         raise ValueError("quality_stage_identity_changed")
@@ -745,12 +776,12 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             "target_document_sha256": target_sha,
             "request_sha256": _sha(request_bytes),
             "custom_id": stage["custom_id"], "inline_request_count": 1,
-            "prompt_sha256": _sha(GEMINI_AUDIT_PROMPT_PATH.read_bytes()),
-            "schema_sha256": _sha(_json_bytes(AUDIT_SCHEMA)),
+            "prompt_sha256": _sha(prompt_path.read_bytes()),
+            "schema_sha256": _sha(_json_bytes(schema)),
             "credential_id": stage["credential_id"],
             "credential_version": stage["credential_version"],
             "workspace_id": pinned_scope, "model": GEMINI_MODEL,
-            "provider": QUALITY_PROVIDER, "quality_policy_version": QUALITY_POLICY_VERSION,
+            "provider": QUALITY_PROVIDER, "quality_policy_version": policy,
             "privacy_mode": GEMINI_PRIVACY_MODE,
             "provider_only": ["google-vertex"],
             "cache_policy": "no_explicit_cache_full_miss_reserved",
@@ -823,7 +854,7 @@ def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: 
         warning_file = Path(stage["artifact_dir"]) / "coverage_warnings.json"
         if warning_file.exists():
             coverage_warning_count += len(json.loads(warning_file.read_text(encoding="utf-8"))["warnings"])
-    if coverage_warning_count and status == "checked":
+    if coverage_warning_count and status in {"checked", "model_audit_unverified"}:
         status = "coverage_incomplete"
         reason = "coverage_report_inconsistent"
     quality_review = {
@@ -888,6 +919,10 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
                 status="audit_unavailable", reason=timeout)
         return {"status": "audit_pending", "job_id": root["id"], "stage_job_id": audit["id"]}
     report = json.loads(Path(audit["accepted_document_path"]).read_text(encoding="utf-8"))
+    inventory_contract = (isinstance(report, dict)
+                          and report.get("schema_version") == GEMINI_AUDIT_SCHEMA_ID_V2)
+    if inventory_contract:
+        report = legacy_report_v1(report)
     try:
         revised, unresolved = apply_audit(draft, report, source_index, mode="audit")
     except (ValueError, json.JSONDecodeError) as exc:
@@ -904,7 +939,9 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
     write_private_json(artifacts / "revised_document.json", revised)
     if not report["patches"]:
         return _finalize_quality(ledger, root, revised, source_index,
-            status="unresolved" if unresolved else "checked", unresolved_count=len(unresolved))
+            status=("unresolved" if unresolved else
+                    "model_audit_unverified" if inventory_contract else "checked"),
+            unresolved_count=len(unresolved))
     verify = ledger.stage(root["id"], "verify")
     if verify is None or verify["status"] == "reserved":
         started = _start_quality_stage(ledger, root, "verify", revised,
@@ -930,6 +967,8 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
                 reason=timeout)
         return {"status": "verify_pending", "job_id": root["id"], "stage_job_id": verify["id"]}
     verification = json.loads(Path(verify["accepted_document_path"]).read_text(encoding="utf-8"))
+    if isinstance(verification, dict) and verification.get("schema_version") == GEMINI_AUDIT_SCHEMA_ID_V2:
+        verification = legacy_report_v1(verification)
     try:
         checked, later_unresolved = apply_audit(revised, verification, source_index, mode="verify")
     except (ValueError, json.JSONDecodeError) as exc:
@@ -941,7 +980,8 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
         write_private_json(artifacts / "postverify_document.json", checked)
     return _finalize_quality(ledger, root, checked, source_index,
         status=("postverify_corrected_unchecked" if verification["patches"] else
-                "unresolved" if unresolved or later_unresolved else "checked"),
+                "unresolved" if unresolved or later_unresolved else
+                "model_audit_unverified" if inventory_contract else "checked"),
         unresolved_count=len(unresolved) + len(later_unresolved),
         reason="final_bounded_correction" if verification["patches"] else None)
 
