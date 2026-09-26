@@ -189,7 +189,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(json.loads((generation / "run_manifest.json").read_text())
                              ["quality_review"]["status"], "audit_unavailable")
 
-    def test_inconsistent_audit_coverage_cannot_publish_as_checked(self):
+    def test_invalid_audit_coverage_links_do_not_discard_or_look_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "outputs" / "meeting"
@@ -211,14 +211,15 @@ class EngineTests(unittest.TestCase):
 
             def inconsistent_coverage(_payload, report):
                 report["coverage"][0]["draft_coverage"] = "missing"
+                report["coverage"][0]["finding_indices"] = [99]
                 return report
 
             FakeClient.submit_calls = 0
             FakeClient.report_factory = inconsistent_coverage
             with patch("summary.luna_v1.engine._credential_store", return_value=FakeStore()), \
                  patch("summary.luna_v1.engine.verify_batch_route", return_value=route):
-                submit(transcript_path=source, output_dir=output,
-                       private_root=private, client_factory=FakeClient)
+                started = submit(transcript_path=source, output_dir=output,
+                                 private_root=private, client_factory=FakeClient)
             for expected in ("draft_ready", "stage_complete"):
                 arm_poll(private)
                 events = fake_poll(private, route)
@@ -228,7 +229,14 @@ class EngineTests(unittest.TestCase):
             generation = output / "summary_generations" / pointer["generation_id"]
             review = json.loads((generation / "run_manifest.json").read_text())["quality_review"]
             self.assertEqual(review["status"], "coverage_incomplete")
-            self.assertEqual(review["coverage_warning_count"], 1)
+            self.assertEqual(review["coverage_warning_count"], 2)
+            ledger = Ledger(private)
+            audit = ledger.stage(started["job_id"], "audit")
+            self.assertEqual(audit["status"], "stage_complete")
+            warnings = json.loads((Path(audit["artifact_dir"]) / "coverage_warnings.json").read_text())["warnings"]
+            ledger.close()
+            self.assertEqual([item["code"] for item in warnings],
+                             ["unknown_finding_index", "coverage_without_omission"])
             self.assertIn("полнота проверки не подтверждена", (generation / "summary.md").read_text())
 
     def test_omitted_action_is_added_and_verify_downgrades_uncertain_claim_before_publication(self):

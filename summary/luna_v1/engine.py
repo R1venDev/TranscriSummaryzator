@@ -30,7 +30,7 @@ from .tasks import RevisionConflict, TaskStore
 
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
 REASONING_EFFORT = "medium"
-QUALITY_POLICY_VERSION = "luna_auto_audit_v2"
+QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
 QUALITY_CREDENTIAL_WAIT_SECONDS = 30 * 60
 QUALITY_BATCH_WAIT_SECONDS = 26 * 60 * 60
 

@@ -15,7 +15,7 @@ from .contract import SCHEMA_ID, validate_document
 
 
 AUDIT_SCHEMA_ID = "luna_summary_audit_v1"
-AUDIT_PROMPT_PATH = Path(__file__).with_name("prompt_audit_v2.md")
+AUDIT_PROMPT_PATH = Path(__file__).with_name("prompt_audit_v3.md")
 AUDIT_SCHEMA = json.loads(Path(__file__).with_name("output_schema_audit_v1.json").read_text(encoding="utf-8"))
 _ARRAY_SECTIONS = ("main", "timecodes", "tasks", "questions", "technical", "ideas", "verification", "chapters")
 _SECTIONS = ("meeting",) + _ARRAY_SECTIONS
@@ -238,13 +238,11 @@ def validate_audit(report: dict, draft: dict, source_index: dict, *, mode: str =
         links = row["finding_indices"]
         if not isinstance(links, list) or len(set(_index(item, f"{where}.finding_indices") for item in links)) != len(links):
             raise ValueError(f"{where}: invalid finding indices")
-        for linked in links:
-            if linked >= len(findings):
-                raise ValueError(f"{where}: unknown finding index")
         # Window links and coverage labels are model bookkeeping. They do not
         # drive patches or the published document, so a mistaken association
-        # must not discard otherwise valid source-referenced corrections. Call
-        # coverage_warnings after validation to retain these diagnostics.
+        # (including a reference past the findings array) must not discard
+        # otherwise valid source-referenced corrections. Call coverage_warnings
+        # after validation to retain these diagnostics.
     return report
 
 
@@ -259,14 +257,20 @@ def coverage_warnings(report: dict, source_index: dict) -> list[dict]:
     warnings = []
     for number, (row, expected) in enumerate(zip(report["coverage"], windows)):
         members = set(all_ids[all_ids.index(expected["start_id"]):all_ids.index(expected["end_id"]) + 1])
+        valid_links = []
         for linked in row["finding_indices"]:
+            if linked >= len(report["findings"]):
+                warnings.append({"code": "unknown_finding_index", "coverage_index": number,
+                                 "finding_index": linked})
+                continue
+            valid_links.append(linked)
             if not (set(report["findings"][linked]["source_ids"]) & members):
                 warnings.append({"code": "finding_outside_window", "coverage_index": number,
                                  "finding_index": linked})
         if row["draft_coverage"] in {"partial", "missing"} and not any(
                 report["findings"][linked]["kind"] == "omission"
                 and set(report["findings"][linked]["source_ids"]) & members
-                for linked in row["finding_indices"]):
+                for linked in valid_links):
             warnings.append({"code": "coverage_without_omission", "coverage_index": number})
     return warnings
 

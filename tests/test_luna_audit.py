@@ -103,6 +103,9 @@ class LunaAuditTests(unittest.TestCase):
         self.assertIn("MODE=audit", prompt)
         self.assertIn("MODE=verify", prompt)
         self.assertIn("всей исходной стенограмме", prompt)
+        self.assertIn("произнесённая", prompt)
+        self.assertIn("без сопоставления с профилем", prompt)
+        self.assertIn("триггер", prompt)
         self.assertEqual(len(source_windows(self.index)), 3)
 
     def test_canonical_input_keeps_full_source_and_draft_separate(self):
@@ -250,11 +253,17 @@ class LunaAuditTests(unittest.TestCase):
         self.assertEqual(len(unresolved), 1)
         self.assertEqual(report, original)
 
-    def test_coverage_bookkeeping_still_requires_existing_finding_index(self):
+    def test_unknown_coverage_finding_does_not_discard_valid_patches(self):
         report = self._report()
         report["coverage"][0]["finding_indices"] = [99]
-        with self.assertRaisesRegex(ValueError, "unknown finding index"):
-            validate_audit(report, self.draft, self.index)
+        original = copy.deepcopy(report)
+        self.assertIs(validate_audit(report, self.draft, self.index), report)
+        self.assertEqual(coverage_warnings(report, self.index), [
+            {"code": "unknown_finding_index", "coverage_index": 0, "finding_index": 99},
+        ])
+        revised, _ = apply_audit(self.draft, report, self.index)
+        self.assertEqual(revised["tasks"][1]["title"], "Проверить Y")
+        self.assertEqual(report, original)
 
     def test_can_repair_parseable_structurally_invalid_draft(self):
         broken = copy.deepcopy(self.draft)
