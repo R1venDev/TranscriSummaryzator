@@ -230,6 +230,12 @@ class SavedAuditRecoveryTests(unittest.TestCase):
             self._recover(apply=True)
         self.assertFalse((self.output / "summary_current.json").exists())
 
+    def test_apply_requires_the_private_state_owner(self):
+        with patch("summary.luna_v1.recovery.os.geteuid", return_value=self.private.stat().st_uid + 1):
+            with self.assertRaisesRegex(PermissionError, "owner of the private summary state"):
+                self._recover(apply=True)
+        self.assertFalse((self.output / "summary_current.json").exists())
+
     def test_foreign_pointer_arriving_after_preflight_cannot_be_replaced(self):
         from summary.luna_v1 import recovery
 

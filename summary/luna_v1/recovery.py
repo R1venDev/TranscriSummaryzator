@@ -133,7 +133,9 @@ def recover_saved_v3(*, private_root: Path, root_job_id: str,
     expected.validate()
     if recovery_code_sha256() != expected.code_sha256:
         raise ValueError("recovery code SHA-256 changed")
-    private_root = Path(private_root)
+    private_root = Path(private_root).resolve()
+    if apply and os.geteuid() != private_root.stat().st_uid:
+        raise PermissionError("run recovery as the owner of the private summary state")
     ledger = Ledger(private_root)
     try:
         root = ledger.get(root_job_id)
