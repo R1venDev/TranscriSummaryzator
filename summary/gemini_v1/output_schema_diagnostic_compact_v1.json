@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["gemini_diagnostic_compact_v1"]
+    },
+    "item_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "item_id": {"type": "string"},
+          "source_status": {
+            "type": "string",
+            "enum": ["supported", "contradicted", "uncertain"]
+          },
+          "draft_status": {
+            "type": "string",
+            "enum": ["represented", "partial", "missing", "contradicted", "uncertain"]
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "draft_evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "unit_id": {"type": "string"},
+                "quote": {"type": "string"}
+              },
+              "required": ["unit_id", "quote"]
+            }
+          },
+          "missing_facets": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "task_modality": {
+            "type": "string",
+            "enum": [
+              "commitment",
+              "proposal",
+              "past_or_cancelled",
+              "technical_or_question",
+              "uncertain"
+            ]
+          },
+          "reason": {"type": "string"},
+          "proposed_edit_target": {"type": ["string", "null"]},
+          "proposed_edit_text": {"type": ["string", "null"]}
+        },
+        "required": [
+          "item_id", "source_status", "draft_status", "source_ids",
+          "draft_evidence", "missing_facets", "task_modality", "reason",
+          "proposed_edit_target", "proposed_edit_text"
+        ]
+      }
+    }
+  },
+  "required": ["schema_version", "item_assessments"]
+}

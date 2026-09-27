@@ -1,0 +1,424 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "gemini_segment_review_v1"
+      ]
+    },
+    "segment_id": {
+      "type": "string"
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "window_id": {
+            "type": "string"
+          },
+          "start_id": {
+            "type": "string"
+          },
+          "end_id": {
+            "type": "string"
+          },
+          "assessment": {
+            "type": "string",
+            "enum": [
+              "material_items",
+              "no_material_items",
+              "uncertain"
+            ]
+          },
+          "item_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "window_id",
+          "start_id",
+          "end_id",
+          "assessment",
+          "item_indices"
+        ]
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "action",
+              "decision",
+              "constraint",
+              "question",
+              "answer",
+              "correction",
+              "technical",
+              "context"
+            ]
+          },
+          "claim": {
+            "type": "string"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "speaker": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recipient": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "modality": {
+            "type": "string",
+            "enum": [
+              "proposed",
+              "committed",
+              "conditional",
+              "completed",
+              "cancelled",
+              "rejected",
+              "open",
+              "answered",
+              "observation",
+              "explanation",
+              "hypothesis",
+              "unknown"
+            ]
+          },
+          "condition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "alternatives": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "correction_of": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "uncertainty": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "claim",
+          "source_ids",
+          "speaker",
+          "actor",
+          "recipient",
+          "action",
+          "modality",
+          "condition",
+          "alternatives",
+          "correction_of",
+          "uncertainty"
+        ]
+      }
+    },
+    "item_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "item_index": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "represented",
+              "partial",
+              "missing",
+              "contradicted",
+              "uncertain"
+            ]
+          },
+          "draft_targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": [
+                    "meeting",
+                    "main",
+                    "timecodes",
+                    "tasks",
+                    "questions",
+                    "technical",
+                    "ideas",
+                    "verification",
+                    "chapters"
+                  ]
+                },
+                "index": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "section",
+                "index"
+              ]
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "item_index",
+          "status",
+          "draft_targets",
+          "finding_indices"
+        ]
+      }
+    },
+    "draft_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "partial",
+              "unsupported",
+              "uncertain"
+            ]
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "item_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "unit_id",
+          "status",
+          "source_ids",
+          "item_indices",
+          "finding_indices"
+        ]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "major",
+              "minor"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "unsupported_claim",
+              "omission",
+              "role",
+              "modality",
+              "alternative",
+              "condition",
+              "number",
+              "time",
+              "late_correction",
+              "duplication",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "affected": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": [
+                    "meeting",
+                    "main",
+                    "timecodes",
+                    "tasks",
+                    "questions",
+                    "technical",
+                    "ideas",
+                    "verification",
+                    "chapters"
+                  ]
+                },
+                "index": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "section",
+                "index"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "repaired",
+              "unresolved"
+            ]
+          },
+          "patch_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "severity",
+          "kind",
+          "description",
+          "source_ids",
+          "affected",
+          "status",
+          "patch_indices"
+        ]
+      }
+    },
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "section": {
+            "type": "string",
+            "enum": [
+              "meeting",
+              "main",
+              "timecodes",
+              "tasks",
+              "questions",
+              "technical",
+              "ideas",
+              "verification",
+              "chapters"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "insert",
+              "replace",
+              "remove"
+            ]
+          },
+          "index": {
+            "type": "integer"
+          },
+          "item_json": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "section",
+          "operation",
+          "index",
+          "item_json"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "segment_id",
+    "coverage",
+    "items",
+    "item_assessments",
+    "draft_assessments",
+    "findings",
+    "patches"
+  ]
+}

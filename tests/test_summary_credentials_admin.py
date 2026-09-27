@@ -21,6 +21,7 @@ from summary_credentials import CredentialError, CredentialStore, credential_dis
 
 FAKE_KEY_A = "sk-or-v1-fake-credential-0001"
 FAKE_KEY_B = "sk-or-v1-fake-credential-0002"
+FAKE_JUDGE_KEY = "sk-or-v1-fake-judge-credential-0003"
 
 
 class FakeKeyResponse:
@@ -34,6 +35,12 @@ class FakeKeyResponse:
         return json.dumps({"data": {"workspace_id": "0df9e665-d932-5740-b2c7-b52af166bc11", "limit": 1.0,
                                     "limit_remaining": 0.8, "limit_reset": "weekly",
                                     "usage_weekly": 0.2}}).encode()
+
+
+class FakeManagementKeyResponse(FakeKeyResponse):
+    def read(self, _):
+        return json.dumps({"data": {"workspace_id": "0df9e665-d932-5740-b2c7-b52af166bc11",
+                                    "is_management_key": True}}).encode()
 
 
 class CredentialStoreTests(unittest.TestCase):
@@ -76,6 +83,80 @@ class CredentialStoreTests(unittest.TestCase):
         with sqlite3.connect(self.store.path) as db:
             events = db.execute("SELECT operation FROM credential_events").fetchall()
         self.assertEqual(events, [])
+
+    def test_judge_openrouter_key_isolated_and_recheckable_without_reentry(self):
+        writer = self.store.add("Автор", FAKE_KEY_A)
+        judge = self.store.add("Проверяющий", FAKE_JUDGE_KEY, role="judge")
+        requests = []
+
+        def openrouter_open(request, **_kwargs):
+            requests.append(request)
+            return FakeKeyResponse()
+
+        # A saved judge key can be rechecked when the routed model changes.
+        with self.store._connect() as db:
+            db.execute("UPDATE credentials SET status='error' WHERE id=?", (judge["id"],))
+            original = db.execute("SELECT ciphertext,version,role FROM credentials WHERE id=?", (judge["id"],)).fetchone()
+        checked = self.store.check(judge["id"], opener=openrouter_open)
+        self.assertEqual(checked["status"], "ready")
+        self.assertEqual(checked["workspace_id"], "0df9e665-d932-5740-b2c7-b52af166bc11")
+        self.assertEqual(checked["limit_remaining"], 0.8)
+        self.assertEqual(checked["version"], 1)
+        with self.store._connect() as db:
+            current = db.execute("SELECT ciphertext,version,role FROM credentials WHERE id=?", (judge["id"],)).fetchone()
+        self.assertEqual(tuple(current), tuple(original))
+        self.assertNotIn("paid_tier_confirmed", checked)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_method(), "GET")
+        self.assertEqual(requests[0].full_url, "https://openrouter.ai/api/v1/key")
+        self.assertEqual(dict((name.lower(), value) for name, value in requests[0].header_items())["authorization"],
+                         "Bearer " + FAKE_JUDGE_KEY)
+        self.assertNotIn(FAKE_JUDGE_KEY, requests[0].full_url)
+        self.assertEqual(self.store.dispatch_candidates(role="judge")[0]["id"], judge["id"])
+        with self.assertRaises(CredentialError):
+            self.store.reveal_for_dispatch(judge["id"], 1)
+        self.assertEqual(self.store.dispatch_candidates(), [])  # writer not checked yet
+        self.store.check(writer["id"], opener=lambda *_args, **_kwargs: FakeKeyResponse())
+        self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
+        self.assertEqual([item["id"] for item in self.store.dispatch_candidates()], [writer["id"]])
+        with self.assertRaises(CredentialError):
+            self.store.set_order([writer["id"]], role="judge")
+        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 1, role="judge"), FAKE_JUDGE_KEY)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), self.store.path.read_bytes())
+        self.assertNotIn(FAKE_JUDGE_KEY, json.dumps(self.store.list()))
+        self.store.replace(judge["id"], FAKE_JUDGE_KEY)
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
+        self.assertEqual(self.store.check(judge["id"], opener=openrouter_open)["status"], "ready")
+        self.assertEqual(self.store.reveal_for_dispatch(judge["id"], 2, role="judge"), FAKE_JUDGE_KEY)
+
+    def test_management_key_does_not_enter_inference_dispatch(self):
+        judge = self.store.add("Административный", FAKE_JUDGE_KEY, role="judge")
+        self.assertEqual(self.store.check(judge["id"], opener=lambda *_a, **_k: FakeManagementKeyResponse())["status"], "error")
+        self.assertEqual(self.store.dispatch_candidates(role="judge"), [])
+
+    def test_existing_database_migrates_to_writer_without_changing_ciphertext(self):
+        legacy_path = self.root / "legacy" / "credentials.sqlite3"
+        legacy_path.parent.mkdir(mode=0o700)
+        master = Fernet.generate_key()
+        ciphertext = Fernet(master).encrypt(FAKE_KEY_A.encode())
+        with sqlite3.connect(legacy_path) as db:
+            db.execute("""CREATE TABLE credentials (
+                id TEXT PRIMARY KEY, version INTEGER NOT NULL, label TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                ciphertext BLOB NOT NULL, mask TEXT NOT NULL, enabled INTEGER NOT NULL,
+                priority INTEGER NOT NULL, status TEXT NOT NULL, checked_at TEXT,
+                workspace_id TEXT, limit_amount REAL, limit_remaining REAL,
+                limit_reset TEXT, usage_weekly REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+            db.execute("""INSERT INTO credentials
+                (id,version,label,ciphertext,mask,enabled,priority,status,created_at,updated_at)
+                VALUES(?,1,'Старый',?,'••••0001',1,0,'ready','old','old')""",
+                ("a" * 32, ciphertext))
+        os.chmod(legacy_path, 0o600)
+        migrated = CredentialStore(legacy_path, master)
+        self.assertEqual(migrated.dispatch_candidates()[0]["role"], "writer")
+        self.assertEqual(migrated.reveal_for_existing_job("a" * 32, 1), FAKE_KEY_A)
+        with sqlite3.connect(legacy_path) as db:
+            self.assertEqual(db.execute("SELECT ciphertext FROM credentials").fetchone()[0], ciphertext)
+            self.assertIn("role", [row[1] for row in db.execute("PRAGMA table_info(credentials)")])
 
     def test_dispatch_guard_serializes_separate_users_of_credential_path(self):
         started = threading.Event()
@@ -195,6 +276,29 @@ class AdminHttpTests(unittest.TestCase):
         status, raw, _ = self.request("POST", "/api/summary/credentials/delete", {"id": identifier})
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(raw)["result"]["revoked_upstream"])
+
+    def test_judge_admin_role_protected(self):
+        body = {"role": "judge", "label": "Claude Opus 5.5 judge", "key": FAKE_JUDGE_KEY}
+        status, _, _ = self.request("POST", "/api/summary/credentials/add", body, auth=False)
+        self.assertEqual(status, 401)
+        status, _, _ = self.request("POST", "/api/summary/credentials/add", body, origin=False)
+        self.assertEqual(status, 403)
+        status, raw, _ = self.request("POST", "/api/summary/credentials/add", body)
+        self.assertEqual(status, 201)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), raw)
+        identifier = json.loads(raw)["result"]["id"]
+        status, raw, _ = self.request("GET", "/api/summary/credentials")
+        self.assertEqual(status, 200)
+        self.assertNotIn(FAKE_JUDGE_KEY.encode(), raw)
+        self.assertEqual(json.loads(raw)["keys"][0]["role"], "judge")
+        self.assertEqual(json.loads(raw)["keys"][0]["id"], identifier)
+        status, page, _ = self.request("GET", "/summary-settings")
+        self.assertEqual(status, 200)
+        self.assertIn("OpenRouter Batch / Claude Opus 5.5".encode(), page)
+        self.assertIn("без повторного ввода".encode(), page)
+        self.assertIn("не подтверждает доступность Claude Opus 5.5 и Batch".encode(), page)
+        self.assertNotIn(b"Gemini", page)
+        self.assertNotIn("оплачиваемого Google-проекта".encode(), page)
 
 
 if __name__ == "__main__":

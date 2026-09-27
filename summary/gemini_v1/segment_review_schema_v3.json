@@ -1,0 +1,362 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "gemini_segment_review_v3"
+      ]
+    },
+    "segment_id": {
+      "type": "string"
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "window_id": {
+            "type": "string"
+          },
+          "start_id": {
+            "type": "string"
+          },
+          "end_id": {
+            "type": "string"
+          },
+          "assessment": {
+            "type": "string",
+            "enum": [
+              "material_items",
+              "no_material_items",
+              "uncertain"
+            ]
+          },
+          "item_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "window_id",
+          "start_id",
+          "end_id",
+          "assessment",
+          "item_indices"
+        ]
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "k": {
+            "type": "string",
+            "enum": [
+              "action",
+              "decision",
+              "constraint",
+              "question",
+              "answer",
+              "correction",
+              "technical",
+              "context"
+            ]
+          },
+          "c": {
+            "type": "string"
+          },
+          "s": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "m": {
+            "type": "string",
+            "enum": [
+              "proposed",
+              "committed",
+              "conditional",
+              "completed",
+              "cancelled",
+              "rejected",
+              "open",
+              "answered",
+              "observation",
+              "explanation",
+              "hypothesis",
+              "unknown"
+            ]
+          },
+          "a": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "r": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "if": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "or": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fix": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "v": {
+            "type": "string",
+            "enum": [
+              "represented",
+              "partial",
+              "missing",
+              "contradicted",
+              "uncertain"
+            ]
+          },
+          "t": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "f": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "k",
+          "c",
+          "s",
+          "m",
+          "a",
+          "r",
+          "if",
+          "or",
+          "fix",
+          "v",
+          "t",
+          "f"
+        ]
+      }
+    },
+    "draft_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "partial",
+              "unsupported",
+              "uncertain"
+            ]
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "item_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "unit_id",
+          "status",
+          "source_ids",
+          "item_indices",
+          "finding_indices"
+        ]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "major",
+              "minor"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "unsupported_claim",
+              "omission",
+              "role",
+              "modality",
+              "alternative",
+              "condition",
+              "number",
+              "time",
+              "late_correction",
+              "duplication",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "affected": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": [
+                    "meeting",
+                    "main",
+                    "timecodes",
+                    "tasks",
+                    "questions",
+                    "technical",
+                    "ideas",
+                    "verification",
+                    "chapters"
+                  ]
+                },
+                "index": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "section",
+                "index"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "repaired",
+              "unresolved"
+            ]
+          },
+          "patch_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "severity",
+          "kind",
+          "description",
+          "source_ids",
+          "affected",
+          "status",
+          "patch_indices"
+        ]
+      }
+    },
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "section": {
+            "type": "string",
+            "enum": [
+              "meeting",
+              "main",
+              "timecodes",
+              "tasks",
+              "questions",
+              "technical",
+              "ideas",
+              "verification",
+              "chapters"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "insert",
+              "replace",
+              "remove"
+            ]
+          },
+          "index": {
+            "type": "integer"
+          },
+          "item_json": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "section",
+          "operation",
+          "index",
+          "item_json"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "segment_id",
+    "coverage",
+    "items",
+    "draft_assessments",
+    "findings",
+    "patches"
+  ]
+}

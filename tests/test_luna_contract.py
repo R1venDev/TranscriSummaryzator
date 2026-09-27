@@ -107,6 +107,58 @@ class LunaContractTests(unittest.TestCase):
         self.assertIsNone(rendered["tasks.json"][0]["assignee"])
         self.assertEqual(rendered["summary.json"]["source_sha256"], self.sha)
 
+    def test_source_reviewed_recovery_is_visibly_unverified(self):
+        quality = {"status": "source_reviewed_local_correction_unverified",
+                   "unresolved_count": 0, "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertIn("локально исправила ошибки", rendered["summary.md"])
+        self.assertIn("не проходил повторную модельную проверку", rendered["summary.fragment.html"])
+
+    def test_reconciled_status_is_not_mislabeled_incomplete(self):
+        quality = {"status": "model_reconciled_checked",
+                   "unresolved_count": 0, "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertNotIn("Автоматическая смысловая проверка завершилась не полностью",
+                         rendered["summary.md"])
+        self.assertEqual(rendered["summary.json"]["quality_review"]["status"],
+                         "model_reconciled_checked")
+
+    def test_opus_audit_without_patches_is_visible_without_overclaiming(self):
+        quality = {"status": "opus_audited_unverified", "unresolved_count": 0,
+                   "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertIn("повторная модельная проверка не запускалась", rendered["summary.md"])
+        self.assertIn("Полнота и точность этим не гарантированы", rendered["summary.fragment.html"])
+        self.assertEqual(rendered["summary.json"]["quality_review"], quality)
+
+    def test_opus_self_verify_is_labeled_as_same_model_check(self):
+        quality = {"status": "opus_self_verified", "unresolved_count": 0,
+                   "coverage_warning_count": 0}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertIn("проверка той же моделью", rendered["summary.md"])
+        self.assertIn("не независимое подтверждение", rendered["summary.fragment.html"])
+
+    def test_opus_unavailable_and_unresolved_statuses_are_visible(self):
+        cases = (
+            ("opus_audit_unavailable", "без этой смысловой проверки"),
+            ("opus_verify_unavailable", "адресная повторная проверка не завершилась"),
+            ("unresolved", "оставила 2 вопрос(ов)"),
+        )
+        for status, phrase in cases:
+            with self.subTest(status=status):
+                quality = {"status": status, "unresolved_count": 2,
+                           "coverage_warning_count": 0}
+                rendered = render_document(_document(), self.index, quality_review=quality)
+                self.assertIn(phrase, rendered["summary.fragment.html"])
+                self.assertEqual(rendered["summary.json"]["quality_review"]["status"], status)
+
+    def test_opus_coverage_warning_overrides_positive_notice(self):
+        quality = {"status": "opus_self_verified", "unresolved_count": 0,
+                   "coverage_warning_count": 1}
+        rendered = render_document(_document(), self.index, quality_review=quality)
+        self.assertIn("1 несогласованных", rendered["summary.md"])
+        self.assertIn("полнота проверки не подтверждена", rendered["summary.fragment.html"])
+
     def test_html_escapes_model_and_source_and_links_actual_time(self):
         rendered = render_document(_document(), self.index)
         for name in ("summary.html", "summary.fragment.html"):
@@ -126,6 +178,30 @@ class LunaContractTests(unittest.TestCase):
         doc = _document()
         doc["tasks"][0]["assignee"] = "@Алекс"
         with self.assertRaisesRegex(ValueError, "assignee and its source references disagree"):
+            validate_document(doc, self.index)
+
+    def test_null_optional_fields_can_retain_evidence_of_uncertainty(self):
+        doc = _document()
+        task = doc["tasks"][0]
+        for field in ("assignee", "due", "priority", "recipient"):
+            task["field_sources"][field] = ["U00001"]
+        self.assertIs(validate_document(doc, self.index), doc)
+        exported = render_document(doc, self.index)["tasks.json"][0]
+        self.assertIsNone(exported["due"])
+        self.assertEqual(exported["field_sources"]["due"], ["U00001"])
+
+    def test_populated_optional_fields_still_require_valid_evidence(self):
+        for field, value in (("assignee", "@Алекс"), ("due", "К следующему разу"),
+                             ("priority", "Высокий"), ("recipient", "@Алекс")):
+            with self.subTest(field=field):
+                doc = _document()
+                doc["tasks"][0][field] = value
+                with self.assertRaisesRegex(ValueError, f"{field} and its source references disagree"):
+                    validate_document(doc, self.index)
+
+        doc = _document()
+        doc["tasks"][0]["field_sources"]["due"] = ["U00002"]
+        with self.assertRaisesRegex(ValueError, "field evidence is absent from task sources"):
             validate_document(doc, self.index)
 
     def test_effective_manual_edit_keeps_action_id_and_sealed_evidence(self):

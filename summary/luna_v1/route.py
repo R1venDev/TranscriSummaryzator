@@ -29,15 +29,19 @@ class Route:
     request_usd: Decimal
     key_limit_remaining_usd: Decimal | None
 
-    def reserve_microusd(self, serialized_request: bytes) -> int:
+    def reserve_microusd(self, serialized_request: bytes, *,
+                         max_completion_tokens: int | None = None) -> int:
         # A deliberately loose source upper bound: UTF-8 bytes plus 20% for
         # transport/tokenizer overhead. No promised cache hit is subtracted.
+        output_cap = self.max_completion_tokens if max_completion_tokens is None else max_completion_tokens
+        if not 1 <= output_cap <= self.max_completion_tokens:
+            raise RouteBlocked("invalid_output_cap")
         input_upper = (len(serialized_request) * 6 + 4) // 5
-        if input_upper + self.max_completion_tokens > self.max_context_tokens:
+        if input_upper + output_cap > self.max_context_tokens:
             raise RouteBlocked("context_capacity_unverified")
         cost = (Decimal(input_upper) * max(self.prompt_usd_per_token,
                                            self.cache_write_usd_per_token)
-                + Decimal(self.max_completion_tokens) * self.completion_usd_per_token
+                + Decimal(output_cap) * self.completion_usd_per_token
                 + self.request_usd)
         reserve = int((cost * 1_000_000).to_integral_value(rounding=ROUND_UP))
         if reserve < 1 or reserve > JOB_CAP_MICROUSD:

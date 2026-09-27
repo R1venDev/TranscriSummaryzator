@@ -1,0 +1,310 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "gemini_inventory_reconcile_v1"
+      ]
+    },
+    "source_window_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "window_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "confirmed_no_material",
+              "material_in_inventory",
+              "new_material",
+              "uncertain"
+            ]
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "window_id",
+          "status",
+          "source_ids",
+          "finding_indices"
+        ]
+      }
+    },
+    "inventory_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "item_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "represented",
+              "partial",
+              "missing",
+              "contradicted",
+              "uncertain"
+            ]
+          },
+          "draft_targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": [
+                    "meeting",
+                    "main",
+                    "timecodes",
+                    "tasks",
+                    "questions",
+                    "technical",
+                    "ideas",
+                    "verification",
+                    "chapters"
+                  ]
+                },
+                "index": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "section",
+                "index"
+              ]
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "item_id",
+          "status",
+          "draft_targets",
+          "finding_indices"
+        ]
+      }
+    },
+    "draft_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "supported",
+              "supported_uninventoried",
+              "partial",
+              "unsupported",
+              "uncertain"
+            ]
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "inventory_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "finding_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "unit_id",
+          "status",
+          "source_ids",
+          "inventory_ids",
+          "finding_indices"
+        ]
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "major",
+              "minor"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "unsupported_claim",
+              "omission",
+              "role",
+              "modality",
+              "alternative",
+              "condition",
+              "number",
+              "time",
+              "late_correction",
+              "duplication",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "source_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "affected": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "section": {
+                  "type": "string",
+                  "enum": [
+                    "meeting",
+                    "main",
+                    "timecodes",
+                    "tasks",
+                    "questions",
+                    "technical",
+                    "ideas",
+                    "verification",
+                    "chapters"
+                  ]
+                },
+                "index": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "section",
+                "index"
+              ]
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "repaired",
+              "unresolved"
+            ]
+          },
+          "patch_indices": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        },
+        "required": [
+          "severity",
+          "kind",
+          "description",
+          "source_ids",
+          "affected",
+          "status",
+          "patch_indices"
+        ]
+      }
+    },
+    "patches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "section": {
+            "type": "string",
+            "enum": [
+              "meeting",
+              "main",
+              "timecodes",
+              "tasks",
+              "questions",
+              "technical",
+              "ideas",
+              "verification",
+              "chapters"
+            ]
+          },
+          "operation": {
+            "type": "string",
+            "enum": [
+              "insert",
+              "replace",
+              "remove"
+            ]
+          },
+          "index": {
+            "type": "integer"
+          },
+          "item_json": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "section",
+          "operation",
+          "index",
+          "item_json"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "source_window_assessments",
+    "inventory_assessments",
+    "draft_assessments",
+    "findings",
+    "patches"
+  ]
+}

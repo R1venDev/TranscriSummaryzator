@@ -105,7 +105,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "c3f153665ecc373626884dadc91f5a02d7e4b0b60114bfcb1182f437ca44c128"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "9e91b259703fa4007002ffe53eca8cd4abb79351a2d672aed9598153cf5bfbed"
 
 
 def _stage_pipeline_sha256(source):
@@ -2298,7 +2298,7 @@ def _luna_output_has_active_batch(output_dir):
             count = ledger.execute("""SELECT COUNT(DISTINCT j.id) FROM jobs AS j
                 LEFT JOIN consumers AS c ON c.semantic_key=j.semantic_key
                 WHERE (j.output_dir=? OR c.output_dir=?) AND j.status IN
-                ('reserved','submitting','submission_unknown','submitted','polling','credential_required','completed_raw')""",
+                ('reserved','submitting','submission_unknown','submitted','polling','credential_required','completed_raw','quality_pending')""",
                 (str(output_dir), str(output_dir))).fetchone()[0]
             return count > 0
         finally:
@@ -2364,7 +2364,7 @@ def reconcile_luna_summary_queue():
     ledger.row_factory = sqlite3.Row
     changed = 0
     try:
-        rows = db.execute("""SELECT id,output_dir,summary_status,summary_attempt_id,summary_started_at FROM jobs
+        rows = db.execute("""SELECT id,output_dir,summary_status,summary_stage,summary_attempt_id,summary_started_at FROM jobs
             WHERE status='done' AND output_dir IS NOT NULL
               AND summary_status IN ('running','pending_batch','submission_unknown','credential_required')""").fetchall()
         for row in rows:
@@ -2427,6 +2427,11 @@ def reconcile_luna_summary_queue():
             elif state in {"submitted", "polling", "completed_raw"} and row["summary_status"] != "pending_batch":
                 update_job(db, row["id"], summary_status="pending_batch", summary_stage="summary_pending_batch",
                            summary_detail="OpenRouter Batch выполняется", summary_error=None)
+                changed += 1
+            elif state == "quality_pending" and (row["summary_status"] != "pending_batch"
+                                                  or row["summary_stage"] != "summary_quality_pending"):
+                update_job(db, row["id"], summary_status="pending_batch", summary_stage="summary_quality_pending",
+                           summary_progress=80, summary_detail="Автоматически проверяю саммари", summary_error=None)
                 changed += 1
             elif state == "credential_required" and row["summary_status"] != "credential_required":
                 update_job(db, row["id"], summary_status="credential_required", summary_stage="summary_credential_required",

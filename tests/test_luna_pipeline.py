@@ -223,6 +223,44 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
         second = pipeline.connect().execute("SELECT summary_status FROM jobs WHERE id=?", (second_job_id,)).fetchone()
         self.assertEqual(second["summary_status"], "queued_force")
 
+    def test_quality_pending_blocks_new_force_after_source_change_and_updates_display(self):
+        db = pipeline.connect()
+        job_id = _job(db, self.output, self.work, summary_status="queued_force", attempt_id="attempt-quality")
+        db.close()
+        original_sha = hashlib.sha256((self.output / "transcript.json").read_bytes()).hexdigest()
+        ledger = Ledger(self.state / "summary_private")
+        decision = ledger.reserve(semantic_key="q" * 64, source_sha256=original_sha,
+            output_dir=self.output, credential_id="key-synthetic", credential_version=1,
+            workspace_id="workspace-synthetic", max_cost_microusd=1000)
+        self.assertEqual(decision.kind, "new")
+        ledger.mark_submitting(decision.job_id)
+        ledger.submission_result(decision.job_id, remote_id="batch_quality_synthetic")
+        ledger.poll_result(decision.job_id, "completed", usage_cost_microusd=200)
+        ledger.mark_quality_pending(decision.job_id)
+        ledger.close()
+        (self.output / "transcript.json").write_text('{"synthetic":true,"revision":2}\n', encoding="utf-8")
+
+        with patch.object(pipeline, "process_summary", side_effect=AssertionError("duplicate paid dispatch")):
+            self.assertFalse(pipeline.run_next_summary())
+        db = pipeline.connect()
+        row = db.execute("SELECT summary_status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        self.assertEqual(row["summary_status"], "queued_force")
+        db.execute("UPDATE jobs SET summary_status='pending_batch',summary_stage='summary_pending_batch' WHERE id=?", (job_id,))
+        db.commit()
+        db.close()
+        pipeline.write_json(self.output / "summary_luna_attempt.json", {"job_id": decision.job_id})
+        pipeline.write_json(self.output / "summary_attempt.json", {"attempt_id": "attempt-quality"})
+        with patch.object(pipeline, "run_command", side_effect=AssertionError("external call")):
+            self.assertEqual(pipeline.reconcile_luna_summary_queue(), 1)
+            self.assertEqual(pipeline.reconcile_luna_summary_queue(), 0)
+        row = pipeline.connect().execute(
+            "SELECT summary_status,summary_stage,summary_progress,summary_detail FROM jobs WHERE id=?",
+            (job_id,)).fetchone()
+        self.assertEqual((row["summary_status"], row["summary_stage"]),
+                         ("pending_batch", "summary_quality_pending"))
+        self.assertEqual(row["summary_progress"], 80)
+        self.assertIn("проверяю", row["summary_detail"])
+
     def test_second_consumer_recovers_from_ledger_without_attempt_file(self):
         source_sha = hashlib.sha256((self.output / "transcript.json").read_bytes()).hexdigest()
         ledger = Ledger(self.state / "summary_private")

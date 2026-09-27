@@ -120,7 +120,9 @@ def validate_document(document: dict, source_index: dict) -> dict:
             if not set(ids).issubset(item["source_ids"]):
                 raise ValueError(f"{where}: field evidence is absent from task sources")
             if field in ("assignee", "due", "priority", "recipient"):
-                if (item[field] is None) != (not ids):
+                # Evidence may explain why an optional value remains unknown.
+                # A populated value, however, must always cite its source.
+                if item[field] is not None and not ids:
                     raise ValueError(f"{where}: {field} and its source references disagree")
 
     for number, item in enumerate(document["verification"]):
