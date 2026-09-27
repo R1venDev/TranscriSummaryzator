@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from summary.gemini_v1.batch import MODEL as GEMINI_MODEL, RESOLVED_MODEL, Reply as GeminiReply
 from summary.gemini_v1.audit_v2 import GEMINI_AUDIT_SCHEMA_ID_V2
-from summary.luna_v1.engine import (INVENTORY_V2_QUALITY_POLICY_VERSION,
+from summary.luna_v1.engine import (EVIDENCE_RECONCILE_QUALITY_POLICY_VERSION,
+                                    INVENTORY_V2_QUALITY_POLICY_VERSION,
                                     _cost_micros, _finish_raw, _quality_contract,
                                     _quality_route, poll_once, submit)
 from summary.luna_v1.audit import AUDIT_SCHEMA, AUDIT_SCHEMA_ID
@@ -113,6 +114,122 @@ class FakeGemini:
 
 
 class GeminiEngineTests(unittest.TestCase):
+    def _saved_gemini_writer(self, output, private):
+        output.mkdir()
+        source = output / "transcript.json"
+        source.write_text(json.dumps({"source": "Синтетика.mkv", "duration_seconds": 12,
+            "speakers": {"p1": "А"}, "utterances": [
+                {"start": 0.2, "end": 5.0, "speaker": "p1",
+                 "text": "Предлагаю проверить X или Y, не оба."},
+                {"start": 5.2, "end": 11.0, "speaker": "p1",
+                 "text": "Ещё предлагаю записать результат в журнал."},
+            ]}, ensure_ascii=False), encoding="utf-8")
+        writer_route = SimpleNamespace(
+            reserve_microusd=lambda payload, **kwargs: 20_000,
+            workspace_id="writer-workspace", prompt_usd_per_token="0.00000005",
+            completion_usd_per_token="0.00000025",
+            cache_write_usd_per_token="0.0000000625", request_usd="0")
+        FakeClient.submit_calls = 0
+        FakeClient.submissions = {}
+        FakeClient.report_factory = None
+        FakeGemini.submit_calls = 0
+        FakeGemini.submissions = {}
+        FakeGemini.mode = "empty_inventory"
+        FakeGemini.remote_model = GEMINI_MODEL
+        with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
+             patch("summary.luna_v1.engine.QUALITY_POLICY_VERSION", INVENTORY_V2_QUALITY_POLICY_VERSION), \
+             patch("summary.luna_v1.engine.verify_batch_route", return_value=writer_route):
+            started = submit(transcript_path=source, output_dir=output,
+                             private_root=private, client_factory=FakeClient)
+        self.assertEqual(started["status"], "submitted")
+        return started
+
+    def test_pending_saved_gemini_root_does_not_dispatch_with_opus_logging_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            started = self._saved_gemini_writer(output, private)
+            arm_poll(private)
+            with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()):
+                outcomes = poll_once(private_root=private, client_factory=FakeClient,
+                                     gemini_client_factory=FakeGemini)
+            self.assertIn("accepted", {row["status"] for row in outcomes})
+            self.assertEqual(FakeGemini.submit_calls, 0)
+            ledger = Ledger(private)
+            self.assertIsNone(ledger.stage(started["job_id"], "audit"))
+            ledger.close()
+            pointer = json.loads((output / "summary_current.json").read_text())
+            generation = output / "summary_generations" / pointer["generation_id"]
+            review = json.loads((generation / "run_manifest.json").read_text())["quality_review"]
+            self.assertEqual(review["status"], "audit_unavailable")
+            self.assertEqual(review["reason"], "gemini_workspace_logging_policy_mismatch")
+
+    def test_fresh_legacy_gemini_writer_is_blocked_before_credential_or_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            output.mkdir()
+            source = output / "transcript.json"
+            source.write_text(json.dumps({
+                "source": "Синтетика.mkv", "duration_seconds": 1,
+                "speakers": {"p1": "А"},
+                "utterances": [{"start": 0, "end": 1, "speaker": "p1", "text": "Проверить."}],
+            }, ensure_ascii=False), encoding="utf-8")
+            with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()):
+                outcome = submit(transcript_path=source, output_dir=output,
+                                 private_root=private,
+                                 client_factory=lambda _token: self.fail("legacy writer client created"),
+                                 quality_policy_version=EVIDENCE_RECONCILE_QUALITY_POLICY_VERSION)
+            self.assertEqual(outcome, {"status": "privacy_policy_blocked",
+                                       "reason": "gemini_workspace_logging_policy_mismatch"})
+            ledger = Ledger(private)
+            self.assertEqual(ledger.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            ledger.close()
+
+    def test_reserved_saved_gemini_stage_is_cancelled_before_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            started = self._saved_gemini_writer(output, private)
+            ledger = Ledger(private)
+            writer = ledger.get(started["job_id"])
+            reserved = ledger.reserve(
+                semantic_key="a" * 64, source_sha256=writer["source_sha256"],
+                output_dir=output, credential_id="judge-key", credential_version=1,
+                workspace_id="judge-workspace", max_cost_microusd=25_000,
+                kind="audit", root_job_id=writer["id"])
+            self.assertEqual(reserved.kind, "new")
+            ledger.close()
+            arm_poll(private)
+            with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()):
+                poll_once(private_root=private, client_factory=FakeClient,
+                          gemini_client_factory=FakeGemini)
+            ledger = Ledger(private)
+            self.assertEqual(ledger.get(reserved.job_id)["status"], "cancelled_before_submit")
+            ledger.close()
+            self.assertEqual(FakeGemini.submit_calls, 0)
+
+    def test_submitted_saved_gemini_stage_finishes_with_opus_logging_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            started = self._saved_gemini_writer(output, private)
+            judge_route = SimpleNamespace(reserve_microusd=lambda: 25_000,
+                                          input_tokens=1500, context_bound_tokens=2100,
+                                          workspace_id="judge-workspace")
+            arm_poll(private)
+            with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()), \
+                 patch("summary.luna_v1.engine.QUALITY_POLICY_VERSION", INVENTORY_V2_QUALITY_POLICY_VERSION), \
+                 patch("summary.luna_v1.engine.verify_gemini_batch_route", return_value=judge_route):
+                poll_once(private_root=private, client_factory=FakeClient,
+                          gemini_client_factory=FakeGemini)
+            self.assertEqual(FakeGemini.submit_calls, 1)
+            ledger = Ledger(private)
+            self.assertEqual(ledger.stage(started["job_id"], "audit")["status"], "submitted")
+            ledger.close()
+            arm_poll(private)
+            with patch("summary.luna_v1.engine._credential_store", return_value=TwoRoleStore()):
+                outcomes = poll_once(private_root=private, client_factory=FakeClient,
+                                     gemini_client_factory=FakeGemini)
+            self.assertIn("accepted", {row["status"] for row in outcomes})
+            self.assertEqual(FakeGemini.submit_calls, 1)
+
     def test_previous_gemini_policy_keeps_its_pinned_contract(self):
         old = "gemini_openrouter_judge_repair_v2"
         prompt, schema, schema_id = _quality_contract("gemini", old)

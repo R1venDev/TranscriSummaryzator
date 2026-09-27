@@ -171,6 +171,12 @@ def _file_sha(path: Path) -> str:
 
 
 class SavedWriterContinuationTests(unittest.TestCase):
+    def setUp(self):
+        # These legacy continuation scenarios require the original logging-OFF policy.
+        logging_policy = patch("summary.luna_v1.engine.OPUS_WORKSPACE_IO_LOGGING_ENABLED", False)
+        logging_policy.start()
+        self.addCleanup(logging_policy.stop)
+
     def _saved_report_with_bad_coverage(self, root: Path) -> tuple[Path, Path, dict, dict, dict]:
         """A failed writer, then an accepted continuation with an invalid report."""
         output = root / "meeting"

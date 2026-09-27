@@ -24,7 +24,12 @@ RESOLVED_MODEL = "anthropic/claude-opus-5.5-20260921"
 BATCH_MODEL_IDS = frozenset({MODEL, MODEL.removesuffix(":batch"),
                              RESOLVED_MODEL, RESOLVED_MODEL + ":batch"})
 PROVIDER = "anthropic"
-PRIVACY_MODE = "openrouter_batch_30d_anthropic_user_authorized"
+# Workspace input/output logs are separate from the Batch artifact lifetime.
+WORKSPACE_IO_LOGGING_ENABLED = True
+PRIVACY_MODE = (
+    "openrouter_batch_30d_anthropic_"
+    "workspace_input_output_logging_on_min_3mo_or_longer_user_authorized"
+)
 # Versioned with opus_summary_audit_v1. The cap includes adaptive thinking
 # plus the JSON report; medium effort can allocate about half to thinking.
 OUTPUT_CAP_AUDIT = 10_000

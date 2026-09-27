@@ -51,6 +51,12 @@ class MisplacedEvidenceGemini(EvidenceGemini):
 
 
 class SavedEvidenceInventoryContinuationTests(unittest.TestCase):
+    def setUp(self):
+        # These legacy continuation scenarios require the original logging-OFF policy.
+        logging_policy = patch("summary.luna_v1.engine.OPUS_WORKSPACE_IO_LOGGING_ENABLED", False)
+        logging_policy.start()
+        self.addCleanup(logging_policy.stop)
+
     def _make_degraded(self, root: Path):
         output = root / "meeting"
         output.mkdir()

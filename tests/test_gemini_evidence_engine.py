@@ -177,6 +177,12 @@ class EvidenceGemini:
 
 
 class EvidenceEngineTests(unittest.TestCase):
+    def setUp(self):
+        # Historical Gemini flow runs only after restoring its logging-OFF policy.
+        logging_policy = patch("summary.luna_v1.engine.OPUS_WORKSPACE_IO_LOGGING_ENABLED", False)
+        logging_policy.start()
+        self.addCleanup(logging_policy.stop)
+
     def test_long_source_uses_three_inventories_then_two_bounded_reconciliations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -80,6 +80,7 @@ from summary.opus_v1.batch import (BatchClient as OpusBatchClient,
                                     MODEL as OPUS_MODEL,
                                     PROVIDER as OPUS_BATCH_PROVIDER,
                                     PRIVACY_MODE as OPUS_PRIVACY_MODE,
+                                    WORKSPACE_IO_LOGGING_ENABLED as OPUS_WORKSPACE_IO_LOGGING_ENABLED,
                                     OUTPUT_CAP_AUDIT as OPUS_AUDIT_OUTPUT_CAP,
                                     OUTPUT_CAP_VERIFY as OPUS_VERIFY_OUTPUT_CAP,
                                     extract_one_completed as extract_one_opus_completed,
@@ -94,6 +95,10 @@ from .tasks import RevisionConflict, TaskStore
 
 
 PRIVACY_MODE = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
+OPUS_WRITER_PRIVACY_MODE = (
+    "batch_gateway_retention_up_to_30d_provider_zdr_off_"
+    "workspace_input_output_logging_on_min_3mo_or_longer_user_authorized"
+)
 REASONING_EFFORT = "medium"
 LEGACY_QUALITY_POLICY_VERSION = "luna_auto_audit_v3"
 PREVIOUS_GEMINI_QUALITY_POLICY_VERSION = "gemini_openrouter_judge_repair_v2"
@@ -381,13 +386,15 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
             "prompt_sha256": prompt_sha256,
             "schema_sha256": schema_sha256,
             "model": MODEL,
-            "privacy_mode": PRIVACY_MODE,
+            "privacy_mode": OPUS_WRITER_PRIVACY_MODE,
+            "workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED,
             "reasoning_effort": REASONING_EFFORT,
             "max_completion_tokens": MAX_COMPLETION_TOKENS,
             "quality_policy_version": policy,
             "quality_provider": OPUS_QUALITY_PROVIDER,
             "audit_model": OPUS_MODEL,
             "audit_privacy_mode": OPUS_PRIVACY_MODE,
+            "audit_workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED,
             "audit_prompt_sha256": _sha(OPUS_AUDIT_PROMPT_PATH.read_bytes()),
             "audit_schema_sha256": _sha(_json_bytes(OPUS_AUDIT_SCHEMA)),
             "audit_output_cap": OPUS_AUDIT_OUTPUT_CAP,
@@ -519,6 +526,7 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "quality_provider": OPUS_QUALITY_PROVIDER,
             "audit_model": OPUS_MODEL,
             "audit_privacy_mode": OPUS_PRIVACY_MODE,
+            "audit_workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED,
             "audit_prompt_sha256": _sha(OPUS_AUDIT_PROMPT_PATH.read_bytes()),
             "audit_schema_sha256": _sha(_json_bytes(OPUS_AUDIT_SCHEMA)),
             "audit_output_cap": OPUS_AUDIT_OUTPUT_CAP,
@@ -577,6 +585,11 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
                                        source_index=source_index, private_root=private_root,
                                        ledger=ledger)
             return {"status": prior["status"], "job_id": prior["id"], "semantic_key": semantic_key}
+        if (policy != OPUS_QUALITY_POLICY_VERSION
+                and QUALITY_POLICY_VERSION == OPUS_QUALITY_POLICY_VERSION
+                and OPUS_WORKSPACE_IO_LOGGING_ENABLED):
+            return {"status": "privacy_policy_blocked",
+                    "reason": "gemini_workspace_logging_policy_mismatch"}
         token = store.reveal_for_dispatch(selected["id"], selected["version"])
         client = client_factory(token)
         route = verify_batch_route(client)  # free GET /key and catalog checks
@@ -598,7 +611,11 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "source_sha256": source_sha, "output_dir": str(output_dir),
             "credential_id": selected["id"], "credential_version": selected["version"],
             "workspace_id": selected.get("workspace_id"), "model": MODEL,
-            "provider": "openai", "privacy_mode": PRIVACY_MODE,
+            "provider": "openai",
+            "privacy_mode": (OPUS_WRITER_PRIVACY_MODE
+                             if policy == OPUS_QUALITY_POLICY_VERSION else PRIVACY_MODE),
+            **({"workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED}
+               if policy == OPUS_QUALITY_POLICY_VERSION else {}),
             "prompt_sha256": prompt_sha, "schema_sha256": schema_sha,
             "quality_policy_version": policy,
             "dynamic_budget_authorization_ref": dynamic_budget_authorization_ref,
@@ -1875,7 +1892,7 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
 def _quality_stage_key(root: dict, kind: str, request_body: dict, provider: str,
                        policy: str | None = None) -> str:
     prompt_path, schema, _ = _quality_stage_contract(provider, policy, kind)
-    return _sha(_json_bytes({
+    material = {
         "root_semantic_key": root["semantic_key"], "kind": kind,
         "request_sha256": _sha(_json_bytes(request_body)),
         "prompt_sha256": _sha(prompt_path.read_bytes()),
@@ -1886,7 +1903,11 @@ def _quality_stage_key(root: dict, kind: str, request_body: dict, provider: str,
             else LEGACY_QUALITY_POLICY_VERSION
         ),
         "provider": provider,
-    }))
+    }
+    if provider == "opus":
+        material["privacy_mode"] = OPUS_PRIVACY_MODE
+        material["workspace_io_logging_enabled"] = OPUS_WORKSPACE_IO_LOGGING_ENABLED
+    return _sha(_json_bytes(material))
 
 
 def _start_quality_stage(ledger: Ledger, root: dict, kind: str, target: dict,
@@ -2014,6 +2035,16 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     from summary.gemini_v1.batch import BatchError as GeminiBatchError, batch_id_from_submit
 
     root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+    existing = ledger.stage(root["id"], kind)
+    if (QUALITY_POLICY_VERSION == OPUS_QUALITY_POLICY_VERSION
+            and OPUS_WORKSPACE_IO_LOGGING_ENABLED
+            and (existing is None or existing["status"] == "reserved")):
+        # Saved Gemini roots require logging OFF. The active Opus policy has it
+        # ON, so a restart must not create a new Gemini request. Already sent
+        # stages still follow their saved remote IDs through normal polling.
+        if existing is not None:
+            ledger.cancel_before_submit(existing["id"], "gemini_workspace_logging_policy_mismatch")
+        return {"status": "unavailable", "reason": "gemini_workspace_logging_policy_mismatch"}
     policy = root_manifest["quality_policy_version"]
     prompt_path, schema, _ = _quality_stage_contract("gemini", policy, kind)
     pinned_scope = root_manifest.get("judge_workspace_id")
@@ -2029,7 +2060,6 @@ def _start_gemini_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     request_bytes = _json_bytes(request_body)
     target_sha = _sha(_json_bytes(target))
     semantic_key = _quality_stage_key(root, kind, request_body, "gemini", policy)
-    existing = ledger.stage(root["id"], kind)
     if existing is not None and existing["semantic_key"] != semantic_key:
         raise ValueError("quality_stage_identity_changed")
     guard = None
@@ -2160,6 +2190,11 @@ def _start_opus_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     root_manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text(encoding="utf-8"))
     if _quality_route(root_manifest) != "opus":
         raise ValueError("opus_root_policy_mismatch")
+    if (root_manifest.get("privacy_mode") != OPUS_WRITER_PRIVACY_MODE
+            or root_manifest.get("workspace_io_logging_enabled") is not True
+            or root_manifest.get("audit_privacy_mode") != OPUS_PRIVACY_MODE
+            or root_manifest.get("audit_workspace_io_logging_enabled") is not True):
+        return {"status": "unavailable", "reason": "opus_workspace_logging_policy_mismatch"}
     pinned_scope = root_manifest.get("judge_workspace_id")
     if not isinstance(pinned_scope, str) or pinned_scope == "judge-unavailable":
         return {"status": "unavailable", "reason": "judge_credential_required_at_writer_dispatch"}
@@ -2238,6 +2273,7 @@ def _start_opus_stage(ledger: Ledger, root: dict, kind: str, target: dict,
             "provider": OPUS_QUALITY_PROVIDER,
             "quality_policy_version": OPUS_QUALITY_POLICY_VERSION,
             "privacy_mode": OPUS_PRIVACY_MODE,
+            "workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED,
             "provider_only": [OPUS_BATCH_PROVIDER],
             "cache_policy": "no_explicit_cache_full_miss_reserved",
             "reserve_microusd": stage["reserved_microusd"],

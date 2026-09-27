@@ -14,9 +14,13 @@ from summary.gemini_v1.batch import MODEL as GEMINI_MODEL
 from summary.luna_v1.engine import (
     OPUS_QUALITY_POLICY_VERSION,
     OPUS_QUALITY_PROVIDER,
+    OPUS_PRIVACY_MODE,
+    OPUS_WRITER_PRIVACY_MODE,
     PREVIOUS_GEMINI_QUALITY_POLICY_VERSION,
     _quality_contract,
     _quality_route,
+    _quality_stage_key,
+    _semantic_identity,
     poll_once,
     submit,
 )
@@ -275,6 +279,16 @@ class OpusEngineTests(unittest.TestCase):
             audit = ledger.stage(started["job_id"], "audit")
             self.assertEqual((audit["credential_id"], audit["workspace_id"]),
                              (_SavedKeys.judge["id"], _SavedKeys.judge["workspace_id"]))
+            writer = ledger.get(started["job_id"])
+            writer_manifest = json.loads((Path(writer["artifact_dir"]) / "manifest.json").read_text())
+            audit_manifest = json.loads((Path(audit["artifact_dir"]) / "manifest.json").read_text())
+            self.assertEqual(writer_manifest["privacy_mode"], OPUS_WRITER_PRIVACY_MODE)
+            self.assertIs(writer_manifest["workspace_io_logging_enabled"], True)
+            self.assertEqual(writer_manifest["audit_privacy_mode"], OPUS_PRIVACY_MODE)
+            self.assertIs(writer_manifest["audit_workspace_io_logging_enabled"], True)
+            self.assertEqual(audit_manifest["privacy_mode"], OPUS_PRIVACY_MODE)
+            self.assertIs(audit_manifest["workspace_io_logging_enabled"], True)
+            self.assertIn("logging_on_min_3mo_or_longer", OPUS_PRIVACY_MODE)
             self.assertIsNone(ledger.stage(started["job_id"], "verify"))
             ledger.close()
 
@@ -442,6 +456,48 @@ class OpusEngineTests(unittest.TestCase):
         self.assertEqual(_quality_route({"quality_policy_version": OPUS_QUALITY_POLICY_VERSION,
                                          "quality_provider": OPUS_QUALITY_PROVIDER,
                                          "audit_model": OPUS_MODEL}), "opus")
+
+    def test_logging_choice_changes_only_opus_semantic_keys(self):
+        args = ("a" * 64, "source", "writer-workspace", "b" * 64,
+                "c" * 64, None, "judge-workspace")
+        opus_root = _semantic_identity(*args, OPUS_QUALITY_POLICY_VERSION)
+        gemini_root = _semantic_identity(*args, PREVIOUS_GEMINI_QUALITY_POLICY_VERSION)
+        root = {"semantic_key": "a" * 64}
+        request = {"messages": []}
+        opus_stage = _quality_stage_key(root, "audit", request, "opus", OPUS_QUALITY_POLICY_VERSION)
+        gemini_stage = _quality_stage_key(root, "audit", request, "gemini",
+                                          PREVIOUS_GEMINI_QUALITY_POLICY_VERSION)
+        with patch("summary.luna_v1.engine.OPUS_WORKSPACE_IO_LOGGING_ENABLED", False):
+            self.assertNotEqual(_semantic_identity(*args, OPUS_QUALITY_POLICY_VERSION), opus_root)
+            self.assertNotEqual(_quality_stage_key(root, "audit", request, "opus",
+                                                   OPUS_QUALITY_POLICY_VERSION), opus_stage)
+            self.assertEqual(_semantic_identity(*args, PREVIOUS_GEMINI_QUALITY_POLICY_VERSION),
+                             gemini_root)
+            self.assertEqual(_quality_stage_key(root, "audit", request, "gemini",
+                                                PREVIOUS_GEMINI_QUALITY_POLICY_VERSION), gemini_stage)
+
+    def test_old_opus_root_without_logging_disclosure_cannot_start_judge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, private = root / "meeting", root / "private"
+            _source(output)
+            opener = _OpusHttp()
+            started = self._start(output, private, opener)
+            ledger = Ledger(private)
+            writer = ledger.get(started["job_id"])
+            manifest_path = Path(writer["artifact_dir"]) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["privacy_mode"] = "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized"
+            manifest["audit_privacy_mode"] = "openrouter_batch_30d_anthropic_user_authorized"
+            del manifest["workspace_io_logging_enabled"]
+            del manifest["audit_workspace_io_logging_enabled"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            ledger.close()
+            result = self._poll(private, opener)
+            self.assertIn("accepted", {row["status"] for row in result})
+            self.assertEqual(opener.posts, [])
+            _generation, published = self._published(output)
+            self.assertEqual(published["quality_review"]["status"], "opus_audit_unavailable")
 
     def test_ledger_raises_only_pinned_opus_stage_and_group_caps(self):
         with tempfile.TemporaryDirectory() as directory:
