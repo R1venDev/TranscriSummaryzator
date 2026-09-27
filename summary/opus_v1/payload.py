@@ -1,17 +1,28 @@
-"""Full-source Opus audit input and bounded Chat request construction."""
+"""Opus source audit input and bounded Chat request construction."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 
+from ..gemini_v1.inventory_contract import (
+    _source_utterances, _windows, plan_inventory_segments,
+    validate_inventory_plan,
+)
 from ..luna_v1.audit import build_audit_input
+from ..luna_v1.audit import _working_draft
 from .batch import OUTPUT_CAP_AUDIT, OUTPUT_CAP_VERIFY, REASONING_EFFORT
-from .contract import OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA, OPUS_AUDIT_SCHEMA_ID
+from .contract import (
+    OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA, OPUS_AUDIT_SCHEMA_ID,
+    OPUS_SEGMENT_PROMPT_PATH, OPUS_SEGMENT_SCHEMA, OPUS_SEGMENT_SCHEMA_ID,
+    risk_anchors_for_primary,
+)
 
 _TASKS = {
     "audit": "Проверь всю TRANSCRIPT_SOURCE против DRAFT_DOCUMENT; верни краткий отчёт с адресными исправлениями.",
     "verify": "Проверь отдельные адресные контексты TRANSCRIPT_SOURCE против исправленного DRAFT_DOCUMENT и PRIOR_FINDINGS; верни оставшиеся или новые ошибки и адресные исправления.",
 }
+OPUS_SEGMENT_OUTPUT_CAP = 6_000
 
 
 def _focused_verify_input(source: dict, draft: dict, prior_findings: list[dict]) -> dict:
@@ -114,5 +125,117 @@ def build_opus_audit_request(
             "name": OPUS_AUDIT_SCHEMA_ID, "strict": True, "schema": OPUS_AUDIT_SCHEMA,
         }},
         "max_completion_tokens": OUTPUT_CAP_AUDIT if mode == "audit" else OUTPUT_CAP_VERIFY,
+        "reasoning": {"effort": REASONING_EFFORT},
+    }
+
+
+def _canonical_segment_source(source_text: str) -> tuple[dict, list[dict], dict]:
+    """Require the exact load_source projection, without inspecting audio/upstream."""
+    source, utterances = _source_utterances(source_text)
+    canonical = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if canonical != source_text:
+        raise ValueError("Opus segment source is not canonical")
+    required = {"source_kind", "source_name", "meeting_date", "duration_ms",
+                "participants_by_transcript", "unattributed_speech", "utterances"}
+    if set(source) != required or source["source_kind"] != "TRANSCRIPT_SOURCE":
+        raise ValueError("Opus segment source metadata differs from canonical projection")
+    source_index = {
+        "source_name": source["source_name"],
+        "meeting_date": source["meeting_date"],
+        "duration_ms": source["duration_ms"],
+        "participants": source["participants_by_transcript"],
+        "unattributed_speech": source["unattributed_speech"],
+        "by_id": {row["id"]: row for row in utterances},
+    }
+    return source, utterances, source_index
+
+
+def plan_opus_audit_segments(source_text: str) -> list[dict]:
+    """Cover each canonical utterance once, with bounded adjacent context."""
+    _source, _utterances, source_index = _canonical_segment_source(source_text)
+    segments = plan_inventory_segments(source_text, count=3, overlap=8,
+                                       windows_per_segment=4)
+    validate_inventory_plan(segments, source_index)
+    return segments
+
+
+def _validate_one_segment(source_text: str, source: dict,
+                          utterances: list[dict], segment: dict) -> None:
+    keys = {"segment_id", "source_fingerprint", "source_name", "meeting_date",
+            "participants_by_transcript", "context_before", "primary_utterances",
+            "context_after", "coverage_windows"}
+    if not isinstance(segment, dict) or set(segment) != keys:
+        raise ValueError("Opus segment fields differ from inventory plan")
+    if segment["source_fingerprint"] != hashlib.sha256(source_text.encode("utf-8")).hexdigest():
+        raise ValueError("Opus segment source fingerprint differs")
+    if (segment["source_name"] != source["source_name"]
+            or segment["meeting_date"] != source["meeting_date"]
+            or segment["participants_by_transcript"] != source["participants_by_transcript"]):
+        raise ValueError("Opus segment metadata differs from source")
+    primary, before, after = (segment[name] for name in
+                              ("primary_utterances", "context_before", "context_after"))
+    if (not isinstance(primary, list) or not primary
+            or not isinstance(before, list) or not isinstance(after, list)
+            or len(before) > 12 or len(after) > 12):
+        raise ValueError("Opus segment primary/context is invalid")
+    positions = {row["id"]: position for position, row in enumerate(utterances)}
+    first_id = primary[0].get("id") if isinstance(primary[0], dict) else None
+    if first_id not in positions:
+        raise ValueError("Opus segment primary ID is unknown")
+    start = positions[first_id]
+    end = start + len(primary)
+    if (primary != utterances[start:end]
+            or start < len(before)
+            or before != utterances[start - len(before):start]
+            or after != utterances[end:end + len(after)]):
+        raise ValueError("Opus segment differs from canonical source")
+    windows = segment["coverage_windows"]
+    if (not isinstance(windows, list) or not windows
+            or windows != _windows(primary, segment["segment_id"], len(windows))):
+        raise ValueError("Opus segment coverage windows differ from primary source")
+
+
+def build_opus_segment_audit_input(source_text: str, draft: dict,
+                                   segment: dict) -> str:
+    """Place scoped source before complete draft and trusted task last."""
+    source, utterances, _index = _canonical_segment_source(source_text)
+    _validate_one_segment(source_text, source, utterances, segment)
+    primary = segment["primary_utterances"]
+    before = segment["context_before"]
+    after = segment["context_after"]
+    scoped = dict(source)
+    scoped["utterances"] = before + primary + after
+    payload = {
+        "TRANSCRIPT_SOURCE": scoped,
+        "SEGMENT_ID": segment["segment_id"],
+        "AUDIT_SCOPE": {
+            "primary_start_id": primary[0]["id"],
+            "primary_end_id": primary[-1]["id"],
+            "primary_count": len(primary),
+            "context_before_ids": [row["id"] for row in before],
+            "context_after_ids": [row["id"] for row in after],
+        },
+        "SOURCE_WINDOWS": segment["coverage_windows"],
+        "RISK_ANCHORS": risk_anchors_for_primary(primary),
+        "DRAFT_DOCUMENT": _working_draft(draft),
+        "TASK": "Проверь только основной участок против всего черновика; верни доказательные находки и адресные исправления по схеме opus_segment_audit_v2.",
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_opus_segment_audit_request(source_text: str, draft: dict,
+                                     segment: dict) -> dict:
+    """Single Opus Batch item; no provider cache or speculative transport retry."""
+    content = build_opus_segment_audit_input(source_text, draft, segment)
+    return {
+        "messages": [
+            {"role": "system", "content": OPUS_SEGMENT_PROMPT_PATH.read_text(encoding="utf-8")},
+            {"role": "user", "content": content},
+        ],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": OPUS_SEGMENT_SCHEMA_ID, "strict": True,
+            "schema": OPUS_SEGMENT_SCHEMA,
+        }},
+        "max_completion_tokens": OPUS_SEGMENT_OUTPUT_CAP,
         "reasoning": {"effort": REASONING_EFFORT},
     }

@@ -238,7 +238,8 @@ class Ledger:
         if (continuation_mode not in {"failed_writer", "accepted_inventory_unavailable"}
                 or (continuation_mode != "failed_writer" and not is_continuation)):
             raise ValueError("invalid continuation mode")
-        stage_cap = (OPUS_STAGE_CAP_MICROUSD if kind in {"audit", "verify"}
+        stage_cap = (OPUS_STAGE_CAP_MICROUSD if kind in {"audit", "verify",
+                                                       "segment_1", "segment_2", "segment_3"}
                      else JOB_CAP_MICROUSD)
         if not (max_cost_microusd == 0 if is_continuation
                 else 0 < max_cost_microusd <= stage_cap):
@@ -328,10 +329,14 @@ class Ledger:
                         root_manifest = json.loads(root_manifest_path.read_text(encoding="utf-8"))
                     except (OSError, ValueError) as exc:
                         raise ValueError("quality root manifest unavailable") from exc
-                opus_policy = (root_manifest.get("quality_provider") == "openrouter_claude_opus"
-                               and root_manifest.get("quality_policy_version") ==
-                               "claude_opus_5_5_full_source_audit_v1"
-                               and kind in {"audit", "verify"})
+                opus_version = root_manifest.get("quality_policy_version")
+                opus_policy = (
+                    root_manifest.get("quality_provider") == "openrouter_claude_opus"
+                    and ((opus_version == "claude_opus_5_5_full_source_audit_v1"
+                          and kind in {"audit", "verify"})
+                         or (opus_version == "claude_opus_5_5_partitioned_audit_v2"
+                             and kind in {"segment_1", "segment_2", "segment_3"}))
+                )
                 if max_cost_microusd > JOB_CAP_MICROUSD and not opus_policy:
                     self.db.execute("ROLLBACK")
                     return StartDecision("blocked", None, "job_budget_exceeded")

@@ -8,6 +8,11 @@ from .batch import (BatchClient, BatchError, MODEL, PROVIDER, BATCH_MODEL_IDS,
 from .contract import (OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA,
                        OPUS_AUDIT_SCHEMA_ID, apply_opus_audit,
                        coverage_warnings_opus, legacy_report_v1,
-                       validate_opus_audit)
-from .payload import build_opus_audit_input, build_opus_audit_request
+                       validate_opus_audit, OPUS_SEGMENT_PROMPT_PATH,
+                       OPUS_SEGMENT_SCHEMA, OPUS_SEGMENT_SCHEMA_ID,
+                       validate_opus_segment_report, merge_opus_segment_reports)
+from .payload import (build_opus_audit_input, build_opus_audit_request,
+                      build_opus_segment_audit_input,
+                      build_opus_segment_audit_request,
+                      plan_opus_audit_segments, OPUS_SEGMENT_OUTPUT_CAP)
 from .route import RouteBlocked, verify_batch_route, estimate_usage_cost_microusd

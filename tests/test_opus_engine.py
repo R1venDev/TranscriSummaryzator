@@ -249,7 +249,8 @@ class OpusEngineTests(unittest.TestCase):
         with patch("summary.luna_v1.engine._credential_store", return_value=_SavedKeys()), \
              patch("summary.luna_v1.engine.verify_batch_route", return_value=self._writer_route()):
             started = submit(transcript_path=output / "transcript.json", output_dir=output,
-                             private_root=private, client_factory=WriterClient)
+                             private_root=private, client_factory=WriterClient,
+                             quality_policy_version=OPUS_QUALITY_POLICY_VERSION)
         self.assertEqual(started["status"], "submitted")
         self.assertEqual(WriterClient.submit_calls, 1)
         return started
@@ -316,7 +317,8 @@ class OpusEngineTests(unittest.TestCase):
             self._poll(private, opener)
             with patch("summary.luna_v1.engine._credential_store", return_value=_SavedKeys()):
                 again = submit(transcript_path=output / "transcript.json", output_dir=output,
-                               private_root=private, client_factory=WriterClient)
+                               private_root=private, client_factory=WriterClient,
+                               quality_policy_version=OPUS_QUALITY_POLICY_VERSION)
             self.assertEqual(again["status"], "accepted_cache_hit")
             self.assertEqual((WriterClient.submit_calls, len(opener.posts)), (1, 1))
 
@@ -544,6 +546,12 @@ class OpusEngineTests(unittest.TestCase):
                                  "openrouter_gemini")
             self.assertEqual(stage(gemini_root, "f", "audit", 100_001, "2").reason,
                              "job_budget_exceeded")
+            opus_v2_root = writer("g", "3", "claude_opus_5_5_partitioned_audit_v2",
+                                  OPUS_QUALITY_PROVIDER)
+            self.assertEqual(stage(opus_v2_root, "h", "audit", 100_001, "3").reason,
+                             "job_budget_exceeded")
+            self.assertEqual(stage(opus_v2_root, "i", "segment_1", 120_000, "3").kind,
+                             "new")
             ledger.close()
 
 
