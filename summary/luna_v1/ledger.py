@@ -334,7 +334,8 @@ class Ledger:
                     root_manifest.get("quality_provider") == "openrouter_claude_opus"
                     and ((opus_version == "claude_opus_5_5_full_source_audit_v1"
                           and kind in {"audit", "verify"})
-                         or (opus_version == "claude_opus_5_5_partitioned_audit_v2"
+                         or (opus_version in {"claude_opus_5_5_partitioned_audit_v2",
+                                               "claude_opus_5_5_partitioned_audit_v3"}
                              and kind in {"segment_1", "segment_2", "segment_3"}))
                 )
                 if max_cost_microusd > JOB_CAP_MICROUSD and not opus_policy:

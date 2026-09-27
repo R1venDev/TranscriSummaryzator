@@ -18,11 +18,13 @@ from summary.luna_v1.audit import apply_audit
 from summary.luna_v1.source import load_source
 from summary.opus_v1.contract import (
     OPUS_SEGMENT_SCHEMA_ID,
+    OPUS_SEGMENT_SCHEMA_ID_V3,
     merge_opus_segment_reports,
     validate_opus_segment_report,
 )
 from summary.opus_v1.payload import (
     build_opus_segment_audit_input,
+    build_opus_segment_audit_request,
     plan_opus_audit_segments,
 )
 
@@ -109,6 +111,33 @@ def _empty_report(segment: dict, source_text: str, draft: dict) -> dict:
 
 
 class OpusPartitionedAuditTests(unittest.TestCase):
+    def test_v3_profile_rejects_empty_coverage_without_inventing_rows(self):
+        source_text, index = _source(12)
+        segment = plan_opus_audit_segments(source_text)[0]
+        draft = _draft()
+        request = build_opus_segment_audit_request(
+            source_text, draft, segment, profile="v3")
+        self.assertEqual(request["max_completion_tokens"], 7_000)
+        self.assertEqual(request["reasoning"], {"effort": "low"})
+        self.assertEqual(request["response_format"]["json_schema"]["name"],
+                         OPUS_SEGMENT_SCHEMA_ID_V3)
+        self.assertEqual(request["response_format"]["json_schema"]["schema"]
+                         ["properties"]["coverage"]["minItems"], 1)
+        self.assertEqual(json.loads(request["messages"][1]["content"])["SOURCE_WINDOWS"],
+                         segment["coverage_windows"])
+        empty = {"schema_version": OPUS_SEGMENT_SCHEMA_ID_V3,
+                 "segment_id": segment["segment_id"],
+                 "coverage": [], "findings": [], "patches": []}
+        with self.assertRaisesRegex(ValueError, "every primary window"):
+            validate_opus_segment_report(
+                empty, segment, draft, index,
+                expected_schema_id=OPUS_SEGMENT_SCHEMA_ID_V3)
+        one = _empty_report(segment, source_text, draft)
+        one["schema_version"] = OPUS_SEGMENT_SCHEMA_ID_V3
+        self.assertIs(validate_opus_segment_report(
+            one, segment, draft, index,
+            expected_schema_id=OPUS_SEGMENT_SCHEMA_ID_V3), one)
+
     def test_short_sources_still_cover_every_utterance_once(self):
         for count in (1, 2, 3, 4):
             with self.subTest(count=count):

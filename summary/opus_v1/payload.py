@@ -15,6 +15,7 @@ from .batch import OUTPUT_CAP_AUDIT, OUTPUT_CAP_VERIFY, REASONING_EFFORT
 from .contract import (
     OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA, OPUS_AUDIT_SCHEMA_ID,
     OPUS_SEGMENT_PROMPT_PATH, OPUS_SEGMENT_SCHEMA, OPUS_SEGMENT_SCHEMA_ID,
+    OPUS_SEGMENT_PROMPT_PATH_V3, OPUS_SEGMENT_SCHEMA_V3, OPUS_SEGMENT_SCHEMA_ID_V3,
     risk_anchors_for_primary,
 )
 
@@ -23,6 +24,8 @@ _TASKS = {
     "verify": "Проверь отдельные адресные контексты TRANSCRIPT_SOURCE против исправленного DRAFT_DOCUMENT и PRIOR_FINDINGS; верни оставшиеся или новые ошибки и адресные исправления.",
 }
 OPUS_SEGMENT_OUTPUT_CAP = 6_000
+OPUS_SEGMENT_OUTPUT_CAP_V3 = 7_000
+OPUS_SEGMENT_EFFORT_V3 = "low"
 
 
 def _focused_verify_input(source: dict, draft: dict, prior_findings: list[dict]) -> dict:
@@ -196,7 +199,8 @@ def _validate_one_segment(source_text: str, source: dict,
 
 
 def build_opus_segment_audit_input(source_text: str, draft: dict,
-                                   segment: dict) -> str:
+                                   segment: dict, *,
+                                   profile: str = "v2") -> str:
     """Place scoped source before complete draft and trusted task last."""
     source, utterances, _index = _canonical_segment_source(source_text)
     _validate_one_segment(source_text, source, utterances, segment)
@@ -205,6 +209,10 @@ def build_opus_segment_audit_input(source_text: str, draft: dict,
     after = segment["context_after"]
     scoped = dict(source)
     scoped["utterances"] = before + primary + after
+    if profile not in {"v2", "v3"}:
+        raise ValueError("unknown Opus segment profile")
+    schema_id = (OPUS_SEGMENT_SCHEMA_ID_V3 if profile == "v3"
+                 else OPUS_SEGMENT_SCHEMA_ID)
     payload = {
         "TRANSCRIPT_SOURCE": scoped,
         "SEGMENT_ID": segment["segment_id"],
@@ -218,24 +226,38 @@ def build_opus_segment_audit_input(source_text: str, draft: dict,
         "SOURCE_WINDOWS": segment["coverage_windows"],
         "RISK_ANCHORS": risk_anchors_for_primary(primary),
         "DRAFT_DOCUMENT": _working_draft(draft),
-        "TASK": "Проверь только основной участок против всего черновика; верни доказательные находки и адресные исправления по схеме opus_segment_audit_v2.",
+        "TASK": ("Проверь только основной участок против всего черновика; "
+                 "верни доказательные находки и адресные исправления "
+                 f"по схеме {schema_id}."),
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_opus_segment_audit_request(source_text: str, draft: dict,
-                                     segment: dict) -> dict:
+                                     segment: dict, *,
+                                     profile: str = "v2") -> dict:
     """Single Opus Batch item; no provider cache or speculative transport retry."""
-    content = build_opus_segment_audit_input(source_text, draft, segment)
+    content = build_opus_segment_audit_input(source_text, draft, segment,
+                                            profile=profile)
+    if profile == "v3":
+        prompt_path, schema, schema_id = (
+            OPUS_SEGMENT_PROMPT_PATH_V3, OPUS_SEGMENT_SCHEMA_V3,
+            OPUS_SEGMENT_SCHEMA_ID_V3)
+        output_cap, effort = OPUS_SEGMENT_OUTPUT_CAP_V3, OPUS_SEGMENT_EFFORT_V3
+    else:
+        prompt_path, schema, schema_id = (
+            OPUS_SEGMENT_PROMPT_PATH, OPUS_SEGMENT_SCHEMA,
+            OPUS_SEGMENT_SCHEMA_ID)
+        output_cap, effort = OPUS_SEGMENT_OUTPUT_CAP, REASONING_EFFORT
     return {
         "messages": [
-            {"role": "system", "content": OPUS_SEGMENT_PROMPT_PATH.read_text(encoding="utf-8")},
+            {"role": "system", "content": prompt_path.read_text(encoding="utf-8")},
             {"role": "user", "content": content},
         ],
         "response_format": {"type": "json_schema", "json_schema": {
-            "name": OPUS_SEGMENT_SCHEMA_ID, "strict": True,
-            "schema": OPUS_SEGMENT_SCHEMA,
+            "name": schema_id, "strict": True,
+            "schema": schema,
         }},
-        "max_completion_tokens": OPUS_SEGMENT_OUTPUT_CAP,
-        "reasoning": {"effort": REASONING_EFFORT},
+        "max_completion_tokens": output_cap,
+        "reasoning": {"effort": effort},
     }

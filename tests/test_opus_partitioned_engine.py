@@ -11,12 +11,13 @@ from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from summary.luna_v1.engine import (
-    OPUS_PARTITIONED_QUALITY_POLICY_VERSION, poll_once, submit,
+    OPUS_PARTITIONED_QUALITY_POLICY_VERSION,
+    OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2, poll_once, submit,
 )
 from summary.luna_v1.ledger import Ledger
 from summary.luna_v1.source import load_source
 from summary.opus_v1 import (BatchClient as OpusBatchClient, MODEL as OPUS_MODEL,
-                             OPUS_SEGMENT_SCHEMA_ID)
+                             OPUS_SEGMENT_SCHEMA_ID, OPUS_SEGMENT_SCHEMA_ID_V3)
 from tests.test_luna_engine import FakeClient as WriterClient
 from tests.test_opus_engine import (_HttpResponse, _OpusHttp, _SavedKeys,
                                     _arm, _source)
@@ -25,8 +26,10 @@ from tests.test_opus_engine import (_HttpResponse, _OpusHttp, _SavedKeys,
 class _SegmentHttp:
     """OpenRouter transport stub with one response per durable Batch stage."""
 
-    def __init__(self, *, fail_segment: str | None = None):
+    def __init__(self, *, fail_segment: str | None = None,
+                 empty_segment: str | None = None):
         self.fail_segment = fail_segment
+        self.empty_segment = empty_segment
         self.calls: list[tuple[str, str, dict | None]] = []
         self.submissions: dict[str, dict] = {}
 
@@ -36,7 +39,7 @@ class _SegmentHttp:
                 if method == "POST" and path == "/api/v1/batches"]
 
     @staticmethod
-    def _report(payload: dict) -> dict:
+    def _report(payload: dict, schema_id: str) -> dict:
         rows = {row["id"]: row for row in payload["TRANSCRIPT_SOURCE"]["utterances"]}
         anchors = payload["RISK_ANCHORS"]
         topic = payload["DRAFT_DOCUMENT"]["meeting"]["topic"]
@@ -57,7 +60,7 @@ class _SegmentHttp:
                     if start <= anchor["source_id"] <= end
                 ],
             })
-        return {"schema_version": OPUS_SEGMENT_SCHEMA_ID,
+        return {"schema_version": schema_id,
                 "segment_id": payload["SEGMENT_ID"],
                 "coverage": coverage, "findings": [], "patches": []}
 
@@ -89,10 +92,15 @@ class _SegmentHttp:
                     "endpoint": "/v1/chat/completions", "usage": {"cost": 0.001},
                     "request_counts": {"total": 1, "completed": 0, "failed": 1},
                 })
+            report = (self._report(payload, chat["response_format"]["json_schema"]["name"])
+                      if payload["SEGMENT_ID"] != self.empty_segment else {
+                          "schema_version": chat["response_format"]["json_schema"]["name"],
+                          "segment_id": payload["SEGMENT_ID"],
+                          "coverage": [], "findings": [], "patches": [],
+                      })
             response = {"model": OPUS_MODEL, "choices": [{
                 "finish_reason": "stop", "message": {
-                    "role": "assistant", "content": json.dumps(self._report(payload),
-                                                       ensure_ascii=False),
+                    "role": "assistant", "content": json.dumps(report, ensure_ascii=False),
                 },
             }]}
             return _HttpResponse(200, {
@@ -112,7 +120,8 @@ class OpusPartitionedEngineTests(unittest.TestCase):
         WriterClient.report_factory = None
 
     @staticmethod
-    def _start(output: Path, private: Path) -> dict:
+    def _start(output: Path, private: Path, *,
+               policy: str = OPUS_PARTITIONED_QUALITY_POLICY_VERSION) -> dict:
         writer_route = SimpleNamespace(
             reserve_microusd=lambda payload, **kwargs: 20_000,
             workspace_id="writer-workspace",
@@ -125,7 +134,8 @@ class OpusPartitionedEngineTests(unittest.TestCase):
                    return_value=writer_route):
             return submit(transcript_path=output / "transcript.json",
                           output_dir=output, private_root=private,
-                          client_factory=WriterClient)
+                          client_factory=WriterClient,
+                          quality_policy_version=policy)
 
     @staticmethod
     def _poll(private: Path, http: _SegmentHttp) -> list[dict]:
@@ -174,8 +184,11 @@ class OpusPartitionedEngineTests(unittest.TestCase):
                 self.assertEqual(payload["DRAFT_DOCUMENT"], draft)
                 self.assertEqual(payload["SEGMENT_ID"], f"S{number:02d}")
                 self.assertEqual(chat["response_format"]["json_schema"]["name"],
-                                 OPUS_SEGMENT_SCHEMA_ID)
-                self.assertEqual(chat["max_completion_tokens"], 6_000)
+                                 OPUS_SEGMENT_SCHEMA_ID_V3)
+                self.assertEqual(chat["response_format"]["json_schema"]["schema"]
+                                 ["properties"]["coverage"]["minItems"], 1)
+                self.assertEqual(chat["max_completion_tokens"], 7_000)
+                self.assertEqual(chat["reasoning"], {"effort": "low"})
                 segment = plan["segments"][number - 1]
                 self.assertEqual(payload["TRANSCRIPT_SOURCE"]["utterances"],
                                  segment["context_before"] +
@@ -223,6 +236,59 @@ class OpusPartitionedEngineTests(unittest.TestCase):
             self.assertEqual(run["quality_review"]["status"], "coverage_incomplete")
             self.assertEqual(run["quality_review"]["segment_count"], 3)
             ledger.close()
+
+    def test_empty_stopped_report_is_rejected_without_next_paid_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            _source(output)
+            started = self._start(output, private)
+            http = _SegmentHttp(empty_segment="S01")
+            for _ in range(4):
+                outcomes = self._poll(private, http)
+                if any(row["status"] == "accepted" for row in outcomes):
+                    break
+            else:
+                self.fail("invalid segment did not settle")
+            self.assertEqual(len(http.posts), 1)
+            ledger = Ledger(private)
+            root = ledger.get(started["job_id"])
+            first = ledger.stage(root["id"], "segment_1")
+            self.assertEqual(first["status"], "failed_validation")
+            self.assertIsNone(ledger.stage(root["id"], "segment_2"))
+            self.assertEqual(
+                json.loads((Path(root["artifact_dir"]) / "candidate_document.json").read_text()),
+                json.loads((Path(root["artifact_dir"]) / "draft_document.json").read_text()),
+            )
+            self.assertEqual(self._published(output)[1]["quality_review"]["status"],
+                             "coverage_incomplete")
+            ledger.close()
+
+    def test_prior_v2_profile_stays_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            _source(output)
+            self._start(output, private,
+                        policy=OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2)
+            http = _SegmentHttp()
+            for _ in range(3):
+                self._poll(private, http)
+                if http.posts:
+                    break
+            self.assertEqual(len(http.posts), 1)
+            chat = http.posts[0]["requests"][0]["body"]
+            self.assertEqual(chat["response_format"]["json_schema"]["name"],
+                             OPUS_SEGMENT_SCHEMA_ID)
+            self.assertNotIn("minItems", chat["response_format"]["json_schema"]
+                             ["schema"]["properties"]["coverage"])
+            self.assertEqual(chat["max_completion_tokens"], 6_000)
+            self.assertEqual(chat["reasoning"], {"effort": "medium"})
+            for _ in range(6):
+                outcomes = self._poll(private, http)
+                if any(row["status"] == "accepted" for row in outcomes):
+                    break
+            else:
+                self.fail("pinned v2 workflow did not complete")
+            self.assertEqual(len(http.posts), 3)
 
 
 if __name__ == "__main__":

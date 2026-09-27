@@ -28,6 +28,11 @@ OPUS_SEGMENT_PROMPT_PATH = Path(__file__).with_name("prompt_audit_v2.md")
 OPUS_SEGMENT_SCHEMA = json.loads(
     Path(__file__).with_name("output_schema_audit_v2.json").read_text(encoding="utf-8")
 )
+OPUS_SEGMENT_SCHEMA_ID_V3 = "opus_segment_audit_v3"
+OPUS_SEGMENT_PROMPT_PATH_V3 = Path(__file__).with_name("prompt_audit_v3.md")
+OPUS_SEGMENT_SCHEMA_V3 = json.loads(
+    Path(__file__).with_name("output_schema_audit_v3.json").read_text(encoding="utf-8")
+)
 _COVERAGE_KEYS = {"window_id", "start_id", "end_id", "salient",
                   "source_quote", "draft_coverage", "finding_indices"}
 _FINDING_KEYS = {"severity", "kind", "description", "evidence_quote",
@@ -319,15 +324,18 @@ def _segment_mechanical_report(report: dict, source_index: dict) -> dict:
 
 
 def validate_opus_segment_report(report: dict, segment: dict, draft: dict,
-                                 source_index: dict) -> dict:
+                                 source_index: dict, *,
+                                 expected_schema_id: str = OPUS_SEGMENT_SCHEMA_ID) -> dict:
     """Check exact primary windows, source quotes and current-draft quotes.
 
     These mechanical checks cannot prove that a quote entails a model claim.
     """
     primary_ids, visible_ids = _segment_source_scope(segment, source_index)
     primary_set = set(primary_ids)
+    if expected_schema_id not in {OPUS_SEGMENT_SCHEMA_ID, OPUS_SEGMENT_SCHEMA_ID_V3}:
+        raise ValueError("unknown Opus segment schema")
     if (not isinstance(report, dict) or set(report) != _SEGMENT_REPORT_KEYS
-            or report.get("schema_version") != OPUS_SEGMENT_SCHEMA_ID
+            or report.get("schema_version") != expected_schema_id
             or report.get("segment_id") != segment["segment_id"]
             or not isinstance(report.get("coverage"), list)
             or not isinstance(report.get("findings"), list)
@@ -432,10 +440,12 @@ def validate_opus_segment_report(report: dict, segment: dict, draft: dict,
 
 
 def merge_opus_segment_reports(reports: list[dict], segments: list[dict],
-                               draft: dict, source_index: dict) -> tuple[dict, list[dict]]:
+                               draft: dict, source_index: dict, *,
+                               expected_schema_id: str = OPUS_SEGMENT_SCHEMA_ID,
+                               ) -> tuple[dict, list[dict]]:
     """Project all segment findings to a legacy patch report without lost conflicts.
 
-    The original v2 reports remain the authoritative coverage evidence. Full
+    The original segment reports remain the authoritative coverage evidence. Full
     windows here are derived bookkeeping for the existing patch applier.
     """
     if (not isinstance(reports, list) or not isinstance(segments, list)
@@ -443,7 +453,8 @@ def merge_opus_segment_reports(reports: list[dict], segments: list[dict],
         raise ValueError("Opus merge requires every segment report")
     validate_inventory_plan(segments, source_index)
     for report, segment in zip(reports, segments):
-        validate_opus_segment_report(report, segment, draft, source_index)
+        validate_opus_segment_report(report, segment, draft, source_index,
+                                     expected_schema_id=expected_schema_id)
     patches_with_origin = [(segment["segment_id"], pointer, copy.deepcopy(patch))
                            for report, segment in zip(reports, segments)
                            for pointer, patch in enumerate(report["patches"])]

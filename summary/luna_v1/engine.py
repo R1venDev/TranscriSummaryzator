@@ -76,6 +76,9 @@ from summary.opus_v1 import (OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA,
                              validate_opus_audit,
                              OPUS_SEGMENT_OUTPUT_CAP, OPUS_SEGMENT_PROMPT_PATH,
                              OPUS_SEGMENT_SCHEMA, OPUS_SEGMENT_SCHEMA_ID,
+                             OPUS_SEGMENT_OUTPUT_CAP_V3, OPUS_SEGMENT_EFFORT_V3,
+                             OPUS_SEGMENT_PROMPT_PATH_V3, OPUS_SEGMENT_SCHEMA_V3,
+                             OPUS_SEGMENT_SCHEMA_ID_V3,
                              build_opus_segment_audit_request,
                              merge_opus_segment_reports,
                              plan_opus_audit_segments, validate_opus_segment_report)
@@ -117,9 +120,12 @@ SEGMENT_REVIEW_POLICIES = frozenset({SEGMENT_REVIEW_QUALITY_POLICY_VERSION_V1,
                                       SEGMENT_REVIEW_QUALITY_POLICY_VERSION_V2,
                                       SEGMENT_REVIEW_QUALITY_POLICY_VERSION})
 OPUS_QUALITY_POLICY_VERSION = "claude_opus_5_5_full_source_audit_v1"
-OPUS_PARTITIONED_QUALITY_POLICY_VERSION = "claude_opus_5_5_partitioned_audit_v2"
+OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2 = "claude_opus_5_5_partitioned_audit_v2"
+OPUS_PARTITIONED_QUALITY_POLICY_VERSION = "claude_opus_5_5_partitioned_audit_v3"
+OPUS_PARTITIONED_POLICIES = frozenset({OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2,
+                                       OPUS_PARTITIONED_QUALITY_POLICY_VERSION})
 OPUS_QUALITY_POLICIES = frozenset({OPUS_QUALITY_POLICY_VERSION,
-                                    OPUS_PARTITIONED_QUALITY_POLICY_VERSION})
+                                    *OPUS_PARTITIONED_POLICIES})
 OPUS_QUALITY_PROVIDER = "openrouter_claude_opus"
 OPUS_PARTITION_VERSION = "opus_three_primary_parts_overlap8_v1"
 QUALITY_POLICY_VERSION = OPUS_PARTITIONED_QUALITY_POLICY_VERSION
@@ -127,6 +133,19 @@ QUALITY_POLICY_VERSION = OPUS_PARTITIONED_QUALITY_POLICY_VERSION
 QUALITY_PROVIDER = "openrouter_gemini"
 GEMINI_MODEL = "google/gemini-3.7-flash:batch"
 GEMINI_PRIVACY_MODE = "openrouter_batch_30d_google_vertex_user_authorized"
+
+
+def _opus_partition_profile(policy: str) -> tuple[Path, dict, str, int, str, str]:
+    if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2:
+        return (OPUS_SEGMENT_PROMPT_PATH, OPUS_SEGMENT_SCHEMA,
+                OPUS_SEGMENT_SCHEMA_ID, OPUS_SEGMENT_OUTPUT_CAP, "medium", "v2")
+    if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+        return (OPUS_SEGMENT_PROMPT_PATH_V3, OPUS_SEGMENT_SCHEMA_V3,
+                OPUS_SEGMENT_SCHEMA_ID_V3, OPUS_SEGMENT_OUTPUT_CAP_V3,
+                OPUS_SEGMENT_EFFORT_V3, "v3")
+    raise ValueError("unknown Opus partition policy")
+
+
 QUALITY_CREDENTIAL_WAIT_SECONDS = 30 * 60
 QUALITY_BATCH_WAIT_SECONDS = 26 * 60 * 60
 INVENTORY_SEGMENTER_VERSION = "source_inventory_segments_v1"
@@ -288,8 +307,9 @@ def _quality_contract(provider: str, policy: str | None = None) -> tuple[Path, d
         return AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID
     if provider == "opus" and policy == OPUS_QUALITY_POLICY_VERSION:
         return OPUS_AUDIT_PROMPT_PATH, OPUS_AUDIT_SCHEMA, OPUS_AUDIT_SCHEMA_ID
-    if provider == "opus" and policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
-        return OPUS_SEGMENT_PROMPT_PATH, OPUS_SEGMENT_SCHEMA, OPUS_SEGMENT_SCHEMA_ID
+    if provider == "opus" and policy in OPUS_PARTITIONED_POLICIES:
+        prompt, schema, schema_id, _cap, _effort, _profile = _opus_partition_profile(policy)
+        return prompt, schema, schema_id
     if provider == "gemini":
         if policy == PREVIOUS_GEMINI_QUALITY_POLICY_VERSION:
             return GEMINI_AUDIT_PROMPT_PATH, AUDIT_SCHEMA, AUDIT_SCHEMA_ID
@@ -412,7 +432,8 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
             "verify_output_cap": OPUS_VERIFY_OUTPUT_CAP,
             "force_nonce": force_nonce,
         }))
-    if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+    if policy in OPUS_PARTITIONED_POLICIES:
+        audit_prompt, audit_schema, _id, output_cap, effort, _profile = _opus_partition_profile(policy)
         return _sha(_json_bytes({
             "source_sha256": source_sha256,
             "projected_source_sha256": _sha(source_text.encode("utf-8")),
@@ -430,10 +451,12 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
             "audit_model": OPUS_MODEL,
             "audit_privacy_mode": OPUS_PRIVACY_MODE,
             "audit_workspace_io_logging_enabled": OPUS_WORKSPACE_IO_LOGGING_ENABLED,
-            "audit_prompt_sha256": _sha(OPUS_SEGMENT_PROMPT_PATH.read_bytes()),
-            "audit_schema_sha256": _sha(_json_bytes(OPUS_SEGMENT_SCHEMA)),
-            "segment_output_cap": OPUS_SEGMENT_OUTPUT_CAP,
+            "audit_prompt_sha256": _sha(audit_prompt.read_bytes()),
+            "audit_schema_sha256": _sha(_json_bytes(audit_schema)),
+            "segment_output_cap": output_cap,
             "partition_version": OPUS_PARTITION_VERSION,
+            **({"segment_reasoning_effort": effort}
+               if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION else {}),
             "force_nonce": force_nonce,
         }))
     audit_prompt_path, audit_schema, _ = _quality_contract("gemini", policy)
@@ -547,6 +570,7 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
     """Persist intent and upper-bound reserve before one physical POST."""
     policy = quality_policy_version or QUALITY_POLICY_VERSION
     if policy not in {QUALITY_POLICY_VERSION, OPUS_QUALITY_POLICY_VERSION,
+                      OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2,
                       SEGMENT_REVIEW_QUALITY_POLICY_VERSION,
                       EVIDENCE_RECONCILE_QUALITY_POLICY_VERSION}:
         raise ValueError("unsupported_new_summary_quality_policy")
@@ -569,8 +593,10 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             **({"audit_output_cap": OPUS_AUDIT_OUTPUT_CAP,
                 "verify_output_cap": OPUS_VERIFY_OUTPUT_CAP}
                if policy == OPUS_QUALITY_POLICY_VERSION else
-               {"segment_output_cap": OPUS_SEGMENT_OUTPUT_CAP,
-                "partition_version": OPUS_PARTITION_VERSION}),
+               {"segment_output_cap": _opus_partition_profile(policy)[3],
+                "partition_version": OPUS_PARTITION_VERSION,
+                **({"segment_reasoning_effort": OPUS_SEGMENT_EFFORT_V3}
+                   if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION else {})}),
         }
     else:
         audit_prompt_path, audit_schema, _ = _quality_contract("gemini", policy)
@@ -1713,7 +1739,7 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
         target = json.loads(target_path.read_text(encoding="utf-8"))
         if _sha(_json_bytes(target)) != request_manifest["target_document_sha256"]:
             raise ValueError("opus_target_changed")
-        if stage_policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+        if stage_policy in OPUS_PARTITIONED_POLICIES:
             if (job["kind"] not in {"segment_1", "segment_2", "segment_3"}
                     or not isinstance(target, dict)
                     or set(target) != {"segment", "draft"}
@@ -1722,8 +1748,9 @@ def _finish_raw(ledger: Ledger, job: dict) -> dict:
                     or target["segment"].get("segment_id") !=
                     "S" + job["kind"].split("_")[1].zfill(2)):
                 raise ValueError("opus_segment_target_invalid")
-            validate_opus_segment_report(document, target["segment"],
-                                         target["draft"], source_index)
+            validate_opus_segment_report(
+                document, target["segment"], target["draft"], source_index,
+                expected_schema_id=_opus_partition_profile(stage_policy)[2])
             report_file = artifacts / "opus_segment_report.json"
             write_private_json(report_file, document)
             ledger.stage_completed(job["id"], report_file)
@@ -1870,12 +1897,13 @@ def _quality_request_body(source_text: str, target: dict, *, kind: str,
         if policy == OPUS_QUALITY_POLICY_VERSION and kind in {"audit", "verify"}:
             return build_opus_audit_request(source_text, target, mode=kind,
                                             prior_findings=prior_findings)
-        if (policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION
+        if (policy in OPUS_PARTITIONED_POLICIES
                 and kind in {"segment_1", "segment_2", "segment_3"}
                 and isinstance(target, dict)
                 and set(target) == {"segment", "draft"}):
             return build_opus_segment_audit_request(
-                source_text, target["draft"], target["segment"])
+                source_text, target["draft"], target["segment"],
+                profile=_opus_partition_profile(policy)[5])
         raise ValueError("invalid_opus_quality_stage")
     if provider == "gemini":
         # OpenRouter Chat Completions carries a Gemini-specific instruction.
@@ -2252,16 +2280,19 @@ def _start_opus_stage(ledger: Ledger, root: dict, kind: str, target: dict,
     policy = root_manifest.get("quality_policy_version")
     permitted_kinds = ({"audit", "verify"} if policy == OPUS_QUALITY_POLICY_VERSION
                        else {"segment_1", "segment_2", "segment_3"}
-                       if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION else set())
+                       if policy in OPUS_PARTITIONED_POLICIES else set())
     if kind not in permitted_kinds:
         raise ValueError("invalid_opus_quality_stage")
     if _quality_route(root_manifest) != "opus":
         raise ValueError("opus_root_policy_mismatch")
-    if policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+    if policy in OPUS_PARTITIONED_POLICIES:
+        prompt, schema, _id, output_cap, effort, _profile = _opus_partition_profile(policy)
         if (root_manifest.get("partition_version") != OPUS_PARTITION_VERSION
-                or root_manifest.get("segment_output_cap") != OPUS_SEGMENT_OUTPUT_CAP
-                or root_manifest.get("audit_prompt_sha256") != _sha(OPUS_SEGMENT_PROMPT_PATH.read_bytes())
-                or root_manifest.get("audit_schema_sha256") != _sha(_json_bytes(OPUS_SEGMENT_SCHEMA))):
+                or root_manifest.get("segment_output_cap") != output_cap
+                or root_manifest.get("audit_prompt_sha256") != _sha(prompt.read_bytes())
+                or root_manifest.get("audit_schema_sha256") != _sha(_json_bytes(schema))
+                or (policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION
+                    and root_manifest.get("segment_reasoning_effort") != effort)):
             raise ValueError("opus_partition_contract_changed")
     if (root_manifest.get("privacy_mode") != OPUS_WRITER_PRIVACY_MODE
             or root_manifest.get("workspace_io_logging_enabled") is not True
@@ -2466,11 +2497,11 @@ def _finalize_quality(ledger: Ledger, root: dict, document: dict, source_index: 
             "judge_model": OPUS_MODEL,
             "judge_provider": OPUS_QUALITY_PROVIDER,
             "verification_performed": (
-                False if request_manifest.get("quality_policy_version") ==
-                OPUS_PARTITIONED_QUALITY_POLICY_VERSION else
+                False if request_manifest.get("quality_policy_version") in
+                OPUS_PARTITIONED_POLICIES else
                 bool(verify and verify["status"] == "stage_complete")),
         })
-        if request_manifest.get("quality_policy_version") == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+        if request_manifest.get("quality_policy_version") in OPUS_PARTITIONED_POLICIES:
             quality_review["segment_job_ids"] = [stage["id"] for stage in segments if stage]
             plan = json.loads((artifacts / "opus_segment_plan.json").read_text(encoding="utf-8"))
             quality_review["segment_count"] = len(plan["segments"])
@@ -3022,11 +3053,16 @@ def _opus_partition_plan(root: dict, source_text: str, source_index: dict,
     """Seal the exact primary source partition before the first Opus POST."""
     artifacts = Path(root["artifact_dir"])
     manifest = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))
-    if (manifest.get("quality_policy_version") != OPUS_PARTITIONED_QUALITY_POLICY_VERSION
-            or manifest.get("partition_version") != OPUS_PARTITION_VERSION
-            or manifest.get("segment_output_cap") != OPUS_SEGMENT_OUTPUT_CAP
-            or manifest.get("audit_prompt_sha256") != _sha(OPUS_SEGMENT_PROMPT_PATH.read_bytes())
-            or manifest.get("audit_schema_sha256") != _sha(_json_bytes(OPUS_SEGMENT_SCHEMA))):
+    policy = manifest.get("quality_policy_version")
+    if policy not in OPUS_PARTITIONED_POLICIES:
+        raise ValueError("opus_partition_contract_changed")
+    prompt, schema, _id, output_cap, effort, _profile = _opus_partition_profile(policy)
+    if (manifest.get("partition_version") != OPUS_PARTITION_VERSION
+            or manifest.get("segment_output_cap") != output_cap
+            or manifest.get("audit_prompt_sha256") != _sha(prompt.read_bytes())
+            or manifest.get("audit_schema_sha256") != _sha(_json_bytes(schema))
+            or (policy == OPUS_PARTITIONED_QUALITY_POLICY_VERSION
+                and manifest.get("segment_reasoning_effort") != effort)):
         raise ValueError("opus_partition_contract_changed")
     segments = plan_opus_audit_segments(source_text)
     validate_inventory_plan(segments, source_index)
@@ -3051,6 +3087,9 @@ def _advance_quality_opus_partitioned(ledger: Ledger, root: dict, source_text: s
     """
     artifacts = Path(root["artifact_dir"])
     segments = _opus_partition_plan(root, source_text, source_index, draft)
+    policy = json.loads((artifacts / "manifest.json").read_text(encoding="utf-8"))[
+        "quality_policy_version"]
+    expected_schema_id = _opus_partition_profile(policy)[2]
     reports: list[dict] = []
 
     def incomplete(stage_name: str, reason: str) -> dict:
@@ -3084,12 +3123,15 @@ def _advance_quality_opus_partitioned(ledger: Ledger, root: dict, source_text: s
         if _quality_stage_outcome(stage) == "failed":
             return incomplete(kind, stage["status"])
         report = json.loads(Path(stage["accepted_document_path"]).read_text(encoding="utf-8"))
-        validate_opus_segment_report(report, segment, draft, source_index)
+        validate_opus_segment_report(
+            report, segment, draft, source_index,
+            expected_schema_id=expected_schema_id)
         reports.append(report)
 
     try:
         combined, warnings = merge_opus_segment_reports(
-            reports, segments, draft, source_index)
+            reports, segments, draft, source_index,
+            expected_schema_id=expected_schema_id)
         write_private_json(artifacts / "opus_partition_combined_report.json", combined)
         if warnings:
             write_private_json(artifacts / "segment_merge_warnings.json",
@@ -3231,7 +3273,7 @@ def _advance_quality(ledger: Ledger, root: dict, client_factory,
                 or _sha((original_artifacts / "draft_document.json").read_bytes())
                 != root_manifest.get("writer_draft_file_sha256")):
             raise ValueError("saved_writer_evidence_changed")
-    if root_manifest.get("quality_policy_version") == OPUS_PARTITIONED_QUALITY_POLICY_VERSION:
+    if root_manifest.get("quality_policy_version") in OPUS_PARTITIONED_POLICIES:
         if _quality_route(root_manifest) != "opus":
             raise ValueError("opus_partitioned_quality_root_changed")
         return _advance_quality_opus_partitioned(
