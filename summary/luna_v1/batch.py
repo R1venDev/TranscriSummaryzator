@@ -54,6 +54,23 @@ class Reply:
     body: dict[str, Any]
 
 
+def validate_prepared_batch_payload(payload_bytes: bytes, *, expected_sha256: str) -> None:
+    """Run all deterministic wire checks before an intent becomes ambiguous."""
+    if (not isinstance(payload_bytes, bytes) or len(payload_bytes) > 16 * 1024 * 1024
+            or hashlib.sha256(payload_bytes).hexdigest() != expected_sha256):
+        raise ValueError("prepared_batch_payload_changed")
+    try:
+        value = json.loads(payload_bytes)
+        requests = value["requests"]
+        items = [(item["custom_id"], item["body"]) for item in requests]
+    except (TypeError, KeyError, ValueError, UnicodeDecodeError):
+        raise ValueError("prepared_batch_payload_invalid") from None
+    expected = build_batch_payload(items)
+    encoded = json.dumps(expected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if value != expected or payload_bytes != encoded:
+        raise ValueError("prepared_batch_order_or_shape_invalid")
+
+
 class BatchClient:
     """Use one selected backend key; callers save bodies in a private ledger."""
 
@@ -129,20 +146,9 @@ class BatchClient:
         requires requests after endpoint/model/provider/window.  The caller
         seals this byte string and records its digest before dispatch.
         """
-        if (not isinstance(payload_bytes, bytes) or len(payload_bytes) > 16 * 1024 * 1024
-                or hashlib.sha256(payload_bytes).hexdigest() != expected_sha256):
-            raise ValueError("prepared_batch_payload_changed")
-        try:
-            value = json.loads(payload_bytes)
-            requests = value["requests"]
-            items = [(item["custom_id"], item["body"]) for item in requests]
-        except (TypeError, KeyError, ValueError, UnicodeDecodeError):
-            raise ValueError("prepared_batch_payload_invalid") from None
-        expected = build_batch_payload(items)
-        encoded = json.dumps(expected, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if value != expected or payload_bytes != encoded:
-            raise ValueError("prepared_batch_order_or_shape_invalid")
+        validate_prepared_batch_payload(payload_bytes, expected_sha256=expected_sha256)
         return self._request("POST", "/batches", prepared_body=payload_bytes)
+
 
     def list_batches(self, *, limit: int = 100, after: str | None = None,
                      created_after: int | str | None = None,

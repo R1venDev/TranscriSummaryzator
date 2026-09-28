@@ -29,7 +29,7 @@ from scripts.summary_credentials import (
 
 from .batch import (
     BatchClient, BatchError, MODEL, PROVIDER, SUBMIT_MODEL, TERMINAL, build_batch_payload,
-    parse_batch_items, valid_batch_id,
+    parse_batch_items, valid_batch_id, validate_prepared_batch_payload,
 )
 from .batch_stage_contracts_v1 import (
     STAGE_PROMPT_VERSION, developer_message_for_stage,
@@ -258,6 +258,7 @@ def _post_reserved(*, ledger: Ledger, attempt_id: str, payload_path: Path,
     # A damaged local payload has never been submitted. Check its seal before
     # changing the durable intent to the ambiguous submitting state.
     payload_bytes = _read_sealed_bytes(payload_path, payload_sha)
+    validate_prepared_batch_payload(payload_bytes, expected_sha256=payload_sha)
     if not ledger.mark_batch_submitting(attempt_id, expected_payload_sha256=payload_sha):
         return {"status": "pending", "attempt_id": attempt_id}
     try:
@@ -270,13 +271,14 @@ def _post_reserved(*, ledger: Ledger, attempt_id: str, payload_path: Path,
         ledger.record_batch_submission(attempt_id, remote_id=remote_id)
         return {"status": "submitted", "attempt_id": attempt_id,
                 "remote_batch_id": remote_id}
-    except BatchError as exc:
-        definite = exc.code in _DEFINITE_REJECTION
+    except (BatchError, ValueError) as exc:
+        definite = isinstance(exc, BatchError) and exc.code in _DEFINITE_REJECTION
+        reason = exc.reason if isinstance(exc, BatchError) else "post_outcome_unknown"
         ledger.record_batch_submission(attempt_id, remote_id=None,
-                                       error_code=exc.reason,
+                                       error_code=reason,
                                        definite_rejection=definite)
         return {"status": "rejected_before_submit" if definite else "submission_unknown",
-                "attempt_id": attempt_id, "error_code": exc.reason}
+                "attempt_id": attempt_id, "error_code": reason}
 
 
 def _planned_capacity_hold(route: Route, snapshot: SourceSnapshot,
@@ -798,7 +800,11 @@ def _cleanup_terminal_once(*, ledger: Ledger, attempt: dict,
     """
     if attempt["status"] not in TERMINAL or not attempt["remote_id"]:
         return None
-    _read_sealed(Path(attempt["terminal_path"]), attempt["terminal_sha256"])
+    try:
+        _read_sealed(Path(attempt["terminal_path"]), attempt["terminal_sha256"])
+    except (OSError, ValueError, TypeError):
+        return {"attempt_id": attempt["id"],
+                "status": "gateway_cleanup_capture_invalid"}
     receipt = private_root / "source_first" / workflow["semantic_key"] / "cleanup" / (
         attempt["id"] + ".json")
     if receipt.exists():
@@ -817,7 +823,7 @@ def _cleanup_terminal_once(*, ledger: Ledger, attempt: dict,
             "provider_files": "per_gateway_deletion_response",
             "io_logs": "unchanged_by_batch_delete"})
         return {"attempt_id": attempt["id"], "status": "gateway_cleanup_recorded"}
-    except (CredentialError, BatchError, ValueError):
+    except (CredentialError, BatchError, ValueError, OSError):
         return {"attempt_id": attempt["id"], "status": "gateway_cleanup_pending"}
 
 
@@ -1629,7 +1635,7 @@ def poll_source_first_once(*, private_root: Path,
                 except CredentialError:
                     outcomes.append({"status": "credential_required",
                                      "attempt_id": attempt["id"]})
-                except (RouteBlocked, BatchError, ValueError) as exc:
+                except (RouteBlocked, BatchError, ValueError, OSError) as exc:
                     outcomes.append({"status": "dispatch_blocked",
                                      "attempt_id": attempt["id"],
                                      "reason": (str(exc) if isinstance(exc, RouteBlocked)

@@ -113,7 +113,9 @@ class SourceFirstLedgerTests(unittest.TestCase):
             self.assertEqual(JOB_CAP_MICROUSD, 100_000)
 
     def test_invalid_source_first_cap_rejected(self):
-        for value in ("", "nan", "1.01", "0", "0.1000001"):
+        with patch.dict(os.environ, {"TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD": "0.25"}):
+            self.assertEqual(source_first_job_cap_microusd(), 250_000)
+        for value in ("", "nan", "1.01", "1.00", "0.250001", "0", "0.1000001"):
             with patch.dict(os.environ, {"TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD": value}):
                 with self.assertRaisesRegex(ValueError, "invalid_source_first_job_cap"):
                     source_first_job_cap_microusd()

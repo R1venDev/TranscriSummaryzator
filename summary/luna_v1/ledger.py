@@ -17,6 +17,7 @@ from typing import Sequence
 WEEK_SECONDS = 7 * 24 * 60 * 60
 WEEK_CAP_MICROUSD = 1_000_000
 JOB_CAP_MICROUSD = 100_000
+SOURCE_FIRST_APPROVED_CAP_MICROUSD = 250_000
 MAX_DISPATCHES_PER_JOB = 6
 MAX_BATCH_ITEMS_PER_WORKFLOW = 12
 MAX_BATCH_POSTS_PER_WORKFLOW = 6
@@ -36,7 +37,7 @@ def source_first_job_cap_microusd() -> int:
     except (InvalidOperation, AttributeError):
         raise ValueError("invalid_source_first_job_cap") from None
     if (not amount.is_finite() or amount != amount.to_integral_value()
-            or not 0 < amount <= WEEK_CAP_MICROUSD):
+            or not 0 < amount <= SOURCE_FIRST_APPROVED_CAP_MICROUSD):
         raise ValueError("invalid_source_first_job_cap")
     return int(amount)
 

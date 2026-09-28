@@ -223,6 +223,32 @@ class SourceFirstRuntimeTests(unittest.TestCase):
         self.assertEqual(client.calls, 1)
         self.assertEqual(self.ledger.get_batch_attempt(attempt_id)["post_count"], 1)
 
+    def test_malformed_sealed_wire_is_rejected_before_post_intent(self):
+        attempt_id, path, _, _ = self._reserved()
+        prepared = json.loads(path.read_bytes())
+        malformed = {"requests": prepared["requests"],
+                     "endpoint": prepared["endpoint"],
+                     "model": prepared["model"],
+                     "provider": prepared["provider"],
+                     "completion_window": prepared["completion_window"]}
+        bad_path = self.root / "bad-order.json"
+        bad_bytes = json.dumps(malformed, ensure_ascii=False,
+                               separators=(",", ":")).encode("utf-8")
+        bad_path.write_bytes(bad_bytes)
+        bad_sha = hashlib.sha256(bad_bytes).hexdigest()
+
+        class Client:
+            def submit_prepared(self, *_args, **_kwargs):
+                raise AssertionError("malformed wire reached POST")
+
+        with self.assertRaisesRegex(ValueError, "prepared_batch_order_or_shape_invalid"):
+            _post_reserved(ledger=self.ledger, attempt_id=attempt_id,
+                           payload_path=bad_path, payload_sha=bad_sha,
+                           client=Client())
+        pending = self.ledger.get_batch_attempt(attempt_id)
+        self.assertEqual(pending["status"], "reserved")
+        self.assertEqual(pending["post_count"], 0)
+
     def test_lost_post_recovers_only_exact_custom_id(self):
         attempt_id, path, digest, custom_id = self._reserved()
         self.assertTrue(self.ledger.mark_batch_submitting(attempt_id, digest))
@@ -777,6 +803,52 @@ class SourceFirstRuntimeTests(unittest.TestCase):
             self.assertTrue(any(row.get("status") == "dispatch_blocked"
                                 for row in outcomes), label)
 
+    def test_unreadable_reserved_payload_does_not_stop_other_jobs(self):
+        broken, _ = self._source_workflow("missing_payload")
+        broken_writer, _ = self._reserve_stage(broken, "writer")
+        self._reserve_stage(broken, "extract")
+        Path(self.ledger.get_batch_attempt(broken_writer)["payload_path"]).unlink()
+        healthy, _ = self._source_workflow("healthy_peer")
+        healthy_writer, _ = self._reserve_stage(healthy, "writer")
+        healthy_extract, _ = self._reserve_stage(healthy, "extract")
+        route = Route(SUBMIT_MODEL, PROVIDER, "workspace-1", 1_000_000, 32_000,
+                      Decimal("0.000000001"), Decimal("0.00000001"),
+                      Decimal("0.000000001"), Decimal(0), None,
+                      batch_endpoint_model=MODEL, provider_endpoint_tag=PROVIDER)
+
+        class Credential:
+            def __init__(self, path):
+                self.path = Path(path)
+
+            def reveal_for_dispatch(self, *_):
+                return "offline-token"
+
+        class Client:
+            posts = 0
+
+            def submit_prepared(self, *_args, **_kwargs):
+                self.posts += 1
+                return Reply(202, {"id": f"batch_healthy{self.posts}"})
+
+        client = Client()
+        with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+              patch("summary.luna_v1.source_first_runtime.verify_source_first_batch_route",
+                    return_value=route),
+              patch("summary.luna_v1.source_first_runtime._advance_workflow",
+                    return_value={"status": "pending"})):
+            outcomes = poll_source_first_once(private_root=self.root,
+                client_factory=lambda token: client)
+        self.assertEqual(client.posts, 2)
+        self.assertEqual(self.ledger.get_batch_attempt(broken_writer)["status"],
+                         "reserved")
+        self.assertEqual(self.ledger.get_batch_attempt(healthy_writer)["status"],
+                         "submitted")
+        self.assertEqual(self.ledger.get_batch_attempt(healthy_extract)["status"],
+                         "submitted")
+        self.assertTrue(any(row.get("status") == "dispatch_blocked"
+                            and row.get("attempt_id") == broken_writer
+                            for row in outcomes))
+
     def test_cleanup_requires_matching_gateway_deletion_receipt(self):
         terminal = self.root / "terminal-for-cleanup.json"
         sealed_sha = _json_file_once(terminal, {"id": "batch_cleanup123",
@@ -787,6 +859,12 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                    "credential_version": 1}
         receipt = (self.root / "source_first" / self.workflow["semantic_key"] /
                    "cleanup" / "attempt-cleanup.json")
+        missing = dict(attempt, id="missing-capture",
+                       terminal_path=str(self.root / "absent-terminal.json"))
+        self.assertEqual(_cleanup_terminal_once(ledger=self.ledger, attempt=missing,
+            workflow=self.workflow, private_root=self.root,
+            client_factory=lambda token: None)["status"],
+            "gateway_cleanup_capture_invalid")
 
         class Credential:
             def __init__(self, *_):
