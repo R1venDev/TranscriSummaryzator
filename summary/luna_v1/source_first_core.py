@@ -643,21 +643,30 @@ def stage_patch_candidate(document: dict, plan: dict, registry: dict[str, dict],
                     "value_hash": digest(value),
                 })
                 container[key] = value
-                if (field.startswith("tasks.") and field.rsplit(".", 1)[-1]
-                        in {"assignee", "due", "priority", "recipient"}
-                        and value is not None):
+                if field.startswith("tasks."):
+                    field_name = field.rsplit(".", 1)[-1]
+                    # Title and description share the action provenance in the
+                    # Luna task schema. A later correction must travel with the
+                    # repaired text into every rendered task/source link.
+                    source_field = ("action" if field_name in {"title", "description"}
+                                    else field_name)
+                    needs_provenance = (field_name in {"title", "description",
+                                                        "discussion_status"}
+                                        or field_name in {"assignee", "due", "priority",
+                                                               "recipient"} and value is not None)
+                    if not needs_provenance:
+                        continue
                     if evidence_lookup is None or not bundle["evidence_ids"]:
-                        raise ValueError("task_metadata_repair_without_evidence")
+                        raise ValueError("task_repair_without_evidence")
                     cited = []
                     for evidence_id in bundle["evidence_ids"]:
                         evidence = evidence_lookup.get(evidence_id)
                         if not isinstance(evidence, dict) or not evidence.get("u_id"):
-                            raise ValueError("task_metadata_repair_evidence_unknown")
+                            raise ValueError("task_repair_evidence_unknown")
                         cited.append(evidence["u_id"])
                     task = candidate["tasks"][int(field.split(".")[1])]
-                    field_name = field.rsplit(".", 1)[-1]
-                    task["field_sources"][field_name] = list(dict.fromkeys(
-                        [*task["field_sources"][field_name], *cited]))
+                    task["field_sources"][source_field] = list(dict.fromkeys(
+                        [*task["field_sources"][source_field], *cited]))
                     task["source_ids"] = list(dict.fromkeys([*task["source_ids"], *cited]))
             else:
                 section = op["field_key"]

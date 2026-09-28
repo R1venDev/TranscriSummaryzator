@@ -117,6 +117,16 @@ class SourceFirstRouteTests(unittest.TestCase):
         with self.assertRaisesRegex(RouteBlocked, "batch_endpoints_unavailable"):
             verify_source_first_batch_route(client)
 
+    def test_source_first_item_can_use_separately_authorized_cap(self):
+        route = verify_source_first_batch_route(_MetadataClient())
+        request = b"x" * 700_000
+        with self.assertRaisesRegex(RouteBlocked, "job_budget_exceeded"):
+            route.reserve_microusd(request, max_completion_tokens=25_000)
+        reserve = route.reserve_microusd(request, max_completion_tokens=25_000,
+                                         authorized_job_cap_microusd=200_000)
+        self.assertGreater(reserve, 100_000)
+        self.assertLess(reserve, 200_000)
+
 
 if __name__ == "__main__":
     unittest.main()

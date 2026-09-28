@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -15,6 +17,7 @@ from summary.luna_v1.ledger import (
     WEEK_SECONDS,
     Ledger,
     batch_item_intent_for_body,
+    source_first_job_cap_microusd,
     write_private_json,
 )
 
@@ -76,6 +79,44 @@ class SourceFirstLedgerTests(unittest.TestCase):
             credential_version=1, workspace_id=workspace,
             payload_path=payload, payload_sha256=_sha(payload), items=items)
         return result, payload, items
+
+    def test_explicit_source_first_cap_is_sealed_without_raising_legacy_cap(self):
+        with patch.dict(os.environ, {"TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD": "0.20"}):
+            self.assertEqual(source_first_job_cap_microusd(), 200_000)
+            manifest = self.root / "private" / "larger-plan.json"
+            write_private_json(manifest, {"source_sha256": "c" * 64,
+                "planned_capacity_microusd": 200_000,
+                "capacity_basis": {"route": "synthetic"}})
+            created = self.ledger.create_source_first_job(
+                semantic_key="d" * 64, source_sha256="c" * 64,
+                output_dir=self.root / "larger-output", manifest_path=manifest,
+                manifest_sha256=_sha(manifest), credential_id="writer-key",
+                credential_version=1, workspace_id="writer-space")
+            self.assertEqual(self.ledger.reserve_source_first_plan(
+                created.job_id, plan_sha256=_sha(manifest),
+                reserve_microusd=200_000).kind, "new")
+        with patch.dict(os.environ, {"TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD": "0.10"}):
+            self.assertEqual(self.ledger.reserve_source_first_plan(
+                created.job_id, plan_sha256=_sha(manifest),
+                reserve_microusd=200_000).kind, "pending")
+            body = _body("U00002: тест")
+            payload = self.root / "private" / "larger-item.json"
+            write_private_json(payload, build_batch_payload([("larger-item", body)]))
+            decision = self.ledger.reserve_batch_intent(
+                workflow_id=created.job_id, intent_key="e" * 64,
+                stage="writer", credential_id="writer-key",
+                credential_version=1, workspace_id="writer-space",
+                payload_path=payload, payload_sha256=_sha(payload),
+                items=[batch_item_intent_for_body("larger-item", body,
+                                                 reserve_microusd=120_000)])
+            self.assertEqual(decision.kind, "new")
+            self.assertEqual(JOB_CAP_MICROUSD, 100_000)
+
+    def test_invalid_source_first_cap_rejected(self):
+        for value in ("", "nan", "1.01", "0", "0.1000001"):
+            with patch.dict(os.environ, {"TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD": value}):
+                with self.assertRaisesRegex(ValueError, "invalid_source_first_job_cap"):
+                    source_first_job_cap_microusd()
 
     def test_manifest_and_payload_are_sealed_before_post(self):
         decision, payload, items = self.intent(stage="writer", workspace="writer-space",

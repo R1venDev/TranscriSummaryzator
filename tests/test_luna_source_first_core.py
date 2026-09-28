@@ -162,6 +162,50 @@ class SourceFirstCoreTests(unittest.TestCase):
                                             old, self.snapshot.index, evidence)
         self.assertEqual(published, candidate)
 
+    def test_repaired_task_content_and_status_keep_late_source_provenance(self):
+        document = _document()
+        old = build_surfaces(document, self.snapshot.index)
+        evidence = {"E2": {"u_id": "U00002"}}
+        cases = (
+            ("title", "Проверить сигнал или взять другую запись", "action"),
+            ("description", "Проверить сигнал на тестовой или другой записи.", "action"),
+            ("discussion_status", "unknown", "discussion_status"),
+        )
+        for field_name, replacement, provenance_field in cases:
+            with self.subTest(field=field_name):
+                target = next(identity for identity, row in old.items()
+                              if row["field_key"] == "tasks.0." + field_name)
+                plan = {"bundles": {"B1": {"evidence_ids": ["E2"],
+                    "operations": [{"kind": "update_task", "target_id": target,
+                        "field_key": "tasks.0." + field_name,
+                        "value_json": json.dumps(replacement, ensure_ascii=False)}]}}}
+                candidate, _ = stage_patch_candidate(document, plan, old,
+                                                     self.snapshot.index, evidence)
+                task = candidate["tasks"][0]
+                self.assertEqual(task[field_name], replacement)
+                self.assertEqual(task["source_ids"], ["U00001", "U00002"])
+                self.assertEqual(task["field_sources"][provenance_field],
+                                 ["U00001", "U00002"])
+                self.assertEqual(document["tasks"][0]["source_ids"], ["U00001"])
+                published = accepted_patch_document(document, plan,
+                    {"accepted": {"B1"}}, old, self.snapshot.index, evidence)
+                self.assertEqual(published, candidate)
+
+    def test_repaired_task_content_without_known_evidence_is_rejected(self):
+        document = _document()
+        old = build_surfaces(document, self.snapshot.index)
+        target = next(identity for identity, row in old.items()
+                      if row["field_key"] == "tasks.0.description")
+        plan = {"bundles": {"B1": {"evidence_ids": ["E2"],
+            "operations": [{"kind": "update_task", "target_id": target,
+                "field_key": "tasks.0.description",
+                "value_json": json.dumps("Проверить другую запись.")}]}}}
+        with self.assertRaisesRegex(ValueError, "task_repair_without_evidence"):
+            stage_patch_candidate(document, plan, old, self.snapshot.index)
+        with self.assertRaisesRegex(ValueError, "task_repair_evidence_unknown"):
+            stage_patch_candidate(document, plan, old, self.snapshot.index, {})
+        self.assertEqual(document["tasks"][0]["source_ids"], ["U00001"])
+
     def test_inventory_requires_every_core_id_and_unit_evidence(self):
         packet = plan_packets(self.snapshot, target_chars=9999)[0]
         report = {"schema_version": "luna_inventory_v1", "complete": True,

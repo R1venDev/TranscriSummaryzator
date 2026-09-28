@@ -37,7 +37,7 @@ from .batch_stage_contracts_v1 import (
 )
 from .contract import SCHEMA as WRITER_SCHEMA, validate_document
 from .ledger import (
-    JOB_CAP_MICROUSD, BatchItemIntent, Ledger,
+    BatchItemIntent, Ledger, source_first_job_cap_microusd,
     batch_item_intent_for_body,
 )
 from .render import HEADINGS
@@ -238,7 +238,8 @@ def _batch_intent(*, ledger: Ledger, workflow: dict, stage: str,
     item_intents: list[BatchItemIntent] = []
     for custom_id, body in items:
         reserve = route.reserve_microusd(canonical_bytes(body),
-                                         max_completion_tokens=STAGE_CAPS[stage])
+                                         max_completion_tokens=STAGE_CAPS[stage],
+                                         authorized_job_cap_microusd=workflow["planned_reserve_microusd"])
         item_intents.append(batch_item_intent_for_body(
             custom_id, body, reserve_microusd=reserve))
     decision = ledger.reserve_batch_intent(
@@ -254,9 +255,11 @@ def _batch_intent(*, ledger: Ledger, workflow: dict, stage: str,
 
 def _post_reserved(*, ledger: Ledger, attempt_id: str, payload_path: Path,
                    payload_sha: str, client: BatchClient) -> dict:
+    # A damaged local payload has never been submitted. Check its seal before
+    # changing the durable intent to the ambiguous submitting state.
+    payload_bytes = _read_sealed_bytes(payload_path, payload_sha)
     if not ledger.mark_batch_submitting(attempt_id, expected_payload_sha256=payload_sha):
         return {"status": "pending", "attempt_id": attempt_id}
-    payload_bytes = _read_sealed_bytes(payload_path, payload_sha)
     try:
         reply = client.submit_prepared(payload_bytes, expected_sha256=payload_sha)
         remote_id = reply.body.get("id")
@@ -332,7 +335,8 @@ def _reserve_and_post_wave1(*, ledger: Ledger, workflow: dict,
     for stage, items in (("writer", writer), ("extract", extract)):
         for _, body in items:
             reserve = pricing_route.reserve_microusd(canonical_bytes(body),
-                                                     max_completion_tokens=STAGE_CAPS[stage])
+                                                     max_completion_tokens=STAGE_CAPS[stage],
+                                                     authorized_job_cap_microusd=workflow["planned_reserve_microusd"])
             if not prior.get(stage) or prior[stage]["post_count"] == 0:
                 remaining_wave_reserve += reserve
     if (route.key_limit_remaining_usd is not None
@@ -472,6 +476,10 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                         "reason": "no_luna_batch_credential"}
             if route.workspace_id != selected.get("workspace_id"):
                 raise RouteBlocked("credential_workspace_changed_since_check")
+            try:
+                job_cap = source_first_job_cap_microusd()
+            except ValueError as exc:
+                return {"status": "preflight_blocked", "reason": str(exc)}
             semantic_key = digest({
                 "source_sha256": snapshot.source_sha256,
                 "policy_version": POLICY_VERSION,
@@ -500,7 +508,8 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                     if (saved is not None
                             and _saved_policy_matches(existing, saved, snapshot,
                                                       Path(output_dir), force_nonce)
-                            and saved.get("planned_capacity_microusd") == JOB_CAP_MICROUSD
+                            and isinstance(saved.get("planned_capacity_microusd"), int)
+                            and 0 < saved["planned_capacity_microusd"] <= job_cap
                             and ledger.reactivate_source_first_budget_refusal(
                                 existing["id"], semantic_key=semantic_key,
                                 source_sha256=snapshot.source_sha256,
@@ -513,14 +522,14 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                                    else existing["status"]),
                         "workflow_id": existing["id"]}
             forecast = _planned_capacity_hold(route, snapshot, packets)
-            if forecast > JOB_CAP_MICROUSD:
+            if forecast > job_cap:
                 return {"status": "budget_blocked", "reason": "full_chain_capacity_exceeds_saved_cap",
                         "planned_capacity_microusd": forecast,
-                        "authorized_job_cap_microusd": JOB_CAP_MICROUSD}
+                        "authorized_job_cap_microusd": job_cap}
             # The future D0 and sparse findings cannot be priced exactly yet.
             # Hold only the saved authorized logical-job cap, not a maximum
             # context-window payload; unused dollars are released at terminal.
-            planned_hold = JOB_CAP_MICROUSD
+            planned_hold = job_cap
             manifest = _manifest(snapshot, packets, dimensions,
                 output_dir=Path(output_dir), workspace_id=route.workspace_id,
                 force_nonce=force_nonce, route=route,
@@ -549,6 +558,7 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                 # the poller can reserve its saved plan on a later tick.
                 return {"status": "budget_blocked", "workflow_id": workflow["id"],
                         "reason": "rolling_week_budget_exceeded"}
+            workflow = ledger.get_batch_workflow(workflow["id"])
             return _reserve_and_post_wave1(ledger=ledger, workflow=workflow,
                 snapshot=snapshot, packets=packets, route=route, client=client)
     except (CredentialError, RouteBlocked, BatchError) as exc:
@@ -797,9 +807,15 @@ def _cleanup_terminal_once(*, ledger: Ledger, attempt: dict,
         store = CredentialStore(private_root / "credentials.sqlite3")
         token = _credential_for_read(store, attempt, workflow)
         reply = client_factory(token).delete(attempt["remote_id"])
+        deletion = reply.body.get("deletion") if isinstance(reply.body, dict) else None
+        if (reply.status_code != 200 or reply.body.get("id") != attempt["remote_id"]
+                or not isinstance(deletion, dict)
+                or deletion.get("openrouter") != "deleted"):
+            raise ValueError("gateway_delete_unconfirmed")
         _json_file_once(receipt, {"batch_id": attempt["remote_id"],
             "http_status": reply.status_code, "gateway_reply": reply.body,
-            "provider_files": "unknown", "io_logs": "unchanged_by_batch_delete"})
+            "provider_files": "per_gateway_deletion_response",
+            "io_logs": "unchanged_by_batch_delete"})
         return {"attempt_id": attempt["id"], "status": "gateway_cleanup_recorded"}
     except (CredentialError, BatchError, ValueError):
         return {"attempt_id": attempt["id"], "status": "gateway_cleanup_pending"}
@@ -811,6 +827,63 @@ def _stage_attempt(ledger: Ledger, workflow_id: str, stage: str) -> dict | None:
     if len(attempts) > 1:
         raise ValueError("multiple_stage_attempts_require_bounded_recovery")
     return attempts[0] if attempts else None
+
+
+def _verify_reserved_dispatch(*, ledger: Ledger, workflow: dict,
+                              manifest: dict, attempt: dict,
+                              client: BatchClient) -> None:
+    """Re-admit an unposted durable intent after a scheduler restart.
+
+    The old reservation protects the app budget, but it does not prove that
+    the key, account policy, endpoint, price or key balance is still valid.
+    For wave one, both pending POSTs compete for the same key balance.
+    """
+    route = verify_source_first_batch_route(client)
+    if (attempt["post_count"] != 0 or attempt["status"] != "reserved"
+            or attempt["credential_id"] != workflow["credential_id"]
+            or attempt["credential_version"] != workflow["credential_version"]
+            or attempt["workspace_id"] != workflow["workspace_id"]
+            or route.workspace_id != workflow["workspace_id"]
+            or route.model != manifest.get("model_submit_slug")
+            or route.batch_endpoint_model != manifest.get("resolved_batch_endpoint")
+            or route.provider_endpoint_tag != manifest.get("provider_endpoint_tag")):
+        raise RouteBlocked("reserved_batch_route_identity_changed")
+    if (manifest.get("prompt_hashes") !=
+            {name: prompt_sha256_for_stage(name) for name in STAGE_CAPS}
+            or manifest.get("schema_hashes") !=
+            {name: digest(schema_for_stage(name)) for name in STAGE_CAPS}):
+        raise RouteBlocked("stage_contract_changed_during_job")
+    pending = [attempt]
+    if attempt["stage"] in {"writer", "extract"}:
+        pending = [row for row in ledger.list_batch_attempts(workflow["id"])
+                   if row["stage"] in {"writer", "extract"}
+                   and row["status"] == "reserved" and row["post_count"] == 0]
+    pricing_route = replace(route, key_limit_remaining_usd=None)
+    total_pending = 0
+    for row in pending:
+        envelope = _read_sealed(Path(row["payload_path"]), row["payload_sha256"])
+        saved = {item["custom_id"]: item for item in ledger.batch_items(row["id"])}
+        requests = envelope.get("requests")
+        if (not isinstance(requests, list) or len(requests) != len(saved)
+                or len({entry.get("custom_id") for entry in requests
+                        if isinstance(entry, dict)}) != len(saved)):
+            raise RouteBlocked("reserved_batch_items_changed")
+        for entry in requests:
+            if not isinstance(entry, dict) or entry.get("custom_id") not in saved:
+                raise RouteBlocked("reserved_batch_items_changed")
+            body = entry.get("body")
+            item = saved[entry["custom_id"]]
+            if not isinstance(body, dict) or digest(body) != item["request_sha256"]:
+                raise RouteBlocked("reserved_batch_items_changed")
+            current_price = pricing_route.reserve_microusd(
+                canonical_bytes(body), max_completion_tokens=item["max_output_tokens"],
+                authorized_job_cap_microusd=workflow["planned_reserve_microusd"])
+            if current_price > item["reserved_microusd"]:
+                raise RouteBlocked("reserved_batch_price_increased")
+        total_pending += row["reserved_microusd"]
+    if (route.key_limit_remaining_usd is not None
+            and Decimal(total_pending) > route.key_limit_remaining_usd * 1_000_000):
+        raise RouteBlocked("key_budget_insufficient")
 
 
 def _stage_native(ledger: Ledger, attempt: dict) -> tuple[dict[str, dict], dict[str, str]]:
@@ -1313,7 +1386,9 @@ def _advance_workflow(*, ledger: Ledger, workflow: dict,
                         reserve_microusd=manifest["planned_capacity_microusd"])
                     if reserved is False or getattr(reserved, "kind", None) == "blocked":
                         return {"status": "budget_blocked", "workflow_id": workflow["id"],
-                                "reason": "rolling_week_budget_exceeded"}
+                                "reason": getattr(reserved, "reason", None)
+                                          or "rolling_week_budget_exceeded"}
+                    workflow = ledger.get_batch_workflow(workflow["id"])
                 return _reserve_and_post_wave1(ledger=ledger, workflow=workflow,
                     snapshot=snapshot, packets=packets, route=route, client=client)
         except (CredentialError, RouteBlocked, BatchError) as exc:
@@ -1532,14 +1607,33 @@ def poll_source_first_once(*, private_root: Path,
                     with credential_dispatch_guard(store.path):
                         token = store.reveal_for_dispatch(attempt["credential_id"],
                                                           attempt["credential_version"])
+                        client = client_factory(token)
+                        _verify_reserved_dispatch(ledger=ledger, workflow=workflow,
+                            manifest=manifest, attempt=attempt, client=client)
+                        try:
+                            source_still_current = (
+                                _sha(source_path.read_bytes()) == workflow["source_sha256"])
+                        except OSError:
+                            source_still_current = False
+                        if not source_still_current:
+                            ledger.cancel_batch_before_submit(attempt["id"],
+                                                              "source_revision_changed")
+                            outcomes.append({"status": "source_revision_changed_before_submit",
+                                             "attempt_id": attempt["id"]})
+                            continue
                         outcomes.append(_post_reserved(ledger=ledger,
                             attempt_id=attempt["id"],
                             payload_path=Path(attempt["payload_path"]),
                             payload_sha=attempt["payload_sha256"],
-                            client=client_factory(token)))
+                            client=client))
                 except CredentialError:
                     outcomes.append({"status": "credential_required",
                                      "attempt_id": attempt["id"]})
+                except (RouteBlocked, BatchError, ValueError) as exc:
+                    outcomes.append({"status": "dispatch_blocked",
+                                     "attempt_id": attempt["id"],
+                                     "reason": (str(exc) if isinstance(exc, RouteBlocked)
+                                                else "reserved_batch_preflight_failed")})
             elif attempt["status"] == "submitting" and attempt["remote_id"] is None:
                 ledger.defer_batch_unknown(attempt["id"], delay_seconds=60,
                                            error_code="post_outcome_unknown_after_restart")

@@ -58,6 +58,7 @@ class WaveOneBudgetTests(unittest.TestCase):
         self.workflow = self.ledger.get_batch_workflow(created.job_id)
         self.assertEqual(self.ledger.reserve_source_first_plan(created.job_id,
             plan_sha256=manifest_sha, reserve_microusd=100_000).kind, "new")
+        self.workflow = self.ledger.get_batch_workflow(created.job_id)
 
     def _wave(self, *, route=None, client=None):
         return runtime._reserve_and_post_wave1(

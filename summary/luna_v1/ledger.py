@@ -9,6 +9,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Sequence
 
@@ -19,6 +20,25 @@ JOB_CAP_MICROUSD = 100_000
 MAX_DISPATCHES_PER_JOB = 6
 MAX_BATCH_ITEMS_PER_WORKFLOW = 12
 MAX_BATCH_POSTS_PER_WORKFLOW = 6
+
+
+def source_first_job_cap_microusd() -> int:
+    """Explicit summary-only cap; missing setting keeps the saved $0.10 cap.
+
+    Read before creating a new logical job. Its sealed manifest and durable
+    plan hold then preserve that job's authorized amount across restarts.
+    """
+    raw = os.environ.get("TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD")
+    if raw is None:
+        return JOB_CAP_MICROUSD
+    try:
+        amount = Decimal(raw.strip()) * Decimal(1_000_000)
+    except (InvalidOperation, AttributeError):
+        raise ValueError("invalid_source_first_job_cap") from None
+    if (not amount.is_finite() or amount != amount.to_integral_value()
+            or not 0 < amount <= WEEK_CAP_MICROUSD):
+        raise ValueError("invalid_source_first_job_cap")
+    return int(amount)
 
 
 def usd_micros(amount: float) -> int:
@@ -440,7 +460,7 @@ class Ledger:
         is an exact no-op, including after a process restart.
         """
         if (not _full_hash(plan_sha256) or type(reserve_microusd) is not int
-                or not 0 < reserve_microusd <= JOB_CAP_MICROUSD):
+                or not 0 < reserve_microusd <= WEEK_CAP_MICROUSD):
             raise ValueError("invalid source-first plan reserve")
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -466,6 +486,9 @@ class Ledger:
                     raise ValueError("different source-first plan already held")
                 self.db.execute("COMMIT")
                 return StartDecision("pending", workflow_id, "plan_reserved")
+            if reserve_microusd > source_first_job_cap_microusd():
+                self.db.execute("ROLLBACK")
+                return StartDecision("blocked", None, "source_first_cap_not_authorized")
             if self.db.execute("SELECT 1 FROM batch_attempts WHERE workflow_id=? LIMIT 1",
                                (workflow_id,)).fetchone() is not None:
                 raise ValueError("full plan must precede Batch item reservations")
@@ -555,7 +578,7 @@ class Ledger:
                     or type(item.max_output_tokens) is not int
                     or not 1 <= item.max_output_tokens <= 128_000
                     or type(item.reserve_microusd) is not int
-                    or not 0 < item.reserve_microusd <= JOB_CAP_MICROUSD):
+                    or not 0 < item.reserve_microusd <= WEEK_CAP_MICROUSD):
                 raise ValueError("invalid Batch item identity or reserve")
         total = sum(item.reserve_microusd for item in items)
         payload_path = Path(payload_path)
@@ -595,7 +618,7 @@ class Ledger:
                 self.db.execute("ROLLBACK")
                 return BatchIntentDecision("blocked", None, "workflow_not_active")
             if (workflow["plan_sha256"] != workflow["manifest_sha256"]
-                    or not 0 < workflow["planned_reserve_microusd"] <= JOB_CAP_MICROUSD):
+                    or not 0 < workflow["planned_reserve_microusd"] <= WEEK_CAP_MICROUSD):
                 self.db.execute("ROLLBACK")
                 return BatchIntentDecision("blocked", None, "workflow_plan_not_reserved")
             if stage == "writer" and (
@@ -627,7 +650,7 @@ class Ledger:
                              else row["reserved_microusd"] for row in rows
                              if row["status"] not in {"rejected_no_charge",
                                                      "cancelled_before_submit"})
-            if (total > JOB_CAP_MICROUSD
+            if (total > workflow["planned_reserve_microusd"]
                     or group_cost + total > workflow["planned_reserve_microusd"]):
                 self.db.execute("ROLLBACK")
                 return BatchIntentDecision("blocked", None, "logical_job_budget_exceeded")

@@ -6,7 +6,7 @@ from decimal import Decimal, InvalidOperation, ROUND_UP
 import os
 
 from .batch import MODEL, PROVIDER, SUBMIT_MODEL, BatchClient
-from .ledger import JOB_CAP_MICROUSD
+from .ledger import JOB_CAP_MICROUSD, WEEK_CAP_MICROUSD
 
 
 MAX_COMPLETION_TOKENS = 32_000
@@ -36,7 +36,8 @@ class Route:
     supports_explicit_cache: bool = False
 
     def reserve_microusd(self, serialized_request: bytes, *,
-                         max_completion_tokens: int | None = None) -> int:
+                         max_completion_tokens: int | None = None,
+                         authorized_job_cap_microusd: int = JOB_CAP_MICROUSD) -> int:
         # A deliberately loose source upper bound: UTF-8 bytes plus 20% for
         # transport/tokenizer overhead. No promised cache hit is subtracted.
         output_cap = self.max_completion_tokens if max_completion_tokens is None else max_completion_tokens
@@ -50,7 +51,9 @@ class Route:
                 + Decimal(output_cap) * self.completion_usd_per_token
                 + self.request_usd)
         reserve = int((cost * 1_000_000).to_integral_value(rounding=ROUND_UP))
-        if reserve < 1 or reserve > JOB_CAP_MICROUSD:
+        if (type(authorized_job_cap_microusd) is not int
+                or not 0 < authorized_job_cap_microusd <= WEEK_CAP_MICROUSD
+                or reserve < 1 or reserve > authorized_job_cap_microusd):
             raise RouteBlocked("job_budget_exceeded")
         if self.key_limit_remaining_usd is not None and cost > self.key_limit_remaining_usd:
             raise RouteBlocked("key_budget_insufficient")

@@ -12,13 +12,15 @@ from unittest.mock import patch
 
 from summary.luna_v1.batch import BatchError, Reply, build_batch_payload
 from summary.luna_v1.batch import MODEL, PROVIDER, SUBMIT_MODEL
+from summary.luna_v1.batch_stage_contracts_v1 import prompt_sha256_for_stage, schema_for_stage
 from summary.luna_v1.ledger import Ledger, batch_item_intent_for_body
 from summary.luna_v1.route import Route
 from summary.luna_v1.route import RouteBlocked
-from summary.luna_v1.source_first_core import SourceSnapshot, load_snapshot, plan_packets
+from summary.luna_v1.source_first_core import SourceSnapshot, digest, load_snapshot, plan_packets
 from summary.luna_v1.tasks import ReconciliationConflict
 from summary.luna_v1.source_first_runtime import (
-    _batch_file_once, _chat_body, _planned_capacity_hold, _post_reserved,
+    STAGE_CAPS, _batch_file_once, _chat_body, _cleanup_terminal_once,
+    _json_file_once, _planned_capacity_hold, _post_reserved,
     _extraction_payload, _poll_attempt, _recover_unknown, _writer_payload,
     poll_source_first_once, submit_source_first,
 )
@@ -68,6 +70,13 @@ class SourceFirstRuntimeTests(unittest.TestCase):
         transcript.write_text('{"utterances":[{"text":"frozen"}]}', encoding="utf-8")
         source_sha = hashlib.sha256(transcript.read_bytes()).hexdigest()
         manifest = {"source_revision": source_sha, "workspace_id": "workspace-1",
+                    "model_submit_slug": SUBMIT_MODEL,
+                    "resolved_batch_endpoint": MODEL,
+                    "provider_endpoint_tag": PROVIDER,
+                    "prompt_hashes": {stage: prompt_sha256_for_stage(stage)
+                                      for stage in STAGE_CAPS},
+                    "schema_hashes": {stage: digest(schema_for_stage(stage))
+                                      for stage in STAGE_CAPS},
                     "planned_capacity_microusd": 10_000,
                     "capacity_basis": {"offline_test": True},
                     "packets": [], "snapshot": {"transcript_path": str(transcript),
@@ -634,7 +643,8 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                 raise AssertionError("drifted source dispatched")
 
             def delete(self, batch_id):
-                return Reply(200, {"id": batch_id, "deleted": True})
+                return Reply(200, {"id": batch_id, "object": "batch",
+                                   "deletion": {"openrouter": "deleted"}})
 
         client = Client()
         base = time.time()
@@ -702,7 +712,13 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                 raise BatchError(None, "transport_unknown")
 
         client = Client()
+        route = Route(SUBMIT_MODEL, PROVIDER, "workspace-1", 1_000_000, 32_000,
+                      Decimal("0.000000001"), Decimal("0.00000001"),
+                      Decimal("0.000000001"), Decimal(0), None,
+                      batch_endpoint_model=MODEL, provider_endpoint_tag=PROVIDER)
         with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+              patch("summary.luna_v1.source_first_runtime.verify_source_first_batch_route",
+                    return_value=route),
               patch("summary.luna_v1.source_first_runtime._advance_workflow",
                     return_value={"status": "pending"})):
             outcomes = poll_source_first_once(private_root=self.root,
@@ -712,6 +728,98 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                          "submission_unknown")
         self.assertEqual(self.ledger.get_batch_attempt(extract_id)["status"], "reserved")
         self.assertTrue(any(row.get("status") == "wave1_peer_pending" for row in outcomes))
+
+    def test_reserved_resume_checks_current_route_and_key_balance_before_post(self):
+        class Credential:
+            def __init__(self, path):
+                self.path = Path(path)
+
+            def reveal_for_dispatch(self, *_):
+                return "offline-token"
+
+        class Client:
+            def __init__(self):
+                self.posts = 0
+
+            def submit_prepared(self, *_args, **_kwargs):
+                self.posts += 1
+                raise AssertionError("blocked reserved intent reached POST")
+
+        for label, route_result in (
+                ("policy_revoked", RouteBlocked("account_policy_unverified_for_workspace")),
+                ("key_exhausted", Route(SUBMIT_MODEL, PROVIDER, "workspace-1",
+                    1_000_000, 32_000, Decimal("0.000000001"),
+                    Decimal("0.00000001"), Decimal("0.000000001"),
+                    Decimal(0), Decimal(0), batch_endpoint_model=MODEL,
+                    provider_endpoint_tag=PROVIDER))):
+            workflow, _ = self._source_workflow(label)
+            writer_id, _ = self._reserve_stage(workflow, "writer")
+            extract_id, _ = self._reserve_stage(workflow, "extract")
+            client = Client()
+            verification = (patch("summary.luna_v1.source_first_runtime."
+                                  "verify_source_first_batch_route",
+                                  side_effect=route_result)
+                            if isinstance(route_result, Exception) else
+                            patch("summary.luna_v1.source_first_runtime."
+                                  "verify_source_first_batch_route",
+                                  return_value=route_result))
+            with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+                  verification,
+                  patch("summary.luna_v1.source_first_runtime._advance_workflow",
+                        return_value={"status": "pending"})):
+                outcomes = poll_source_first_once(private_root=self.root,
+                    client_factory=lambda token: client)
+            self.assertEqual(client.posts, 0, label)
+            self.assertEqual(self.ledger.get_batch_attempt(writer_id)["status"],
+                             "reserved", label)
+            self.assertEqual(self.ledger.get_batch_attempt(extract_id)["status"],
+                             "reserved", label)
+            self.assertTrue(any(row.get("status") == "dispatch_blocked"
+                                for row in outcomes), label)
+
+    def test_cleanup_requires_matching_gateway_deletion_receipt(self):
+        terminal = self.root / "terminal-for-cleanup.json"
+        sealed_sha = _json_file_once(terminal, {"id": "batch_cleanup123",
+                                                "status": "completed"})
+        attempt = {"id": "attempt-cleanup", "status": "completed",
+                   "remote_id": "batch_cleanup123", "terminal_path": str(terminal),
+                   "terminal_sha256": sealed_sha, "credential_id": "key-1",
+                   "credential_version": 1}
+        receipt = (self.root / "source_first" / self.workflow["semantic_key"] /
+                   "cleanup" / "attempt-cleanup.json")
+
+        class Credential:
+            def __init__(self, *_):
+                pass
+
+            def reveal_for_existing_job(self, *_):
+                return "offline-token"
+
+        replies = [Reply(200, {"id": "batch_other", "deletion": {"openrouter": "deleted"}}),
+                   Reply(200, {"id": "batch_cleanup123",
+                               "deletion": {"openrouter": "pending"}}),
+                   Reply(200, {"id": "batch_cleanup123", "object": "batch",
+                               "deletion": {"openrouter": "deleted"}})]
+
+        class Client:
+            def delete(self, batch_id):
+                if batch_id != "batch_cleanup123":
+                    raise AssertionError("wrong cleanup Batch ID")
+                return replies.pop(0)
+
+        with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
+            for _ in range(2):
+                outcome = _cleanup_terminal_once(ledger=self.ledger, attempt=attempt,
+                    workflow=self.workflow, private_root=self.root,
+                    client_factory=lambda token: Client())
+                self.assertEqual(outcome["status"], "gateway_cleanup_pending")
+                self.assertFalse(receipt.exists())
+            outcome = _cleanup_terminal_once(ledger=self.ledger, attempt=attempt,
+                workflow=self.workflow, private_root=self.root,
+                client_factory=lambda token: Client())
+        self.assertEqual(outcome["status"], "gateway_cleanup_recorded")
+        self.assertTrue(receipt.exists())
+        self.assertFalse(replies)
 
     def _offline_replay(self, incomplete_inventory: bool = False,
                         uncertain_inventory: bool = False,
@@ -885,7 +993,8 @@ class SourceFirstRuntimeTests(unittest.TestCase):
 
             def delete(self, batch_id):
                 self.deletes.append(batch_id)
-                return Reply(200, {"id": batch_id, "deleted": True})
+                return Reply(200, {"id": batch_id, "object": "batch",
+                                   "deletion": {"openrouter": "deleted"}})
 
         client = Client()
         with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
