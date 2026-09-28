@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import time
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -95,7 +96,8 @@ from summary.opus_v1.batch import (BatchClient as OpusBatchClient,
                                     valid_batch_id as valid_opus_batch_id)
 from summary.opus_v1.route import (RouteBlocked as OpusRouteBlocked,
                                     verify_batch_route as verify_opus_batch_route)
-from .ledger import (DIAGNOSTIC_KINDS, JOB_CAP_MICROUSD, MAX_DISPATCHES_PER_JOB, WEEK_CAP_MICROUSD, Ledger,
+from .ledger import (DIAGNOSTIC_KINDS, JOB_CAP_MICROUSD, MAX_DISPATCHES_PER_JOB,
+                     OPUS_V3_TRIAL_WEEK_CAP_MICROUSD, WEEK_CAP_MICROUSD, Ledger,
                      usd_micros, write_private_json)
 from .publication import _verify_staged_target, publish_document
 from .route import MAX_COMPLETION_TOKENS, RouteBlocked, verify_batch_route
@@ -500,6 +502,52 @@ def _semantic_identity(source_sha256: str, source_text: str, workspace_scope: st
     return _sha(_json_bytes(material))
 
 
+def authorize_isolated_opus_v3_weekly_cap(*, transcript_path: Path,
+                                          output_dir: Path, private_root: Path,
+                                          force_nonce: str,
+                                          authorization_ref: str) -> dict:
+    """Register one administrator-authorized $2 run before its first POST.
+
+    This deliberately has no HTTP endpoint or user-configurable amount. The
+    normal ``submit`` entry point recomputes the semantic identity and the
+    ledger binds the exception only if source, output, policy and nonce match.
+    The method reads credential metadata, never reveals an API key or sends a
+    request. Call ``submit`` with the same ``force_nonce`` and Opus v3 policy.
+    """
+    if (not isinstance(force_nonce, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", force_nonce) is None):
+        raise ValueError("isolated weekly authorization requires a run nonce")
+    private_root = Path(private_root)
+    output_dir = Path(output_dir)
+    source_text, _source_index, source_sha = load_source(Path(transcript_path))
+    store = _credential_store(private_root)
+    writer_candidates = store.dispatch_candidates(role="writer")
+    judge_candidates = store.dispatch_candidates(role="judge")
+    if not writer_candidates or not judge_candidates:
+        raise ValueError("isolated weekly authorization requires configured writer and judge")
+    writer = writer_candidates[0]
+    scope = (writer.get("workspace_id") or
+             "unverified-key-version:" + writer["id"] + ":" + str(writer["version"]))
+    judge_scope = judge_candidates[0].get("workspace_id") or "judge-unavailable"
+    policy = OPUS_PARTITIONED_QUALITY_POLICY_VERSION
+    semantic_key = _semantic_identity(
+        source_sha, source_text, scope, _sha(PROMPT_PATH.read_bytes()),
+        _sha(_json_bytes(SCHEMA)), force_nonce, judge_scope, policy)
+    ledger = Ledger(private_root)
+    try:
+        created = ledger.authorize_weekly_cap_for_run(
+            semantic_key=semantic_key, source_sha256=source_sha,
+            output_dir=output_dir, quality_policy_version=policy,
+            authorization_ref=authorization_ref)
+    finally:
+        ledger.close()
+    return {"created": created, "semantic_key": semantic_key,
+            "source_sha256": source_sha, "output_dir": str(output_dir),
+            "quality_policy_version": policy,
+            "weekly_cap_microusd": OPUS_V3_TRIAL_WEEK_CAP_MICROUSD,
+            "authorization_ref": authorization_ref}
+
+
 def _credential_store(private_root: Path) -> CredentialStore:
     return CredentialStore(Path(private_root) / "credentials.sqlite3")
 
@@ -667,10 +715,12 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             credential_id=selected["id"], credential_version=selected["version"],
             workspace_id=selected.get("workspace_id"), max_cost_microusd=reserve_micros,
             dynamic_group_authorization_ref=dynamic_budget_authorization_ref,
+            quality_policy_version=policy,
         )
         if decision.kind != "new":
             return {"status": decision.kind, "reason": decision.reason, "job_id": decision.job_id}
         job = ledger.get(decision.job_id)
+        weekly_authorization = ledger.weekly_authorization_for_root(job["id"])
         artifacts = Path(job["artifact_dir"])
         write_private_json(artifacts / "manifest.json", {
             "job_id": job["id"], "semantic_key": semantic_key,
@@ -685,6 +735,9 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             "prompt_sha256": prompt_sha, "schema_sha256": schema_sha,
             "quality_policy_version": policy,
             "dynamic_budget_authorization_ref": dynamic_budget_authorization_ref,
+            **({"weekly_budget_authorization_ref": weekly_authorization["authorization_ref"],
+                "weekly_cap_microusd": weekly_authorization["cap_microusd"]}
+               if weekly_authorization is not None else {}),
             "judge_workspace_id": judge_scope,
             **quality_metadata,
             "request_sha256": _sha(serialized_request),

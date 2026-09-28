@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 from summary.luna_v1.engine import (
     OPUS_PARTITIONED_QUALITY_POLICY_VERSION,
-    OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2, poll_once, submit,
+    OPUS_PARTITIONED_QUALITY_POLICY_VERSION_V2,
+    authorize_isolated_opus_v3_weekly_cap, poll_once, submit,
 )
 from summary.luna_v1.ledger import Ledger
 from summary.luna_v1.source import load_source
@@ -150,6 +151,49 @@ class OpusPartitionedEngineTests(unittest.TestCase):
         pointer = json.loads((output / "summary_current.json").read_text(encoding="utf-8"))
         path = output / "summary_generations" / pointer["generation_id"]
         return path, json.loads((path / "run_manifest.json").read_text(encoding="utf-8"))
+
+    def test_privileged_weekly_authorization_binds_exact_production_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, private = Path(directory) / "meeting", Path(directory) / "private"
+            _source(output)
+            nonce = "opus-v3-isolated-20260928-001"
+            with patch("summary.luna_v1.engine._credential_store", return_value=_SavedKeys()):
+                receipt = authorize_isolated_opus_v3_weekly_cap(
+                    transcript_path=output / "transcript.json", output_dir=output,
+                    private_root=private, force_nonce=nonce,
+                    authorization_ref="user-20260928-opus-v3-isolated-2usd")
+                self.assertTrue(receipt["created"])
+                self.assertEqual(receipt["weekly_cap_microusd"], 2_000_000)
+                self.assertFalse(authorize_isolated_opus_v3_weekly_cap(
+                    transcript_path=output / "transcript.json", output_dir=output,
+                    private_root=private, force_nonce=nonce,
+                    authorization_ref="user-20260928-opus-v3-isolated-2usd")["created"])
+                writer_route = SimpleNamespace(
+                    reserve_microusd=lambda payload, **kwargs: 20_000,
+                    workspace_id="writer-workspace",
+                    prompt_usd_per_token="0.00000005",
+                    completion_usd_per_token="0.00000025",
+                    cache_write_usd_per_token="0.0000000625", request_usd="0")
+                with patch("summary.luna_v1.engine.verify_batch_route",
+                           return_value=writer_route):
+                    started = submit(transcript_path=output / "transcript.json",
+                        output_dir=output, private_root=private, force_nonce=nonce,
+                        client_factory=WriterClient,
+                        quality_policy_version=OPUS_PARTITIONED_QUALITY_POLICY_VERSION)
+            self.assertEqual(started["status"], "submitted")
+            ledger = Ledger(private)
+            root = ledger.get(started["job_id"])
+            self.assertEqual(root["semantic_key"], receipt["semantic_key"])
+            self.assertEqual(ledger.weekly_cap_microusd(root["billing_group_id"]),
+                             2_000_000)
+            manifest = json.loads((Path(root["artifact_dir"]) / "manifest.json").read_text())
+            self.assertEqual(manifest["weekly_budget_authorization_ref"],
+                             receipt["authorization_ref"])
+            self.assertEqual(manifest["weekly_cap_microusd"], 2_000_000)
+            self.assertEqual(ledger.db.execute("""SELECT authorization_ref
+                FROM weekly_spending_authorizations WHERE root_job_id=?""",
+                (root["id"],)).fetchone()[0], receipt["authorization_ref"])
+            ledger.close()
 
     def test_three_scoped_batches_read_same_full_draft_and_reuse_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -506,6 +506,125 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(limit.reason, "logical_job_dispatch_limit")
             ledger.close()
 
+    def test_isolated_opus_v3_weekly_authorization_counts_old_costs_and_excludes_other_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            common = dict(source_sha256="b" * 64, credential_id="key-1",
+                          credential_version=1, workspace_id="workspace-1")
+            # These nine unrelated, already billed jobs retain their full cost
+            # in the one shared rolling-week sum.
+            for number in range(9):
+                old = ledger.reserve(semantic_key=f"{number + 10:064x}",
+                    output_dir=root / f"old-{number}", max_cost_microusd=100_000,
+                    **common)
+                self.assertEqual(old.kind, "new")
+                ledger.db.execute("UPDATE jobs SET status='failed_validation', "
+                                  "billed_microusd=100000 WHERE id=?", (old.job_id,))
+
+            key = "a" * 64
+            authorization = dict(semantic_key=key, source_sha256=common["source_sha256"],
+                output_dir=root / "isolated", quality_policy_version=
+                "claude_opus_5_5_partitioned_audit_v3",
+                authorization_ref="user-20260928-opus-v3-isolated-2usd")
+            with self.assertRaisesRegex(ValueError, "isolated weekly authorization"):
+                ledger.authorize_weekly_cap_for_run(**{**authorization,
+                    "quality_policy_version": "claude_opus_5_5_partitioned_audit_v2"})
+            self.assertTrue(ledger.authorize_weekly_cap_for_run(**authorization))
+            self.assertFalse(ledger.authorize_weekly_cap_for_run(**authorization))
+            with self.assertRaisesRegex(ValueError, "already assigned"):
+                ledger.authorize_weekly_cap_for_run(**{**authorization,
+                    "semantic_key": "c" * 64})
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                ledger.reserve(semantic_key=key, output_dir=root / "wrong-output",
+                    max_cost_microusd=50_000,
+                    quality_policy_version=authorization["quality_policy_version"],
+                    **common)
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                ledger.reserve(semantic_key=key, output_dir=root / "isolated",
+                    max_cost_microusd=50_000,
+                    quality_policy_version=authorization["quality_policy_version"],
+                    **{**common, "source_sha256": "d" * 64})
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                ledger.reserve(semantic_key=key, output_dir=root / "isolated",
+                    max_cost_microusd=50_000,
+                    quality_policy_version="claude_opus_5_5_partitioned_audit_v2",
+                    **common)
+            writer = ledger.reserve(semantic_key=key,
+                output_dir=root / "isolated", max_cost_microusd=50_000,
+                quality_policy_version=authorization["quality_policy_version"], **common)
+            self.assertEqual(writer.kind, "new")
+            self.assertEqual(ledger.weekly_cap_microusd(writer.job_id), 2_000_000)
+            (Path(ledger.get(writer.job_id)["artifact_dir"]) / "manifest.json").write_text(
+                json.dumps({"quality_provider": "openrouter_claude_opus",
+                    "quality_policy_version": authorization["quality_policy_version"]}),
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "output changed"):
+                ledger.reserve(semantic_key="1" * 64,
+                    output_dir=root / "wrong-output", max_cost_microusd=200_000,
+                    kind="segment_1", root_job_id=writer.job_id, **common)
+            with self.assertRaisesRegex(ValueError, "invalid quality root"):
+                ledger.reserve(semantic_key="1" * 64,
+                    output_dir=root / "isolated", max_cost_microusd=200_000,
+                    kind="segment_1", root_job_id=writer.job_id,
+                    **{**common, "source_sha256": "d" * 64})
+            self.assertEqual(ledger.reserve(semantic_key="e" * 64,
+                output_dir=root / "ordinary", max_cost_microusd=60_000,
+                quality_policy_version=authorization["quality_policy_version"],
+                **common).reason, "weekly_budget_exceeded")
+            competing_worker = Ledger(root)
+            self.assertEqual(competing_worker.reserve(semantic_key="f" * 64,
+                output_dir=root / "ordinary", max_cost_microusd=60_000,
+                **common).reason, "weekly_budget_exceeded")
+            competing_worker.close()
+            stage = ledger.reserve(semantic_key="1" * 64,
+                output_dir=root / "isolated", max_cost_microusd=200_000,
+                kind="segment_1", root_job_id=writer.job_id, **common)
+            self.assertEqual(stage.kind, "new")  # $0.90 old + $0.05 writer + $0.20 stage
+            self.assertEqual(ledger.get(stage.job_id)["billing_group_id"], writer.job_id)
+            self.assertEqual(ledger.db.execute("""SELECT SUM(COALESCE(billed_microusd,
+                reserved_microusd)) FROM jobs""").fetchone()[0], 1_150_000)
+            ledger.close()
+
+            restarted = Ledger(root)
+            self.assertEqual(restarted.weekly_cap_microusd(writer.job_id), 2_000_000)
+            second = restarted.reserve(semantic_key="2" * 64,
+                output_dir=root / "isolated", max_cost_microusd=200_000,
+                kind="segment_2", root_job_id=writer.job_id, **common)
+            self.assertEqual(second.kind, "new")
+            self.assertEqual(restarted.reserve(semantic_key="3" * 64,
+                output_dir=root / "ordinary", max_cost_microusd=1_000,
+                **common).reason, "weekly_budget_exceeded")
+            # A later authoritative charge can exceed its reservation. The
+            # next reservation still sees it and stops at the $2 ceiling.
+            restarted.db.execute("UPDATE jobs SET billed_microusd=850000 WHERE semantic_key=?",
+                                 (f"{10:064x}",))
+            self.assertEqual(restarted.reserve(semantic_key="4" * 64,
+                output_dir=root / "isolated", max_cost_microusd=1_000,
+                kind="segment_3", root_job_id=writer.job_id,
+                **common).reason, "weekly_budget_exceeded")
+            restarted.close()
+
+    def test_isolated_weekly_authorization_cannot_be_injected_into_regular_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = Ledger(root)
+            base = dict(source_sha256="b" * 64, output_dir=root / "meeting",
+                        credential_id="key-1", credential_version=1,
+                        workspace_id="workspace-1")
+            for number in range(10):
+                self.assertEqual(ledger.reserve(semantic_key=f"{number:064x}",
+                    max_cost_microusd=100_000, **{**base,
+                        "output_dir": root / f"other-{number}"}).kind, "new")
+            self.assertEqual(ledger.reserve(semantic_key="a" * 64,
+                max_cost_microusd=1_000,
+                quality_policy_version="claude_opus_5_5_partitioned_audit_v3",
+                **base).reason, "weekly_budget_exceeded")
+            with self.assertRaises(TypeError):
+                ledger.reserve(semantic_key="b" * 64, max_cost_microusd=1_000,
+                               weekly_cap_microusd=2_000_000, **base)
+            ledger.close()
+
     def test_existing_rows_migrate_into_same_billing_group(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

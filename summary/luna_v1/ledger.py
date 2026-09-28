@@ -14,6 +14,11 @@ from pathlib import Path
 
 WEEK_SECONDS = 7 * 24 * 60 * 60
 WEEK_CAP_MICROUSD = 1_000_000
+# A single explicitly registered Opus v3 run may use the user's $2 rolling
+# weekly ceiling. All jobs, including earlier ones, still contribute to the
+# same rolling sum; unrelated runs keep WEEK_CAP_MICROUSD.
+OPUS_V3_TRIAL_WEEK_CAP_MICROUSD = 2_000_000
+OPUS_V3_TRIAL_POLICY = "claude_opus_5_5_partitioned_audit_v3"
 JOB_CAP_MICROUSD = 100_000
 # Opus Batch must reserve the entire full-source input and hidden thinking
 # allowance. The user's dynamic-budget decision applies only to this new
@@ -122,6 +127,16 @@ class Ledger:
             authorization_ref TEXT NOT NULL,
             authorized_at REAL NOT NULL
           );
+          CREATE TABLE IF NOT EXISTS weekly_spending_authorizations (
+            semantic_key TEXT PRIMARY KEY,
+            source_sha256 TEXT NOT NULL,
+            output_dir TEXT NOT NULL,
+            quality_policy_version TEXT NOT NULL,
+            authorization_ref TEXT NOT NULL,
+            cap_microusd INTEGER NOT NULL,
+            authorized_at REAL NOT NULL,
+            root_job_id TEXT UNIQUE
+          );
           CREATE INDEX IF NOT EXISTS jobs_by_created ON jobs(created_at);
           CREATE INDEX IF NOT EXISTS jobs_by_credential ON jobs(credential_id,status);
         """)
@@ -227,13 +242,83 @@ class Ledger:
             WHERE billing_group_id=?""", (billing_group_id,)).fetchone()
         return None if row is not None and row["policy_version"] == "rolling_week_dynamic_v1" else JOB_CAP_MICROUSD
 
+    def authorize_weekly_cap_for_run(self, *, semantic_key: str,
+                                     source_sha256: str, output_dir: Path,
+                                     quality_policy_version: str,
+                                     authorization_ref: str) -> bool:
+        """Pin the user's $2 decision to one *future* isolated Opus v3 run.
+
+        This is an administrator-side operation on the private ledger, never a
+        request or UI field. It does not alter the shared weekly sum, other
+        runs' $1 ceiling, stage limits, or the six-dispatch limit. The exact
+        semantic/source/output/policy identity is checked again atomically
+        when the writer reserves its first physical request.
+        """
+        if (not isinstance(semantic_key, str)
+                or re.fullmatch(r"[a-f0-9]{64}", semantic_key) is None
+                or not isinstance(source_sha256, str)
+                or re.fullmatch(r"[a-f0-9]{64}", source_sha256) is None
+                or quality_policy_version != OPUS_V3_TRIAL_POLICY
+                or not isinstance(authorization_ref, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,159}",
+                                authorization_ref) is None):
+            raise ValueError("invalid isolated weekly authorization")
+        output_dir = str(Path(output_dir))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.db.execute(
+                "SELECT * FROM weekly_spending_authorizations WHERE semantic_key=?",
+                (semantic_key,)).fetchone()
+            if existing is not None:
+                if (existing["source_sha256"] != source_sha256
+                        or existing["output_dir"] != output_dir
+                        or existing["quality_policy_version"] != quality_policy_version
+                        or existing["authorization_ref"] != authorization_ref
+                        or existing["cap_microusd"] != OPUS_V3_TRIAL_WEEK_CAP_MICROUSD):
+                    raise ValueError("different isolated weekly authorization already recorded")
+                self.db.execute("COMMIT")
+                return False
+            if self.db.execute("SELECT 1 FROM weekly_spending_authorizations LIMIT 1").fetchone():
+                raise ValueError("isolated weekly authorization already assigned to another run")
+            if self.db.execute("SELECT 1 FROM jobs WHERE semantic_key=?",
+                               (semantic_key,)).fetchone() is not None:
+                raise ValueError("isolated weekly authorization requires a future run")
+            self.db.execute("""INSERT INTO weekly_spending_authorizations
+                (semantic_key,source_sha256,output_dir,quality_policy_version,
+                 authorization_ref,cap_microusd,authorized_at,root_job_id)
+                VALUES (?,?,?,?,?,?,?,NULL)""",
+                (semantic_key, source_sha256, output_dir, quality_policy_version,
+                 authorization_ref, OPUS_V3_TRIAL_WEEK_CAP_MICROUSD, time.time()))
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    def weekly_cap_microusd(self, billing_group_id: str) -> int:
+        """Return the ceiling allowed for this group, never its own balance."""
+        row = self.db.execute("""SELECT cap_microusd FROM weekly_spending_authorizations
+            WHERE root_job_id=? AND quality_policy_version=?""",
+            (billing_group_id, OPUS_V3_TRIAL_POLICY)).fetchone()
+        return (row["cap_microusd"] if row is not None
+                and row["cap_microusd"] == OPUS_V3_TRIAL_WEEK_CAP_MICROUSD
+                else WEEK_CAP_MICROUSD)
+
+    def weekly_authorization_for_root(self, root_job_id: str) -> dict | None:
+        row = self.db.execute("""SELECT authorization_ref,cap_microusd,
+            quality_policy_version FROM weekly_spending_authorizations
+            WHERE root_job_id=?""", (root_job_id,)).fetchone()
+        return dict(row) if row is not None else None
+
     def reserve(self, *, semantic_key: str, source_sha256: str, output_dir: Path,
                 credential_id: str, credential_version: int, workspace_id: str | None,
                 max_cost_microusd: int, kind: str = "summary",
                 root_job_id: str | None = None,
                 continuation_of_job_id: str | None = None,
                 continuation_mode: str = "failed_writer",
-                dynamic_group_authorization_ref: str | None = None) -> StartDecision:
+                dynamic_group_authorization_ref: str | None = None,
+                quality_policy_version: str | None = None) -> StartDecision:
         is_continuation = continuation_of_job_id is not None
         if (continuation_mode not in {"failed_writer", "accepted_inventory_unavailable"}
                 or (continuation_mode != "failed_writer" and not is_continuation)):
@@ -253,6 +338,8 @@ class Ledger:
                     or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,159}",
                                     dynamic_group_authorization_ref) is None):
                 raise ValueError("dynamic group authorization requires a new summary root")
+        if quality_policy_version is not None and (kind != "summary" or is_continuation):
+            raise ValueError("quality policy identity belongs to a new summary root")
         if len(semantic_key) != 64 or len(source_sha256) != 64:
             raise ValueError("invalid semantic identity")
         now = time.time()
@@ -319,6 +406,10 @@ class Ledger:
                 if (root is None or root["kind"] != "summary"
                         or root["source_sha256"] != source_sha256):
                     raise ValueError("invalid quality root or workspace")
+                if (self.weekly_cap_microusd(root["billing_group_id"])
+                        == OPUS_V3_TRIAL_WEEK_CAP_MICROUSD
+                        and root["output_dir"] != str(output_dir)):
+                    raise ValueError("isolated weekly authorization output changed")
                 if root["writer_parent_id"] is not None and root["status"] != "quality_pending":
                     self.db.execute("ROLLBACK")
                     return StartDecision("blocked", None, "continuation_not_ready")
@@ -362,6 +453,16 @@ class Ledger:
                             or credential_id == root["credential_id"]):
                         raise ValueError("invalid quality root or workspace")
                 billing_group_id = root["billing_group_id"]
+            isolated_weekly = None
+            if not is_continuation and root_job_id is None:
+                isolated_weekly = self.db.execute("""SELECT * FROM weekly_spending_authorizations
+                    WHERE semantic_key=?""", (semantic_key,)).fetchone()
+                if isolated_weekly is not None and (
+                        isolated_weekly["source_sha256"] != source_sha256
+                        or isolated_weekly["output_dir"] != str(output_dir)
+                        or isolated_weekly["quality_policy_version"] != quality_policy_version
+                        or isolated_weekly["root_job_id"] is not None):
+                    raise ValueError("isolated weekly authorization identity changed")
             if is_continuation or root_job_id is not None:
                 group_cost = self.db.execute("""SELECT COALESCE(SUM(
                     CASE WHEN billed_microusd IS NULL THEN reserved_microusd ELSE billed_microusd END),0)
@@ -385,7 +486,12 @@ class Ledger:
                 "FROM jobs WHERE created_at>=? AND status NOT IN ('rejected_before_submit', 'cancelled_before_submit')",
                 (now - WEEK_SECONDS,),
             ).fetchone()[0]
-            if spent + max_cost_microusd > WEEK_CAP_MICROUSD:
+            weekly_cap = (OPUS_V3_TRIAL_WEEK_CAP_MICROUSD if isolated_weekly is not None
+                          else self.weekly_cap_microusd(billing_group_id)
+                          if (root_job_id is not None and opus_policy
+                              and opus_version == OPUS_V3_TRIAL_POLICY)
+                          else WEEK_CAP_MICROUSD)
+            if spent + max_cost_microusd > weekly_cap:
                 self.db.execute("ROLLBACK")
                 return StartDecision("blocked", None, "weekly_budget_exceeded")
             job_id = uuid.uuid4().hex
@@ -412,6 +518,12 @@ class Ledger:
                     VALUES (?,?,?,?,?)""",
                     (job_id, job_id, "rolling_week_dynamic_v1",
                      dynamic_group_authorization_ref, now))
+            if isolated_weekly is not None:
+                changed = self.db.execute("""UPDATE weekly_spending_authorizations
+                    SET root_job_id=? WHERE semantic_key=? AND root_job_id IS NULL""",
+                    (job_id, semantic_key))
+                if changed.rowcount != 1:
+                    raise ValueError("isolated weekly authorization already bound")
             if kind == "summary":
                 self.db.execute("INSERT INTO consumers (semantic_key,output_dir,updated_at) VALUES (?,?,?)",
                                 (semantic_key, str(output_dir), now))
