@@ -713,6 +713,51 @@ def _recover_unknown(*, ledger: Ledger, attempt: dict, client: BatchClient,
     return {"attempt_id": attempt["id"], "status": "submission_unknown", "reason": reason}
 
 
+def _terminal_route_attestation(client: BatchClient, intent: dict,
+                                remote: dict) -> dict | None:
+    """Resolve a Batch submit alias only through this route's exact catalog ID.
+
+    The gateway may report its canonical dated model in a terminal envelope
+    even though the sealed POST used the public submit alias. A family-prefix
+    comparison would also accept a different model, so require the catalog's
+    explicit canonical_slug and its single pinned OpenAI Batch endpoint.
+    """
+    if (intent.get("model") != SUBMIT_MODEL
+            or intent.get("endpoint") != "/v1/chat/completions"
+            or intent.get("provider") != {"only": [PROVIDER]}
+            or remote.get("endpoint") != intent["endpoint"]):
+        return None
+    remote_model = remote.get("model")
+    if remote_model == SUBMIT_MODEL:
+        return {"resolution": "submitted_alias", "submitted_model": SUBMIT_MODEL,
+                "reported_model": remote_model, "endpoint": intent["endpoint"],
+                "provider_only": PROVIDER}
+    if not isinstance(remote_model, str) or not remote_model:
+        return None
+    try:
+        details = client.model_details().body.get("data")
+        endpoint_data = client.model_endpoints().body.get("data")
+    except (AttributeError, BatchError, TypeError, ValueError):
+        return None
+    if (not isinstance(details, dict) or details.get("id") != MODEL
+            or details.get("canonical_slug") != remote_model
+            or not isinstance(endpoint_data, dict)
+            or endpoint_data.get("id") != MODEL
+            or not isinstance(endpoint_data.get("endpoints"), list)):
+        return None
+    eligible = [entry for entry in endpoint_data["endpoints"]
+                if isinstance(entry, dict) and entry.get("tag") == PROVIDER
+                and entry.get("provider_name") == "OpenAI"
+                and entry.get("model_id") == MODEL]
+    if len(eligible) != 1:
+        return None
+    return {"resolution": "catalog_canonical_slug", "catalog_model_id": MODEL,
+            "catalog_canonical_slug": remote_model,
+            "submitted_model": SUBMIT_MODEL, "reported_model": remote_model,
+            "endpoint": intent["endpoint"], "provider_only": PROVIDER,
+            "catalog_provider_name": "OpenAI"}
+
+
 def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
                   private_root: Path, client_factory) -> dict:
     owner = "source-first-" + uuid.uuid4().hex
@@ -735,14 +780,17 @@ def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
         if status not in TERMINAL:
             raise ValueError("unknown_batch_status")
         intent = _read_sealed(Path(attempt["payload_path"]), attempt["payload_sha256"])
-        if (intent.get("model") != SUBMIT_MODEL
-                or intent.get("endpoint") != "/v1/chat/completions"
-                or remote.get("model") != intent["model"]
-                or remote.get("endpoint") != intent["endpoint"]):
+        attestation = _terminal_route_attestation(client, intent, remote)
+        if attestation is None:
             ledger.defer_batch_poll(attempt["id"], owner, delay_seconds=300,
                                     error_code="terminal_route_identity_unverified")
             return {"attempt_id": attempt["id"], "status": "poll_deferred",
                     "reason": "terminal_route_identity_unverified"}
+        attestation_path = (private_root / "source_first" / workflow["semantic_key"] /
+                            "route_attestations" / (attempt["id"] + ".json"))
+        _json_file_once(attestation_path, {
+            "attempt_id": attempt["id"], "remote_batch_id": attempt["remote_id"],
+            **attestation})
         parsed = parse_batch_items(remote, _expected_ids(ledger, attempt),
                                    expected_batch_id=attempt["remote_id"])
         reported_counts = remote.get("request_counts")
@@ -784,7 +832,7 @@ def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
         ledger.defer_batch_poll(attempt["id"], owner, delay_seconds=600,
                                 error_code="credential_required", credential_required=True)
         return {"attempt_id": attempt["id"], "status": "credential_required"}
-    except (BatchError, ValueError) as exc:
+    except (BatchError, ValueError, OSError):
         ledger.defer_batch_poll(attempt["id"], owner, delay_seconds=300,
                                 error_code="batch_get_or_parse_failed")
         return {"attempt_id": attempt["id"], "status": "poll_deferred"}

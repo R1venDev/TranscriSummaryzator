@@ -621,6 +621,119 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                     client_factory=lambda token: GoodClient())
         self.assertEqual(result["status"], "failed")
 
+    def test_terminal_accepts_only_exact_catalog_canonical_model(self):
+        attempt_id, _, digest, custom_id = self._reserved()
+        self.ledger.mark_batch_submitting(attempt_id, digest)
+        self.ledger.record_batch_submission(attempt_id, remote_id="batch_canonical123")
+        canonical = "openai/gpt-6-luna-20260922"
+
+        class Credential:
+            def __init__(self, *_):
+                pass
+
+            def reveal_for_existing_job(self, *_):
+                return "offline-token"
+
+        def client(*, remote_model=canonical, canonical_slug=canonical,
+                   details_id=MODEL, endpoint_tag=PROVIDER,
+                   endpoint="/v1/chat/completions", batch_id="batch_canonical123"):
+            class Client:
+                def get(self, _batch_id):
+                    return Reply(200, {"id": batch_id, "status": "completed",
+                        "model": remote_model, "endpoint": endpoint,
+                        "request_counts": {"total": 1},
+                        "results": [{"custom_id": custom_id,
+                            "response": {"status_code": 200, "body": {
+                                "choices": [{"finish_reason": "stop", "message": {
+                                    "role": "assistant", "content": "{}"}}],
+                                "usage": {"prompt_tokens": 20,
+                                          "completion_tokens": 5}}}}]})
+
+                def model_details(self):
+                    data = {"id": details_id}
+                    if canonical_slug is not None:
+                        data["canonical_slug"] = canonical_slug
+                    return Reply(200, {"data": data})
+
+                def model_endpoints(self):
+                    return Reply(200, {"data": {"id": MODEL, "endpoints": [
+                        {"tag": endpoint_tag, "provider_name": "OpenAI",
+                         "model_id": MODEL}]}})
+
+            return Client()
+
+        # A family prefix is not an identity: only the catalog's exact
+        # canonical_slug may explain a difference from the sealed submit alias.
+        rejected = [
+            dict(canonical_slug=None),
+            dict(canonical_slug="openai/gpt-6-luna-other"),
+            dict(remote_model=canonical + "-other"),
+            dict(details_id="other/model"),
+            dict(endpoint_tag="other"),
+            dict(endpoint="/wrong"),
+        ]
+        base = time.time()
+        attestation_path = (self.root / "source_first" /
+            self.workflow["semantic_key"] / "route_attestations" /
+            (attempt_id + ".json"))
+        with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
+            for number, options in enumerate(rejected):
+                with patch("summary.luna_v1.ledger.time.time",
+                           return_value=base + 121 + number * 301):
+                    result = _poll_attempt(ledger=self.ledger,
+                        attempt=self.ledger.get_batch_attempt(attempt_id),
+                        workflow=self.workflow, private_root=self.root,
+                        client_factory=lambda token, options=options: client(**options))
+                self.assertEqual(result["reason"], "terminal_route_identity_unverified")
+                self.assertIsNone(self.ledger.get_batch_attempt(attempt_id)["terminal_path"])
+                self.assertEqual(self.ledger.batch_items(attempt_id)[0]["status"], "pending")
+                self.assertFalse(attestation_path.exists())
+
+            with patch("summary.luna_v1.ledger.time.time",
+                       return_value=base + 121 + len(rejected) * 301):
+                result = _poll_attempt(ledger=self.ledger,
+                    attempt=self.ledger.get_batch_attempt(attempt_id),
+                    workflow=self.workflow, private_root=self.root,
+                    client_factory=lambda token: client())
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["item_statuses"], {custom_id: "completed"})
+        self.assertIsNotNone(self.ledger.get_batch_attempt(attempt_id)["terminal_path"])
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        self.assertEqual(attestation["remote_batch_id"], "batch_canonical123")
+        self.assertEqual(attestation["resolution"], "catalog_canonical_slug")
+        self.assertEqual(attestation["catalog_model_id"], MODEL)
+        self.assertEqual(attestation["catalog_canonical_slug"], canonical)
+
+    def test_terminal_canonical_model_still_requires_remote_batch_id(self):
+        attempt_id, _, digest, _ = self._reserved()
+        self.ledger.mark_batch_submitting(attempt_id, digest)
+        self.ledger.record_batch_submission(attempt_id, remote_id="batch_expected123")
+
+        class Credential:
+            def __init__(self, *_):
+                pass
+
+            def reveal_for_existing_job(self, *_):
+                return "offline-token"
+
+        class Client:
+            def get(self, _batch_id):
+                return Reply(200, {"id": "batch_foreign123", "status": "completed",
+                    "model": "openai/gpt-6-luna-20260922",
+                    "endpoint": "/v1/chat/completions", "results": []})
+
+        with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+              patch("summary.luna_v1.ledger.time.time", return_value=time.time() + 121)):
+            result = _poll_attempt(ledger=self.ledger,
+                attempt=self.ledger.get_batch_attempt(attempt_id),
+                workflow=self.workflow, private_root=self.root,
+                client_factory=lambda token: Client())
+        self.assertEqual(result["status"], "poll_deferred")
+        self.assertIsNone(self.ledger.get_batch_attempt(attempt_id)["terminal_path"])
+        self.assertFalse((self.root / "source_first" /
+            self.workflow["semantic_key"] / "route_attestations" /
+            (attempt_id + ".json")).exists())
+
     def test_needs_review_reaches_writer_and_extraction_payloads(self):
         transcript = Path(self.temp.name) / "needs_review.json"
         transcript.write_text(json.dumps({
