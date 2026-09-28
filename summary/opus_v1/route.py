@@ -102,9 +102,9 @@ class Route:
                 + self.request_usd)
         return _microusd(cost * RESERVE_SAFETY)
 
-    def reserve_microusd(self) -> int:
+    def reserve_microusd(self, *, limit_microusd: int = OPUS_STAGE_CAP_MICROUSD) -> int:
         reserve = self.estimated_reserve_microusd()
-        if reserve < 1 or reserve > OPUS_STAGE_CAP_MICROUSD:
+        if reserve < 1 or reserve > limit_microusd:
             raise RouteBlocked("job_budget_exceeded")
         if (self.key_limit_remaining_usd is not None
                 and Decimal(reserve) / 1_000_000 > self.key_limit_remaining_usd):

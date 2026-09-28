@@ -96,7 +96,7 @@ from summary.opus_v1.batch import (BatchClient as OpusBatchClient,
                                     valid_batch_id as valid_opus_batch_id)
 from summary.opus_v1.route import (RouteBlocked as OpusRouteBlocked,
                                     verify_batch_route as verify_opus_batch_route)
-from .ledger import (DIAGNOSTIC_KINDS, JOB_CAP_MICROUSD, MAX_DISPATCHES_PER_JOB,
+from .ledger import (DIAGNOSTIC_KINDS, OPUS_DIRECT_KIND, JOB_CAP_MICROUSD, MAX_DISPATCHES_PER_JOB,
                      OPUS_V3_TRIAL_WEEK_CAP_MICROUSD, WEEK_CAP_MICROUSD, Ledger,
                      usd_micros, write_private_json)
 from .publication import _verify_staged_target, publish_document
@@ -1633,6 +1633,9 @@ def _poll_backoff(retry_after: str | None) -> int:
 
 
 def _finish_raw(ledger: Ledger, job: dict) -> dict:
+    if job.get("kind") == OPUS_DIRECT_KIND:
+        from summary.opus_v1.direct_writer import finish_raw as finish_direct_opus_raw
+        return finish_direct_opus_raw(ledger, job)
     if job.get("kind") in DIAGNOSTIC_KINDS:
         from summary.gemini_v1.diagnostic import finish_raw as finish_diagnostic_raw
         return finish_diagnostic_raw(ledger, job)

@@ -19,6 +19,10 @@ WEEK_CAP_MICROUSD = 1_000_000
 # same rolling sum; unrelated runs keep WEEK_CAP_MICROUSD.
 OPUS_V3_TRIAL_WEEK_CAP_MICROUSD = 2_000_000
 OPUS_V3_TRIAL_POLICY = "claude_opus_5_5_partitioned_audit_v3"
+OPUS_DIRECT_POLICY = "claude_opus_5_5_direct_writer_v1"
+OPUS_DIRECT_KIND = "opus_direct_writer"
+OPUS_DIRECT_WEEK_CAP_MICROUSD = 1_600_000
+OPUS_DIRECT_CALL_CAP_MICROUSD = 550_000
 JOB_CAP_MICROUSD = 100_000
 # Opus Batch must reserve the entire full-source input and hidden thinking
 # allowance. The user's dynamic-budget decision applies only to this new
@@ -298,12 +302,17 @@ class Ledger:
 
     def weekly_cap_microusd(self, billing_group_id: str) -> int:
         """Return the ceiling allowed for this group, never its own balance."""
-        row = self.db.execute("""SELECT cap_microusd FROM weekly_spending_authorizations
-            WHERE root_job_id=? AND quality_policy_version=?""",
-            (billing_group_id, OPUS_V3_TRIAL_POLICY)).fetchone()
-        return (row["cap_microusd"] if row is not None
-                and row["cap_microusd"] == OPUS_V3_TRIAL_WEEK_CAP_MICROUSD
-                else WEEK_CAP_MICROUSD)
+        row = self.db.execute("""SELECT cap_microusd,quality_policy_version
+            FROM weekly_spending_authorizations WHERE root_job_id=?""",
+            (billing_group_id,)).fetchone()
+        if row is not None:
+            if (row["quality_policy_version"] == OPUS_V3_TRIAL_POLICY
+                    and row["cap_microusd"] == OPUS_V3_TRIAL_WEEK_CAP_MICROUSD):
+                return OPUS_V3_TRIAL_WEEK_CAP_MICROUSD
+            if (row["quality_policy_version"] == OPUS_DIRECT_POLICY
+                    and row["cap_microusd"] == OPUS_DIRECT_WEEK_CAP_MICROUSD):
+                return OPUS_DIRECT_WEEK_CAP_MICROUSD
+        return WEEK_CAP_MICROUSD
 
     def weekly_authorization_for_root(self, root_job_id: str) -> dict | None:
         row = self.db.execute("""SELECT authorization_ref,cap_microusd,
@@ -621,6 +630,119 @@ class Ledger:
                 self.db.execute("ROLLBACK")
             raise
 
+    def authorize_direct_opus_run(self, *, semantic_key: str, source_sha256: str,
+                                  output_dir: Path, authorization_ref: str) -> bool:
+        """Pin the new $1.60 ceiling to one future, nonpublishing Opus writer.
+
+        The historical Opus v3 $2 authorization is never reused. This row is
+        checked again inside the reservation transaction, against the same
+        shared rolling expenditure as every other app job.
+        """
+        if (re.fullmatch(r"[a-f0-9]{64}", semantic_key or "") is None
+                or re.fullmatch(r"[a-f0-9]{64}", source_sha256 or "") is None
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{7,159}",
+                                authorization_ref or "") is None):
+            raise ValueError("invalid direct Opus authorization")
+        output = str(Path(output_dir))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            prior = self.db.execute(
+                "SELECT * FROM weekly_spending_authorizations WHERE semantic_key=?",
+                (semantic_key,)).fetchone()
+            if prior is not None:
+                if (prior["source_sha256"] != source_sha256 or prior["output_dir"] != output
+                        or prior["quality_policy_version"] != OPUS_DIRECT_POLICY
+                        or prior["authorization_ref"] != authorization_ref
+                        or prior["cap_microusd"] != OPUS_DIRECT_WEEK_CAP_MICROUSD):
+                    raise ValueError("different direct Opus authorization already recorded")
+                self.db.execute("COMMIT")
+                return False
+            if self.db.execute("SELECT 1 FROM jobs WHERE semantic_key=?", (semantic_key,)).fetchone():
+                raise ValueError("direct Opus authorization requires a future run")
+            if self.db.execute("""SELECT 1 FROM weekly_spending_authorizations
+                WHERE quality_policy_version=? LIMIT 1""",
+                               (OPUS_DIRECT_POLICY,)).fetchone():
+                raise ValueError("direct Opus authorization already assigned to another run")
+            self.db.execute("""INSERT INTO weekly_spending_authorizations
+                (semantic_key,source_sha256,output_dir,quality_policy_version,
+                 authorization_ref,cap_microusd,authorized_at,root_job_id)
+                VALUES (?,?,?,?,?,?,?,NULL)""",
+                (semantic_key, source_sha256, output, OPUS_DIRECT_POLICY,
+                 authorization_ref, OPUS_DIRECT_WEEK_CAP_MICROUSD, time.time()))
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    def reserve_direct_opus(self, *, semantic_key: str, source_sha256: str,
+                            output_dir: Path, credential_id: str,
+                            credential_version: int, workspace_id: str,
+                            max_cost_microusd: int) -> StartDecision:
+        """Atomically reserve the one physical request in the app-wide ledger."""
+        if (re.fullmatch(r"[a-f0-9]{64}", semantic_key or "") is None
+                or re.fullmatch(r"[a-f0-9]{64}", source_sha256 or "") is None
+                or not isinstance(credential_id, str) or not credential_id
+                or type(credential_version) is not int or credential_version < 1
+                or not isinstance(workspace_id, str) or not workspace_id):
+            raise ValueError("invalid direct Opus identity")
+        if not 0 < max_cost_microusd <= OPUS_DIRECT_CALL_CAP_MICROUSD:
+            return StartDecision("blocked", None, "job_budget_exceeded")
+        output = str(Path(output_dir))
+        now = time.time()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            prior = self.db.execute("SELECT * FROM jobs WHERE semantic_key=?",
+                                    (semantic_key,)).fetchone()
+            if prior is not None:
+                if (prior["kind"] != OPUS_DIRECT_KIND or prior["source_sha256"] != source_sha256
+                        or prior["output_dir"] != output or prior["credential_id"] != credential_id
+                        or prior["credential_version"] != credential_version
+                        or prior["workspace_id"] != workspace_id):
+                    raise ValueError("direct Opus semantic identity changed")
+                self.db.execute("COMMIT")
+                return StartDecision("accepted" if prior["status"] == "direct_complete"
+                                     else "pending", prior["id"], prior["status"])
+            authorization = self.db.execute(
+                "SELECT * FROM weekly_spending_authorizations WHERE semantic_key=?",
+                (semantic_key,)).fetchone()
+            if (authorization is None or authorization["source_sha256"] != source_sha256
+                    or authorization["output_dir"] != output
+                    or authorization["quality_policy_version"] != OPUS_DIRECT_POLICY
+                    or authorization["cap_microusd"] != OPUS_DIRECT_WEEK_CAP_MICROUSD
+                    or authorization["root_job_id"] is not None):
+                self.db.execute("ROLLBACK")
+                return StartDecision("blocked", None, "direct_opus_authorization_missing")
+            spent = self.db.execute("""SELECT COALESCE(SUM(CASE WHEN billed_microusd IS NULL
+                THEN reserved_microusd ELSE billed_microusd END),0) FROM jobs
+                WHERE created_at>=? AND status NOT IN
+                ('rejected_before_submit','cancelled_before_submit')""",
+                (now - WEEK_SECONDS,)).fetchone()[0]
+            if spent + max_cost_microusd > OPUS_DIRECT_WEEK_CAP_MICROUSD:
+                self.db.execute("ROLLBACK")
+                return StartDecision("blocked", None, "weekly_budget_exceeded")
+            job_id = uuid.uuid4().hex
+            self.db.execute("""INSERT INTO jobs
+              (id,semantic_key,source_sha256,output_dir,artifact_dir,status,
+               credential_id,credential_version,workspace_id,custom_id,remote_id,
+               reserved_microusd,billed_microusd,dispatches,created_at,updated_at,kind,root_job_id,
+               billing_group_id,writer_parent_id)
+              VALUES (?,?,?,?,?,'reserved',?,?,?,?,NULL,?,NULL,0,?,?,?,?,?,NULL)""",
+              (job_id, semantic_key, source_sha256, output,
+               str(self.root / "jobs" / job_id), credential_id, credential_version,
+               workspace_id, "direct-" + job_id, max_cost_microusd,
+               now, now, OPUS_DIRECT_KIND, job_id, job_id))
+            self.db.execute("UPDATE weekly_spending_authorizations SET root_job_id=? WHERE semantic_key=?",
+                            (job_id, semantic_key))
+            self.db.execute("COMMIT")
+            _secure_dir(self.root / "jobs" / job_id)
+            return StartDecision("new", job_id)
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
     @staticmethod
     def _check_accepted_inventory_unavailable(parent: sqlite3.Row) -> None:
         """Bind the exception to the prior sealed, published degraded decision."""
@@ -803,7 +925,7 @@ class Ledger:
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute("SELECT status,dispatches,billing_group_id,kind FROM jobs WHERE id=?", (job_id,)).fetchone()
-            individual_limit = (1 if row and row["kind"] in DIAGNOSTIC_KINDS
+            individual_limit = (1 if row and row["kind"] in DIAGNOSTIC_KINDS | {OPUS_DIRECT_KIND}
                                 else MAX_DISPATCHES_PER_JOB)
             if not row or row["status"] != "reserved" or row["dispatches"] >= individual_limit:
                 self.db.execute("ROLLBACK")
@@ -812,7 +934,8 @@ class Ledger:
                 "SELECT COALESCE(SUM(dispatches),0) FROM jobs WHERE billing_group_id=?",
                 (row["billing_group_id"],),
             ).fetchone()[0]
-            group_limit = (DIAGNOSTIC_MAX_DISPATCHES if row["kind"] in DIAGNOSTIC_KINDS
+            group_limit = (1 if row["kind"] == OPUS_DIRECT_KIND else
+                           DIAGNOSTIC_MAX_DISPATCHES if row["kind"] in DIAGNOSTIC_KINDS
                            else MAX_DISPATCHES_PER_JOB)
             if group_dispatches >= group_limit:
                 self.db.execute("ROLLBACK")
@@ -965,6 +1088,14 @@ class Ledger:
                                   (str(report_path), time.time(), job_id))
         if changed.rowcount != 1:
             raise ValueError("invalid diagnostic completion transition")
+
+    def direct_opus_completed(self, job_id: str, document_path: Path) -> None:
+        changed = self.db.execute("UPDATE jobs SET status='direct_complete',"
+                                  "accepted_document_path=?,updated_at=? WHERE id=? "
+                                  "AND kind=? AND status='completed_raw'",
+                                  (str(document_path), time.time(), job_id, OPUS_DIRECT_KIND))
+        if changed.rowcount != 1:
+            raise ValueError("invalid direct Opus completion transition")
 
     def credential_required(self, job_id: str) -> None:
         self.db.execute("UPDATE jobs SET status='credential_required',updated_at=?,next_poll_at=? WHERE id=? AND status IN ('submitted','polling','credential_required')",
