@@ -105,7 +105,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "b5e6f6566e7d3c35a46a3f8bd44c76db3d70f6822d9bf896a39e9dbb9ea676f5"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "7a86bfd0f29728538f8841eb69117940226771a6631b949354956f0825da2571"
 
 
 def _stage_pipeline_sha256(source):
