@@ -289,8 +289,9 @@ def _planned_capacity_hold(route: Route, snapshot: SourceSnapshot,
     packet_bytes = sum(len(canonical_bytes(packet["records"])) for packet in packets)
     input_bytes = source_bytes * 4 + packet_bytes * 2
     input_upper = (input_bytes * 6 + 4) // 5
-    item_count = min(12, 1 + len(packets) * 2 + 1 + 2 + 2)
-    # Up to two recovery slots fit only when planned items leave room under 12.
+    # Budget the stages this implementation can actually dispatch. The two
+    # optional recovery slots are not implemented and cannot incur a bill.
+    item_count = 1 + len(packets) * 2 + 1 + 2
     output_tokens = STAGE_CAPS["writer"] + (item_count - 1) * STAGE_CAPS["extract"]
     charge = (Decimal(input_upper) * max(route.prompt_usd_per_token,
                                           route.cache_write_usd_per_token)

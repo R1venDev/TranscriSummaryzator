@@ -120,6 +120,15 @@ class SourceFirstRuntimeTests(unittest.TestCase):
         self.assertLess(_planned_capacity_hold(low, snapshot, packets), 100_000)
         self.assertGreater(_planned_capacity_hold(high, snapshot, packets), 100_000)
 
+    def test_full_chain_forecast_counts_ten_dispatchable_items_for_three_packets(self):
+        snapshot = SourceSnapshot(Path("unused"), "b" * 64, "{}", {}, ())
+        packets = ({"records": []},) * 3
+        route = Route(SUBMIT_MODEL, PROVIDER, "workspace-1", 1_000_000, 32_000,
+                      Decimal(0), Decimal("0.000001"), Decimal(0),
+                      Decimal(0), None)
+        self.assertEqual(_planned_capacity_hold(route, snapshot, packets),
+                         257_000)  # 32k writer + nine 25k items
+
     def test_submit_selects_first_luna_eligible_key_without_policy_fallback(self):
         transcript = self.root / "key-selection-transcript.json"
         transcript.write_text(json.dumps({"source": "synthetic.mkv", "duration_seconds": 2,
