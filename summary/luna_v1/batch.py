@@ -204,7 +204,7 @@ def _canonical_chat_item(body: dict[str, Any]) -> dict[str, Any]:
     """Reject unsupported controls before the gateway can silently drop them."""
     if not isinstance(body, dict):
         raise ValueError("invalid_chat_body")
-    allowed = {"messages", "response_format", "max_completion_tokens",
+    allowed = {"messages", "response_format", "max_completion_tokens", "max_tokens",
                "reasoning", "reasoning_effort", "prompt_cache_options"}
     if set(body) - allowed:
         raise ValueError("unapproved_chat_parameter")
@@ -218,7 +218,9 @@ def _canonical_chat_item(body: dict[str, Any]) -> dict[str, Any]:
                 or not isinstance(message["content"], str)
                 or not message["content"].strip()):
             raise ValueError("text_only_required")
-    cap = body.get("max_completion_tokens")
+    if ("max_completion_tokens" in body) == ("max_tokens" in body):
+        raise ValueError("ambiguous_output_cap")
+    cap = body.get("max_completion_tokens", body.get("max_tokens"))
     if type(cap) is not int or not 1 <= cap <= 128_000:
         raise ValueError("invalid_output_cap")
     fmt = body.get("response_format")

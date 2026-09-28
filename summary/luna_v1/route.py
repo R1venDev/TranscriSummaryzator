@@ -164,7 +164,10 @@ def verify_source_first_batch_route(client: BatchClient, *,
     parameters = endpoint.get("supported_parameters")
     if not isinstance(parameters, list) or not all(isinstance(p, str) for p in parameters):
         raise RouteBlocked("endpoint_capabilities_unavailable")
-    required = {"response_format", "reasoning", "max_completion_tokens"}
+    # This provider's advertised Chat skin currently lists max_tokens,
+    # despite the gateway's newer generic max_completion_tokens alias.
+    # Send only the cap that this specific Batch endpoint declares.
+    required = {"response_format", "reasoning", "max_tokens"}
     if not required.issubset(parameters):
         raise RouteBlocked("endpoint_chat_parameters_unavailable")
     supports_cache = "prompt_cache_options" in parameters

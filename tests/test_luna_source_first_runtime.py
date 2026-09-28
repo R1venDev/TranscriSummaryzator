@@ -14,6 +14,7 @@ from summary.luna_v1.batch import BatchError, Reply, build_batch_payload
 from summary.luna_v1.batch import MODEL, PROVIDER, SUBMIT_MODEL
 from summary.luna_v1.ledger import Ledger, batch_item_intent_for_body
 from summary.luna_v1.route import Route
+from summary.luna_v1.route import RouteBlocked
 from summary.luna_v1.source_first_core import SourceSnapshot, load_snapshot, plan_packets
 from summary.luna_v1.tasks import ReconciliationConflict
 from summary.luna_v1.source_first_runtime import (
@@ -118,6 +119,66 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                      Decimal("0.000001"), Decimal(0), None)
         self.assertLess(_planned_capacity_hold(low, snapshot, packets), 100_000)
         self.assertGreater(_planned_capacity_hold(high, snapshot, packets), 100_000)
+
+    def test_submit_selects_first_luna_eligible_key_without_policy_fallback(self):
+        transcript = self.root / "key-selection-transcript.json"
+        transcript.write_text(json.dumps({"source": "synthetic.mkv", "duration_seconds": 2,
+            "utterances": [{"start": 0, "end": 2, "speaker": None,
+                            "text": "Предлагаю проверить сигнал."}]}), encoding="utf-8")
+        route = Route(SUBMIT_MODEL, PROVIDER, "workspace-1", 1_000_000, 32_000,
+                      Decimal("0.000000001"), Decimal("0.00000001"),
+                      Decimal("0.000000001"), Decimal(0), None,
+                      batch_endpoint_model=MODEL, provider_endpoint_tag=PROVIDER)
+
+        class Credential:
+            def __init__(self, path):
+                self.path = Path(path)
+
+            def dispatch_candidates(self):
+                return [{"id": "judge", "version": 1, "workspace_id": "workspace-1"},
+                        {"id": "author", "version": 1, "workspace_id": "workspace-1"}]
+
+            def reveal_for_dispatch(self, identifier, version):
+                return identifier
+
+        posts = []
+
+        class Client:
+            def __init__(self, token):
+                self.token = token
+
+            def submit_prepared(self, *_args, **_kwargs):
+                posts.append(self.token)
+                return Reply(202, {"id": f"batch_keyselect{len(posts)}"})
+
+        def verify(client):
+            if client.token == "judge":
+                raise RouteBlocked("model_not_allowed_for_key")
+            return route
+
+        with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+              patch("summary.luna_v1.source_first_runtime.verify_source_first_batch_route",
+                    side_effect=verify)):
+            result = submit_source_first(transcript_path=transcript,
+                output_dir=self.root / "key-selection-output",
+                private_root=self.root / "key-selection-private",
+                client_factory=Client)
+        self.assertEqual(result["status"], "submitted")
+        self.assertEqual(posts, ["author", "author"])
+
+        def policy_error(client):
+            raise RouteBlocked("account_policy_unverified_for_workspace")
+
+        with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+              patch("summary.luna_v1.source_first_runtime.verify_source_first_batch_route",
+                    side_effect=policy_error)):
+            blocked = submit_source_first(transcript_path=transcript,
+                output_dir=self.root / "policy-output",
+                private_root=self.root / "policy-private",
+                client_factory=Client)
+        self.assertEqual(blocked["status"], "preflight_blocked")
+        self.assertEqual(blocked["reason"], "account_policy_unverified_for_workspace")
+        self.assertEqual(posts, ["author", "author"])
 
     def test_post_uses_exact_sealed_ordered_bytes_once(self):
         attempt_id, path, digest, _ = self._reserved()

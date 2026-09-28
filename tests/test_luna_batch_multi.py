@@ -100,6 +100,15 @@ class MultiBatchTransportTests(unittest.TestCase):
         self.assertNotIn("model", payload["requests"][0]["body"])
         self.assertEqual(MODEL, "openai/gpt-6-luna:batch")  # legacy pinned route
 
+    def test_current_endpoint_max_tokens_cap_is_accepted_without_alias_mix(self):
+        body = _body()
+        body["max_tokens"] = body.pop("max_completion_tokens")
+        payload = build_batch_payload([("source-first-writer", body)])
+        self.assertEqual(payload["requests"][0]["body"]["max_tokens"], 25_000)
+        body["max_completion_tokens"] = 25_000
+        with self.assertRaisesRegex(ValueError, "ambiguous_output_cap"):
+            build_batch_payload([("source-first-writer", body)])
+
     def test_unsupported_controls_and_duplicate_id_fail_before_post(self):
         opener = _Opener()
         client = BatchClient("synthetic-token", opener=opener)

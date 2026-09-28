@@ -177,7 +177,7 @@ def _chat_body(stage: str, payload: dict) -> dict:
             {"role": "user", "content": _user_json(payload)},
         ],
         "response_format": response_format_for_stage(stage),
-        "max_completion_tokens": STAGE_CAPS[stage],
+        "max_tokens": STAGE_CAPS[stage],
         "reasoning": {"effort": STAGE_EFFORT[stage]},
     }
 
@@ -452,10 +452,23 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
             candidates = store.dispatch_candidates()
             if not candidates:
                 return {"status": "credential_required"}
-            selected = candidates[0]
-            token = store.reveal_for_dispatch(selected["id"], selected["version"])
-            client = client_factory(token)
-            route = verify_source_first_batch_route(client)
+            selected = client = route = None
+            for candidate in candidates:
+                token = store.reveal_for_dispatch(candidate["id"], candidate["version"])
+                candidate_client = client_factory(token)
+                try:
+                    candidate_route = verify_source_first_batch_route(candidate_client)
+                except RouteBlocked as exc:
+                    # A key restricted to another model is not a Luna key.
+                    # Do not skip privacy, policy, balance or route failures.
+                    if str(exc) == "model_not_allowed_for_key":
+                        continue
+                    raise
+                selected, client, route = candidate, candidate_client, candidate_route
+                break
+            if selected is None:
+                return {"status": "credential_required",
+                        "reason": "no_luna_batch_credential"}
             if route.workspace_id != selected.get("workspace_id"):
                 raise RouteBlocked("credential_workspace_changed_since_check")
             semantic_key = digest({

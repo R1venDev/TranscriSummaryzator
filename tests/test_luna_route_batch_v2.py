@@ -31,7 +31,7 @@ class _MetadataClient:
                 "context_length": 1_050_000,
                 "max_completion_tokens": 128_000,
                 "supported_parameters": ["response_format", "reasoning",
-                                         "max_completion_tokens", "prompt_cache_options"],
+                                         "max_tokens", "prompt_cache_options"],
                 "pricing": {"prompt": "0.00000005",
                             "completion": "0.00000025",
                             "input_cache_write": "0.0000000625", "request": "0"},

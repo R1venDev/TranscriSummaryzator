@@ -114,7 +114,9 @@ def batch_item_intent_for_body(custom_id: str, body: dict, *,
     fmt = body.get("response_format")
     if not isinstance(fmt, dict) or not isinstance(fmt.get("json_schema"), dict):
         raise ValueError("invalid batch output schema")
-    cap = body.get("max_completion_tokens")
+    if ("max_completion_tokens" in body) == ("max_tokens" in body):
+        raise ValueError("ambiguous batch output cap")
+    cap = body.get("max_completion_tokens", body.get("max_tokens"))
     if type(cap) is not int or not 1 <= cap <= 128_000:
         raise ValueError("invalid batch output cap")
     return BatchItemIntent(
