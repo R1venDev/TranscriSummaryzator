@@ -14,6 +14,7 @@ from threading import Barrier
 from summary.luna_v1.batch import build_batch_payload
 from summary.luna_v1.ledger import (
     JOB_CAP_MICROUSD,
+    WEEK_CAP_MICROUSD,
     WEEK_SECONDS,
     Ledger,
     batch_item_intent_for_body,
@@ -311,7 +312,8 @@ class SourceFirstLedgerTests(unittest.TestCase):
             second.close()
 
     def test_source_first_weekly_cap_includes_legacy_holds_across_workflows(self):
-        for index in range(9):
+        self.assertEqual(WEEK_CAP_MICROUSD, 5_000_000)
+        for index in range(49):
             legacy = self.ledger.reserve(semantic_key=f"{index+30:064x}",
                 source_sha256="d" * 64, output_dir=self.root / f"legacy-{index}",
                 credential_id="legacy", credential_version=1,
@@ -363,7 +365,7 @@ class SourceFirstLedgerTests(unittest.TestCase):
         self.assertEqual(self.ledger._rolling_spent_microusd(time.time()), 190_000)
 
     def test_competing_workflow_holds_are_serialized_across_connections(self):
-        for index in range(8):
+        for index in range(48):
             legacy = self.ledger.reserve(semantic_key=f"{index+80:064x}",
                 source_sha256="d" * 64, output_dir=self.root / f"other-{index}",
                 credential_id="legacy", credential_version=1,
@@ -377,7 +379,7 @@ class SourceFirstLedgerTests(unittest.TestCase):
                                           "planned_capacity_microusd": 100_000,
                                           "capacity_basis": {"route": "synthetic"}})
             created = self.ledger.create_source_first_job(
-                semantic_key=f"{index+90:064x}", source_sha256="e" * 64,
+                semantic_key=f"{index+200:064x}", source_sha256="e" * 64,
                 output_dir=self.root / f"race-output-{index}",
                 manifest_path=manifest, manifest_sha256=_sha(manifest),
                 credential_id="writer", credential_version=1,
@@ -397,7 +399,7 @@ class SourceFirstLedgerTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(hold, workflows))
         self.assertCountEqual(results, ["new", "blocked"])
-        self.assertEqual(self.ledger._rolling_spent_microusd(time.time()), 1_000_000)
+        self.assertEqual(self.ledger._rolling_spent_microusd(time.time()), WEEK_CAP_MICROUSD)
 
     def test_finish_requires_terminal_attempt_and_sealed_result(self):
         decision, _, _ = self.intent(cost=10_000)

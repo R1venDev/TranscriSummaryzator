@@ -188,7 +188,7 @@ class WeeklyBudgetRetryTests(unittest.TestCase):
             _transcript(transcript)
             ledger = Ledger(private)
             try:
-                for index in range(10):
+                for index in range(50):
                     decision = ledger.reserve(
                         semantic_key=f"{index + 1:064x}",
                         source_sha256="b" * 64,
@@ -273,7 +273,7 @@ class WeeklyBudgetRetryTests(unittest.TestCase):
             client = Client()
             ledger = Ledger(private)
             try:
-                for index in range(10):
+                for index in range(50):
                     self.assertEqual(ledger.reserve(
                         semantic_key=f"{index + 1:064x}",
                         source_sha256="b" * 64,
