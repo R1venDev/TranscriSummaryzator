@@ -1,4 +1,6 @@
-# Summary-only Luna Batch: архитектура и эксплуатация
+# Исторический одновызовный Luna Batch: архитектура и эксплуатация
+
+Новый многостадийный маршрут для новых jobs описан в [SUMMARY_LUNA_SOURCE_FIRST.md](SUMMARY_LUNA_SOURCE_FIRST.md). Этот документ сохраняет контракт прежних поколений и попыток; описание одновызовной схемы относится к прежней policy.
 
 Состояние документа: 2026-09-26. Код Luna Batch включён в `main` как opt-in summary-only backend; в `config.example.json` остаётся `summary_backend: legacy_local`. Отдельный Linux release `/mnt/shared-data/transcri-work/summary-luna-openrouter` работал на commit `4ada035`. Синтетический платный smoke подтверждён. Для полной частной стенограммы на последнем проверенном checkpoint был зарегистрирован Batch; его terminal raw/usage, качество конспекта и production rollout здесь не утверждаются. Исторический локальный summary и опыты сохранены отдельно.
 

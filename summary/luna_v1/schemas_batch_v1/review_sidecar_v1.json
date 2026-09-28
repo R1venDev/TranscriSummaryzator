@@ -1,0 +1,155 @@
+{
+  "$defs": {
+    "ArtifactHash": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "luna_review_sidecar_v1"
+      ]
+    },
+    "generation_id": {
+      "type": "string"
+    },
+    "source_revision": {
+      "type": "string"
+    },
+    "execution_status": {
+      "type": "string"
+    },
+    "review_status": {
+      "enum": [
+        "review_pending",
+        "review_completed",
+        "reviewed_with_uncertainties",
+        "review_incomplete",
+        "generation_failed"
+      ],
+      "type": "string"
+    },
+    "source_scope_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "checked_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unreviewed_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "accepted_bundle_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "rejected_bundle_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unresolved_bundle_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "source_ambiguities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "model_disagreements": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "technical_failures": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "billed_cost_microusd": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "held_cost_microusd": {
+      "type": "integer"
+    },
+    "unknown_bill_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "artifact_hashes": {
+      "items": {
+        "$ref": "#/$defs/ArtifactHash"
+      },
+      "type": "array"
+    },
+    "generation_lineage": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "generation_id",
+    "source_revision",
+    "execution_status",
+    "review_status",
+    "source_scope_ids",
+    "checked_ids",
+    "unreviewed_ids",
+    "accepted_bundle_ids",
+    "rejected_bundle_ids",
+    "unresolved_bundle_ids",
+    "source_ambiguities",
+    "model_disagreements",
+    "technical_failures",
+    "billed_cost_microusd",
+    "held_cost_microusd",
+    "unknown_bill_ids",
+    "artifact_hashes",
+    "generation_lineage"
+  ],
+  "type": "object"
+}

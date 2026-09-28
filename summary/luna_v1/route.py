@@ -1,12 +1,12 @@
 """Free route and price preflight before a private paid Batch submission."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_UP
 import os
 
-from .batch import MODEL, BatchClient
-from .ledger import JOB_CAP_MICROUSD
+from .batch import MODEL, PROVIDER, SUBMIT_MODEL, BatchClient
+from .ledger import JOB_CAP_MICROUSD, WEEK_CAP_MICROUSD
 
 
 MAX_COMPLETION_TOKENS = 32_000
@@ -28,19 +28,32 @@ class Route:
     cache_write_usd_per_token: Decimal
     request_usd: Decimal
     key_limit_remaining_usd: Decimal | None
+    # Additive metadata for the source-first policy. Legacy Route instances
+    # retain their existing MODEL while new jobs record both submit and
+    # resolved Batch identities.
+    batch_endpoint_model: str = MODEL
+    provider_endpoint_tag: str = PROVIDER
+    supports_explicit_cache: bool = False
 
-    def reserve_microusd(self, serialized_request: bytes) -> int:
+    def reserve_microusd(self, serialized_request: bytes, *,
+                         max_completion_tokens: int | None = None,
+                         authorized_job_cap_microusd: int = JOB_CAP_MICROUSD) -> int:
         # A deliberately loose source upper bound: UTF-8 bytes plus 20% for
         # transport/tokenizer overhead. No promised cache hit is subtracted.
+        output_cap = self.max_completion_tokens if max_completion_tokens is None else max_completion_tokens
+        if type(output_cap) is not int or not 1 <= output_cap <= self.max_completion_tokens:
+            raise RouteBlocked("invalid_output_cap")
         input_upper = (len(serialized_request) * 6 + 4) // 5
-        if input_upper + self.max_completion_tokens > self.max_context_tokens:
+        if input_upper + output_cap > self.max_context_tokens:
             raise RouteBlocked("context_capacity_unverified")
         cost = (Decimal(input_upper) * max(self.prompt_usd_per_token,
                                            self.cache_write_usd_per_token)
-                + Decimal(self.max_completion_tokens) * self.completion_usd_per_token
+                + Decimal(output_cap) * self.completion_usd_per_token
                 + self.request_usd)
         reserve = int((cost * 1_000_000).to_integral_value(rounding=ROUND_UP))
-        if reserve < 1 or reserve > JOB_CAP_MICROUSD:
+        if (type(authorized_job_cap_microusd) is not int
+                or not 0 < authorized_job_cap_microusd <= WEEK_CAP_MICROUSD
+                or reserve < 1 or reserve > authorized_job_cap_microusd):
             raise RouteBlocked("job_budget_exceeded")
         if self.key_limit_remaining_usd is not None and cost > self.key_limit_remaining_usd:
             raise RouteBlocked("key_budget_insufficient")
@@ -126,4 +139,80 @@ def verify_batch_route(client: BatchClient) -> Route:
         cache_write_usd_per_token=highest_price("input_cache_write", "cache_write"),
         request_usd=max(_decimal(tier.get("request", "0"), "request_price") for tier in tiers),
         key_limit_remaining_usd=_decimal(remaining, "key_remaining") if remaining is not None else None,
+    )
+
+
+def verify_source_first_batch_route(client: BatchClient, *,
+                                    require_cache_disabled: bool = False) -> Route:
+    """Verify the single OpenAI :batch endpoint used by the new policy.
+
+    /models/user establishes account eligibility, while the variant's
+    /endpoints response establishes provider identity, parameters and prices.
+    The documented endpoint response is data={id,endpoints:[...]}. If any
+    required fact is unavailable, private dispatch remains blocked.
+    """
+    legacy = verify_batch_route(client)
+    data = client.model_endpoints().body.get("data")
+    if (not isinstance(data, dict) or data.get("id") not in {MODEL, SUBMIT_MODEL}
+            or not isinstance(data.get("endpoints"), list)):
+        raise RouteBlocked("batch_endpoints_unavailable")
+    endpoints = data["endpoints"]
+    eligible = [entry for entry in endpoints if isinstance(entry, dict)
+                and entry.get("tag") == PROVIDER
+                and entry.get("provider_name") == "OpenAI"
+                and entry.get("model_id") in {MODEL, SUBMIT_MODEL}]
+    if len(eligible) != 1:
+        raise RouteBlocked("openai_batch_endpoint_not_unique")
+    endpoint = eligible[0]
+    parameters = endpoint.get("supported_parameters")
+    if not isinstance(parameters, list) or not all(isinstance(p, str) for p in parameters):
+        raise RouteBlocked("endpoint_capabilities_unavailable")
+    # This provider's advertised Chat skin currently lists max_tokens,
+    # despite the gateway's newer generic max_completion_tokens alias.
+    # Send only the cap that this specific Batch endpoint declares.
+    required = {"response_format", "reasoning", "max_tokens"}
+    if not required.issubset(parameters):
+        raise RouteBlocked("endpoint_chat_parameters_unavailable")
+    supports_cache = "prompt_cache_options" in parameters
+    if require_cache_disabled and not supports_cache:
+        raise RouteBlocked("explicit_cache_control_unavailable")
+    context = endpoint.get("context_length")
+    completion_cap = endpoint.get("max_completion_tokens")
+    try:
+        context = int(context)
+        completion_cap = int(completion_cap)
+    except (TypeError, ValueError):
+        raise RouteBlocked("endpoint_capacity_unavailable") from None
+    if context < 1 or completion_cap < MAX_COMPLETION_TOKENS:
+        raise RouteBlocked("endpoint_capacity_unavailable")
+    endpoint_pricing = endpoint.get("pricing")
+    if not isinstance(endpoint_pricing, dict):
+        raise RouteBlocked("endpoint_pricing_unavailable")
+    endpoint_overrides = endpoint_pricing.get("overrides", [])
+    if (not isinstance(endpoint_overrides, list)
+            or any(not isinstance(tier, dict) for tier in endpoint_overrides)):
+        raise RouteBlocked("endpoint_pricing_overrides_unavailable")
+    # The legacy route already holds the highest model-level base and tier
+    # prices. Keep those bounds if endpoint metadata quotes a lower tariff.
+    tiers = [endpoint_pricing, *endpoint_overrides]
+
+    def highest_price(field: str, *aliases: str) -> Decimal:
+        values = []
+        for tier in tiers:
+            value = next((tier[name] for name in (field, *aliases) if name in tier), None)
+            values.append(_decimal(value, field + "_price"))
+        return max(values)
+
+    request_usd = max(legacy.request_usd, *(
+        _decimal(tier.get("request", "0"), "request_price") for tier in tiers))
+    return replace(
+        legacy, model=SUBMIT_MODEL, max_context_tokens=min(legacy.max_context_tokens, context),
+        max_completion_tokens=min(legacy.max_completion_tokens, completion_cap),
+        prompt_usd_per_token=max(legacy.prompt_usd_per_token, highest_price("prompt")),
+        completion_usd_per_token=max(legacy.completion_usd_per_token,
+                                     highest_price("completion")),
+        cache_write_usd_per_token=max(legacy.cache_write_usd_per_token,
+                                      highest_price("input_cache_write", "cache_write")),
+        request_usd=request_usd, batch_endpoint_model=MODEL,
+        provider_endpoint_tag=PROVIDER, supports_explicit_cache=supports_cache,
     )

@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from summary.luna_v1.engine import poll_once, submit
+from summary.luna_v1.engine import poll_once
+from summary.luna_v1.source_first_runtime import poll_source_first_once, submit_source_first
 
 def _write_status(path: Path, value: dict) -> None:
     temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex + ".tmp")
@@ -38,8 +39,14 @@ def main() -> int:
     poll.add_argument("--private-root", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "submit":
-        outcome = submit(transcript_path=args.transcript, output_dir=args.output,
-                         private_root=args.private_root, force_nonce=args.force_nonce)
+        if os.environ.get("TRANSCRI_LUNA_SOURCE_FIRST_ENABLED") != "1":
+            outcome = {"status": "policy_disabled",
+                       "reason": "luna_batch_source_first_v1_not_enabled"}
+        else:
+            outcome = submit_source_first(transcript_path=args.transcript,
+                                          output_dir=args.output,
+                                          private_root=args.private_root,
+                                          force_nonce=args.force_nonce)
         _write_status(args.output / "summary_luna_attempt.json", outcome)
         print("SUMMARY_PROGRESS " + json.dumps({
             "stage": "summary_" + outcome["status"],
@@ -47,7 +54,9 @@ def main() -> int:
             "detail": outcome["status"],
         }, ensure_ascii=False), flush=True)
         return 0 if outcome["status"] in {"submitted", "pending", "accepted_cache_hit", "accepted"} else 2
-    outcomes = poll_once(private_root=args.private_root)
+    outcomes = poll_source_first_once(private_root=args.private_root)
+    if os.environ.get("TRANSCRI_ALLOW_LEGACY_BATCH_RECOVERY") == "1":
+        outcomes.extend(poll_once(private_root=args.private_root))
     print(json.dumps(outcomes, ensure_ascii=False), flush=True)
     return 0
 

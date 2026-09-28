@@ -1,0 +1,176 @@
+{
+  "$defs": {
+    "PatchBundle": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_id": {
+          "type": "string"
+        },
+        "finding_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "affected_surface_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "operations": {
+          "items": {
+            "$ref": "#/$defs/PatchOperation"
+          },
+          "type": "array"
+        },
+        "preservation_notes": {
+          "type": "string"
+        },
+        "dependency_bundle_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bundle_id",
+        "finding_ids",
+        "evidence_ids",
+        "affected_surface_ids",
+        "operations",
+        "preservation_notes",
+        "dependency_bundle_ids"
+      ],
+      "type": "object"
+    },
+    "PatchOperation": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "replace_field",
+            "add_section_item",
+            "create_task",
+            "update_task",
+            "change_task_relation",
+            "split_task",
+            "merge_tasks"
+          ],
+          "type": "string"
+        },
+        "target_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "field_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "value_json": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "position_after_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temp_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lineage_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "target_id",
+        "field_key",
+        "value_json",
+        "position_after_id",
+        "temp_id",
+        "lineage_ids"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "luna_patch_plan_v1"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "bundles": {
+      "items": {
+        "$ref": "#/$defs/PatchBundle"
+      },
+      "type": "array"
+    },
+    "unresolved": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unprocessed_finding_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "complete",
+    "bundles",
+    "unresolved",
+    "unprocessed_finding_ids"
+  ],
+  "type": "object"
+}

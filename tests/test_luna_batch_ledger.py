@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from summary.luna_v1.batch import BatchClient, extract_one_completed, valid_batch_id
-from summary.luna_v1.ledger import Ledger
+from summary.luna_v1.ledger import WEEK_CAP_MICROUSD, Ledger
 
 
 class _Response:
@@ -56,9 +56,10 @@ class LedgerTests(unittest.TestCase):
             restarted = Ledger(root)
             self.assertEqual(restarted.get(first.job_id)["status"], "submission_unknown")
             self.assertFalse(restarted.mark_submitting(first.job_id))
-            # Eleven such unknown submissions would exceed the one shared USD,
-            # even if each uses another key and output directory.
-            for index in range(1, 11):
+            self.assertEqual(WEEK_CAP_MICROUSD, 5_000_000)
+            # Fifty-five unknown submissions hold $4.95; the next crosses the
+            # shared rolling $5 cap even with another key and output directory.
+            for index in range(1, 55):
                 decision = restarted.reserve(
                     semantic_key=f"{index:064x}", source_sha256="b" * 64,
                     output_dir=root / f"meeting-{index}", credential_id=f"key-{index}",
@@ -68,7 +69,7 @@ class LedgerTests(unittest.TestCase):
                 self.assertEqual(decision.kind, "new")
             blocked = restarted.reserve(
                 semantic_key="f" * 64, source_sha256="b" * 64,
-                output_dir=root / "over", credential_id="key-12", credential_version=1,
+                output_dir=root / "over", credential_id="key-56", credential_version=1,
                 workspace_id="workspace-1", max_cost_microusd=90_000,
             )
             self.assertEqual(blocked.reason, "weekly_budget_exceeded")

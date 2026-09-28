@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
-import hashlib
 import html
 import json
 
 from .contract import validate_document
+from .tasks import _action_sources, _anchor_id
 
 
 HEADINGS = (
@@ -61,7 +61,7 @@ def _stamp(milliseconds: int) -> str:
 
 def _anchor(source_id: str, index: dict) -> tuple[str, str]:
     record = index["by_id"][source_id]
-    return f"transcript.html#t-{record['start_ms']}", f"{source_id} {_stamp(record['start_ms'])}"
+    return f"transcript.html#u-{source_id}", f"{source_id} {_stamp(record['start_ms'])}"
 
 
 def _links(ids: list[str], index: dict) -> tuple[str, str]:
@@ -103,7 +103,7 @@ def _effective_tasks(document: dict, index: dict, overrides: list[dict] | None) 
     if not isinstance(supplied, list) or len(supplied) != len(document["tasks"]):
         raise ValueError("effective task count differs from generated document")
     result = []
-    first_source_ordinals: dict[str, int] = {}
+    action_anchors = [_action_sources(task) for task in document["tasks"]]
     for number, (generated, item) in enumerate(zip(document["tasks"], supplied), 1):
         if not isinstance(item, dict):
             raise ValueError(f"effective task {number} is not an object")
@@ -124,12 +124,10 @@ def _effective_tasks(document: dict, index: dict, overrides: list[dict] | None) 
         if task["discussion_status"] not in _STATUS:
             raise ValueError(f"effective task {number} has invalid status")
         if not task.get("action_id"):
-            # A deterministic initial key; the backend must persist it and
-            # pass it back as an override across edits and regenerations.
-            first = task["source_ids"][0]
-            first_source_ordinals[first] = first_source_ordinals.get(first, 0) + 1
-            material = f"{index['source_sha256']}:{first}:{first_source_ordinals[first]}"
-            task["action_id"] = "A-" + hashlib.sha256(material.encode()).hexdigest()[:20]
+            # Preview-only fallback uses the same source action anchor as the
+            # persistent task store. The store remains authoritative for edits.
+            task["action_id"] = _anchor_id(index["source_sha256"], generated,
+                duplicate_anchor=action_anchors.count(action_anchors[number - 1]) > 1)
         if not isinstance(task["action_id"], str) or not task["action_id"].strip():
             raise ValueError(f"effective task {number} has invalid action ID")
         if "revision" not in task:
@@ -147,11 +145,11 @@ def _transcript_turns(index: dict, include_ids: set[str] | None = None) -> str:
         if include_ids is not None and source_id not in include_ids:
             continue
         milliseconds = row["start_ms"]
-        anchor = f' id="t-{milliseconds}"' if milliseconds not in anchored else ""
+        legacy_anchor = f'<span id="t-{milliseconds}"></span>' if milliseconds not in anchored else ""
         anchored.add(milliseconds)
         caution = " <small>Неясная реплика в готовой транскрипции</small>" if row.get("needs_review") else ""
         turns.append(
-            f'<section class="turn"{anchor}><time>{_stamp(milliseconds)}</time> '
+            f'<section class="turn" id="u-{_html(source_id)}">{legacy_anchor}<time>{_stamp(milliseconds)}</time> '
             f'<strong>{_html(row["speaker"])}</strong> '
             f'<span>{_html(row["text"])}</span>{caution}</section>'
         )
@@ -187,7 +185,8 @@ def _transcript_html(index: dict) -> str:
     )
 
 
-def render_document(document: dict, source_index: dict, effective_tasks: list[dict] | None = None) -> dict:
+def render_document(document: dict, source_index: dict, effective_tasks: list[dict] | None = None,
+                    quality_review: dict | None = None) -> dict:
     """Return md/html/json/tasks built from a single effective state.
 
     ``effective_tasks`` is the backend's versioned projection of user edits.
@@ -202,6 +201,8 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
     effective["meeting"]["participants_by_transcript"] = list(source_index.get("participants", []))
     effective["meeting"]["unattributed_speech"] = bool(source_index.get("unattributed_speech"))
     effective["source_sha256"] = source_index["source_sha256"]
+    if quality_review is not None:
+        effective["quality_review"] = deepcopy(quality_review)
 
     md: list[str] = []
     fragment: list[str] = []
@@ -214,6 +215,69 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
     participants = ", ".join(people) if people else "Не определены"
     md.extend([f"**Участники по транскрипции:** {_md(participants)}", ""])
     fragment.append(f"<p><strong>Участники по транскрипции:</strong> {_html(participants)}</p>")
+    if quality_review is not None and quality_review.get("status") not in {
+            "checked", "model_reconciled_checked", "model_segment_reviewed_checked"}:
+        status = quality_review.get("status")
+        count = quality_review.get("unresolved_count", 0)
+        if status == "unresolved":
+            notice = f"Проверка по исходным репликам оставила {count} вопрос(ов) без решения. Полнота и точность не подтверждены."
+        elif status == "source_first_checked":
+            notice = ("Сначала составлен перечень значимых пунктов по исходным репликам, затем конспект сверен с ним. "
+                      "Автоматическая проверка завершена; это не гарантирует полноту и точность.")
+        elif status == "review_incomplete":
+            notice = ("Проверка по исходным репликам завершилась не полностью. "
+                      "Часть пунктов или реплик осталась без сверки; полнота конспекта не подтверждена.")
+        elif status == "coverage_incomplete":
+            notice = ("Автоматическая проверка не завершила сверку всей стенограммы "
+                      "либо выявила несогласованность; полнота проверки не подтверждена. "
+                      "Конспект опубликован с этой пометкой.")
+        elif status == "postverify_corrected_unchecked":
+            notice = ("После итоговой проверки внесено ещё одно адресное исправление; "
+                      "локально проверены его формат и ссылки, но смысл повторно не проверялся моделью.")
+            if count:
+                notice += f" Осталось {count} вопрос(ов) в разделе «Требует проверки источника»."
+        elif status == "opus_audited_unverified":
+            notice = ("Claude Opus 5.5 сопоставил всю доступную стенограмму с черновиком; "
+                      "адресных правок не было, повторная модельная проверка не запускалась. "
+                      "Полнота и точность этим не гарантированы.")
+        elif status == "opus_self_verified":
+            notice = ("Claude Opus 5.5 сопоставил всю доступную стенограмму с черновиком "
+                      "и повторно проверил внесённые правки. Это проверка той же моделью, "
+                      "не независимое подтверждение полноты и точности.")
+        elif status == "opus_segment_reviewed_unverified":
+            notice = ("Claude Opus 5.5 проверил закреплённые части стенограммы по полному черновику. "
+                      "Адресные правки объединены локально без второй модельной проверки; "
+                      "смысловая полнота не гарантирована.")
+        elif status == "opus_audit_unavailable":
+            notice = ("Проверка черновика Claude Opus 5.5 не завершилась; "
+                      "конспект опубликован без этой смысловой проверки.")
+        elif status == "opus_verify_unavailable":
+            notice = ("После правок Claude Opus 5.5 адресная повторная проверка не завершилась; "
+                      "конспект опубликован с этой пометкой.")
+            if count:
+                notice += f" Осталось {count} вопрос(ов) в разделе «Требует проверки источника»."
+        elif status == "source_reviewed_local_correction_unverified":
+            notice = ("После автоматической проверки инженерная сверка обнаружила и локально исправила ошибки по исходным репликам. "
+                      "Исправленный вариант не проходил повторную модельную проверку; полнота всей встречи не подтверждена.")
+        elif status == "model_audit_unverified":
+            notice = ("Автоматическая проверка сопоставила значимые пункты с черновиком, "
+                      "но её перечень и смысловая полнота не подтверждены независимой источниковой проверкой.")
+        elif status == "model_reconciled_unverified":
+            notice = ("Независимый перечень по частям стенограммы сопоставлен с черновиком; "
+                      "адресная повторная проверка не требовалась. Это не гарантия полной смысловой точности.")
+        elif status == "model_segment_reviewed_unverified":
+            notice = ("Части исходной стенограммы автоматически сопоставлены с полным черновиком. "
+                      "Адресная повторная проверка не требовалась; абсолютная полнота этим не доказана.")
+        elif status == "segment_review_unavailable":
+            notice = ("Автоматическая проверка не охватила все части стенограммы; "
+                      "конспект и выполненные проверки сохранены, недостающая область отмечена в статусе.")
+        else:
+            notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
+        warning_count = quality_review.get("coverage_warning_count", 0)
+        if warning_count and status != "coverage_incomplete":
+            notice += f" В отчёте о покрытии есть {warning_count} несогласованных строк(и); полнота проверки не подтверждена."
+        md.extend([f"**Качество конспекта:** {_md(notice)}", ""])
+        fragment.append(f"<p class=\"summary-quality-notice\"><strong>Качество конспекта:</strong> {_html(notice)}</p>")
 
     def heading(text: str) -> None:
         md.extend([f"## {text}", ""])
