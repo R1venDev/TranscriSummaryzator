@@ -276,9 +276,17 @@ class TaskStore:
             ]
         for position, candidates in possibilities.items():
             if len(candidates) > 1:
-                raise ReconciliationConflict("ambiguous source action anchor", candidates)
+                if any(old[action_id]["revision"] > 0 for action_id in candidates):
+                    raise ReconciliationConflict("ambiguous source action anchor", candidates)
+                # The utterance alone cannot identify which historical,
+                # unedited action this new predicate represents. Keep those
+                # identities intact and assign a new fingerprint-qualified ID.
+                continue
             if candidates and sum(candidates[0] in other for other in possibilities.values()) > 1:
-                raise ReconciliationConflict("multiple generated tasks share a source action anchor", candidates)
+                if old[candidates[0]]["revision"] > 0:
+                    raise ReconciliationConflict("multiple generated tasks share a source action anchor", candidates)
+                # A split cannot safely inherit the single old ID twice.
+                continue
             if candidates:
                 prior = old[candidates[0]]
                 if prior["revision"] > 0 and prior["fingerprint"] != fingerprints[position]:
@@ -293,11 +301,13 @@ class TaskStore:
         result: list[dict] = []
         anchor_counts = {anchor: sum(_action_sources(item) == anchor for item in fresh)
                          for anchor in {_action_sources(item) for item in fresh}}
+        historical_anchors = {_action_sources(task) for task in old_tasks.values()}
         for position, task in enumerate(fresh):
             action_id = assignments.get(position)
             if action_id is None:
+                anchor = _action_sources(task)
                 action_id = _anchor_id(source_sha, task,
-                    duplicate_anchor=anchor_counts[_action_sources(task)] > 1)
+                    duplicate_anchor=anchor_counts[anchor] > 1 or anchor in historical_anchors)
                 if action_id in old:
                     raise ReconciliationConflict("action ID collision", [action_id])
                 assignments[position] = action_id

@@ -188,6 +188,49 @@ class TaskStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ReconciliationConflict, "duplicate generated"):
             self.store.reconcile(SOURCE_SHA, duplicate)
 
+    def test_new_generation_does_not_inherit_ambiguous_unedited_old_action(self):
+        previous = [
+            task("Проверить X", "Проверить только вариант X.", "U00001"),
+            task("Подготовить Y", "Подготовить только вариант Y.", "U00001"),
+            task("Обсудить Z", "Обсудить только вариант Z.", "U00001"),
+        ]
+        old = self.store.reconcile(SOURCE_SHA, previous)
+        old_ids = {item["action_id"] for item in old}
+        new = task("Зафиксировать решение", "Зафиксировать выбранный вариант.", "U00001")
+        plan = self.store.preview_reconcile(SOURCE_SHA, [new])
+        self.assertEqual(len(plan.effective_tasks), 1)
+        fresh_id = plan.effective_tasks[0]["action_id"]
+        self.assertNotIn(fresh_id, old_ids)
+        self.assertEqual(self.store.commit_reconcile(plan)[0]["action_id"], fresh_id)
+        self.assertEqual(self.store.reconcile(SOURCE_SHA, [new])[0]["action_id"], fresh_id)
+        for old_item, generated in zip(old, previous):
+            self.assertEqual(self.store.get(old_item["action_id"])["description"], generated["description"])
+
+    def test_ambiguous_old_anchor_with_manual_edit_still_blocks_new_generation(self):
+        previous = [
+            task("Проверить X", "Проверить только вариант X.", "U00001"),
+            task("Подготовить Y", "Подготовить только вариант Y.", "U00001"),
+        ]
+        old = self.store.reconcile(SOURCE_SHA, previous)
+        self.store.update(old[0]["action_id"], 0, {"assignee": "А"}, "admin")
+        new = task("Зафиксировать решение", "Зафиксировать выбранный вариант.", "U00001")
+        with self.assertRaisesRegex(ReconciliationConflict, "ambiguous source action anchor"):
+            self.store.preview_reconcile(SOURCE_SHA, [new])
+        self.assertEqual(self.store.get(old[0]["action_id"])["assignee"], "А")
+
+    def test_unedited_action_split_assigns_new_distinct_ids(self):
+        original = task("Проверить X или Y", "Проверить выбранный вариант.", "U00001")
+        old_id = self.store.reconcile(SOURCE_SHA, [original])[0]["action_id"]
+        split = [
+            task("Проверить X", "Проверить только вариант X.", "U00001"),
+            task("Подготовить Y", "Подготовить только вариант Y.", "U00001"),
+        ]
+        fresh = self.store.reconcile(SOURCE_SHA, split)
+        self.assertEqual(len({item["action_id"] for item in fresh}), 2)
+        self.assertTrue(all(item["action_id"] != old_id for item in fresh))
+        self.assertEqual([item["action_id"] for item in self.store.reconcile(SOURCE_SHA, split)],
+                         [item["action_id"] for item in fresh])
+
     def test_rejects_evidence_edit_and_empty_required_content(self):
         first = self.store.reconcile(SOURCE_SHA, self.generated)[0]
         for changes in ({"source_ids": ["U00002"]}, {"field_sources": {}}, {"title": " "}, {"description": None}):
