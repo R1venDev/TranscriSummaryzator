@@ -1,6 +1,7 @@
 """Offline checks for source-first coordinates and patch boundaries."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -10,7 +11,7 @@ from summary.luna_v1.source_first_core import (
     accepted_patch_document, build_surfaces, load_snapshot, normalize_inventories, partition_surfaces,
     plan_dimensions, plan_packets, safe_mark_document, stage_patch_candidate, validate_evidence,
     validate_audit, validate_global, validate_inventory, validate_patch_plan, validate_verification,
-    remap_mark_targets,
+    remap_mark_targets, salvage_inventory,
 )
 
 
@@ -65,6 +66,31 @@ class SourceFirstCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evidence_quote"):
             validate_evidence([{"evidence_id": "E1", "u_id": "U00001",
                                 "quote": "проверить  сигнал"}], self.snapshot)
+
+    def test_evidence_normalizes_only_unique_case_and_terminal_period(self):
+        report = validate_evidence([{"evidence_id": "E1", "u_id": "U00001",
+                                     "quote": "ПРЕДЛАГАЮ."}], self.snapshot)["E1"]
+        self.assertEqual(report["quote"], "Предлагаю")
+        self.assertEqual(report["source_offset"], 0)
+        self.assertEqual(report["normalization"], "casefold_terminal_period_v1")
+        self.assertEqual(len(report["native_quote_sha256"]), 64)
+        case_only = validate_evidence([{"evidence_id": "E2", "u_id": "U00001",
+                                        "quote": "ПРЕДЛАГАЮ ПРОВЕРИТЬ СИГНАЛ."}],
+                                       self.snapshot)["E2"]
+        self.assertEqual(case_only["quote"], "Предлагаю проверить сигнал.")
+        self.assertEqual(case_only["normalization"], "casefold_source_span_v1")
+        with self.assertRaisesRegex(ValueError, "evidence_quote"):
+            validate_evidence([{"evidence_id": "E1", "u_id": "U00001",
+                                "quote": "Предлагаю не проверить сигнал."}], self.snapshot)
+        with self.assertRaisesRegex(ValueError, "evidence_quote"):
+            validate_evidence([{"evidence_id": "E1", "u_id": "U00001",
+                                "quote": "Предлагаю проверить сигнал 2."}], self.snapshot)
+        ambiguous = replace(self.snapshot, records=tuple(
+            {**row, "text": "Тест тест."} if row["id"] == "U00001" else row
+            for row in self.snapshot.records))
+        with self.assertRaisesRegex(ValueError, "evidence_quote"):
+            validate_evidence([{"evidence_id": "E1", "u_id": "U00001",
+                                "quote": "ТЕСТ"}], ambiguous)
 
     def test_negative_audit_verdict_requires_matching_finding_or_context(self):
         document = _document()
@@ -229,6 +255,53 @@ class SourceFirstCoreTests(unittest.TestCase):
         del report["source_accounting"][-1]
         with self.assertRaisesRegex(ValueError, "source_accounting_coverage"):
             validate_inventory(report, packet, self.snapshot)
+
+    def test_inventory_salvage_keeps_valid_units_and_marks_bad_accounting_uncertain(self):
+        packet = plan_packets(self.snapshot, target_chars=9999)[0]
+        report = {"schema_version": "luna_inventory_v1", "complete": True,
+            "evidence": [{"evidence_id": "E1", "u_id": "U00001",
+                          "quote": "Предлагаю проверить сигнал."}],
+            "units": [{"unit_id": "A1", "kind": "action", "text": "Проверить сигнал",
+                       "evidence_ids": ["E1"], "facets": [{"facet_id": "F1",
+                       "axis": "action", "value": "проверка", "evidence_ids": ["E1"]}]}],
+            "source_accounting": [
+                {"u_id": "U00001", "disposition": "content", "unit_ids": ["A1"], "note": None},
+                {"u_id": "U00002", "disposition": "content", "unit_ids": ["A1"], "note": None},
+                {"u_id": "U00003", "disposition": "context_only", "unit_ids": [], "note": None}],
+            "open_links": [], "unprocessed_ids": []}
+        with self.assertRaisesRegex(ValueError, "content_unit_lacks_core_evidence"):
+            validate_inventory(report, packet, self.snapshot)
+        checked = salvage_inventory(report, packet, self.snapshot)
+        self.assertFalse(checked["complete"])
+        self.assertEqual(set(checked["units"]), {"P001:A1"})
+        self.assertEqual(checked["source_accounting"]["U00002"]["disposition"], "uncertain")
+        self.assertEqual(checked["uncertain_core_ids"], ["U00002"])
+        self.assertEqual(checked["native_report"], report)
+
+    def test_inventory_salvage_discards_unit_with_missing_evidence_and_fails_on_collisions(self):
+        packet = plan_packets(self.snapshot, target_chars=9999)[0]
+        report = {"schema_version": "luna_inventory_v1", "complete": True,
+            "evidence": [{"evidence_id": "E1", "u_id": "U00001",
+                          "quote": "Предлагаю проверить сигнал."}],
+            "units": [
+                {"unit_id": "A1", "kind": "action", "text": "Проверить сигнал",
+                 "evidence_ids": ["E1"], "facets": []},
+                {"unit_id": "A2", "kind": "action", "text": "Взять другую запись",
+                 "evidence_ids": ["E2"], "facets": []}],
+            "source_accounting": [
+                {"u_id": "U00001", "disposition": "content", "unit_ids": ["A1"], "note": None},
+                {"u_id": "U00002", "disposition": "content", "unit_ids": ["A2"], "note": None},
+                {"u_id": "U00003", "disposition": "context_only", "unit_ids": [], "note": None}],
+            "open_links": [], "unprocessed_ids": []}
+        checked = salvage_inventory(report, packet, self.snapshot)
+        self.assertEqual(set(checked["units"]), {"P001:A1"})
+        self.assertFalse(checked["complete"])
+        self.assertEqual(checked["source_accounting"]["U00002"]["disposition"], "uncertain")
+        self.assertIn({"kind": "unit", "id": "A2", "reason": "unit_evidence_invalid"},
+                      checked["discarded"])
+        report["evidence"].append(report["evidence"][0].copy())
+        with self.assertRaisesRegex(ValueError, "evidence_identity_invalid"):
+            salvage_inventory(report, packet, self.snapshot)
 
     def test_needs_review_survives_exact_snapshot_and_source_packet(self):
         path = self.snapshot.transcript_path

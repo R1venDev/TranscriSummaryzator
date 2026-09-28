@@ -149,11 +149,53 @@ def validate_evidence(evidence: list[dict], snapshot: SourceSnapshot,
     for item in evidence:
         evidence_id, u_id, quote = item["evidence_id"], item["u_id"], item["quote"]
         if (not evidence_id or evidence_id in checked or u_id not in known
-                or not isinstance(quote, str) or not quote.strip()
-                or exact[u_id].count(quote) != 1):
+                or not isinstance(quote, str) or not quote.strip()):
             raise ValueError("evidence_quote_or_identity_invalid")
-        checked[evidence_id] = {**item, "source_offset": exact[u_id].index(quote),
-                                "source_sha256": snapshot.source_sha256}
+        source = exact[u_id]
+        if source.count(quote) == 1:
+            checked[evidence_id] = {**item, "source_offset": source.index(quote),
+                                    "source_sha256": snapshot.source_sha256}
+            continue
+        # Luna sometimes changes capitalization or appends one sentence-final
+        # full stop. Resolve only a unique, otherwise character-identical
+        # span in the *same* utterance. Never repair words, numbers, spaces,
+        # negation, or other punctuation here. The immutable native report
+        # retains the original quote; this normalized copy records its hash.
+        candidates = [quote]
+        if quote.endswith(".") and not quote.endswith(".."):
+            candidates.append(quote[:-1])
+        folded = ""
+        source_offsets: list[int] = []
+        for offset, char in enumerate(source):
+            part = char.casefold()
+            folded += part
+            source_offsets.extend([offset] * len(part))
+        resolved = None
+        for candidate in candidates:
+            needle = candidate.casefold()
+            start = folded.find(needle)
+            if (not needle or start < 0 or folded.find(needle, start + 1) >= 0):
+                continue
+            end = start + len(needle)
+            if ((start and source_offsets[start - 1] == source_offsets[start])
+                    or (end < len(source_offsets)
+                        and source_offsets[end - 1] == source_offsets[end])):
+                continue
+            source_start = source_offsets[start]
+            source_end = source_offsets[end - 1] + 1
+            span = source[source_start:source_end]
+            if source.count(span) == 1:
+                resolved = (span, source_start, "casefold_source_span_v1" if
+                            candidate == quote else "casefold_terminal_period_v1")
+                break
+        if resolved is None:
+            raise ValueError("evidence_quote_or_identity_invalid")
+        span, source_start, rule = resolved
+        checked[evidence_id] = {**item, "quote": span, "source_offset": source_start,
+                                "source_sha256": snapshot.source_sha256,
+                                "normalization": rule,
+                                "native_quote_sha256": hashlib.sha256(
+                                    quote.encode("utf-8")).hexdigest()}
     return checked
 
 
@@ -222,6 +264,130 @@ def validate_inventory(raw: dict, packet: dict, snapshot: SourceSnapshot) -> dic
             "evidence": evidence, "units": units, "facets": facets,
             "source_accounting": accounts, "open_links": links,
             "unprocessed_ids": report["unprocessed_ids"], "native_report": raw}
+
+
+def salvage_inventory(raw: dict, packet: dict, snapshot: SourceSnapshot) -> dict:
+    """Keep coordinate-valid inventory rows without claiming complete review.
+
+    The native report remains immutable. A missing or nonliteral citation never
+    becomes source evidence; dependent units/facets are removed and affected
+    core IDs are marked uncertain. Ambiguous identities fail closed.
+    """
+    report = parse_stage_report("extract", raw).model_dump(mode="json")
+    core_ids = packet["core_ids"]
+    core = set(core_ids)
+    source_ids = {row["id"] for row in packet["records"]}
+    if len(core_ids) != len(core) or any(u not in core for u in report["unprocessed_ids"]):
+        raise ValueError("inventory_salvage_source_identity_invalid")
+
+    def unique_nonempty(values: list[str], label: str) -> None:
+        if any(not value for value in values) or len(values) != len(set(values)):
+            raise ValueError(label + "_identity_invalid")
+
+    unique_nonempty([item["evidence_id"] for item in report["evidence"]], "evidence")
+    unique_nonempty([item["unit_id"] for item in report["units"]], "source_unit")
+    for unit in report["units"]:
+        unique_nonempty([facet["facet_id"] for facet in unit["facets"]], "source_facet")
+    account_ids = [row["u_id"] for row in report["source_accounting"]]
+    if len(account_ids) != len(set(account_ids)) or any(u not in core for u in account_ids):
+        raise ValueError("source_accounting_identity_invalid")
+
+    discarded: list[dict[str, str]] = []
+    affected: set[str] = set(report["unprocessed_ids"])
+    retained_evidence = []
+    checked_evidence = {}
+    for item in report["evidence"]:
+        try:
+            checked = validate_evidence([item], snapshot, permitted_ids=source_ids)
+        except ValueError:
+            discarded.append({"kind": "evidence", "id": item["evidence_id"],
+                              "reason": "quote_or_source_identity_invalid"})
+            if item["u_id"] in core:
+                affected.add(item["u_id"])
+        else:
+            retained_evidence.append(item)
+            checked_evidence.update(checked)
+
+    retained_units = []
+    retained_unit_ids = set()
+    for unit in report["units"]:
+        cited_core = {checked_evidence[ref]["u_id"] for ref in unit["evidence_ids"]
+                      if ref in checked_evidence and checked_evidence[ref]["u_id"] in core}
+        valid_unit = (bool(unit["text"].strip()) and bool(unit["evidence_ids"])
+                      and all(ref in checked_evidence for ref in unit["evidence_ids"])
+                      and bool(cited_core))
+        if not valid_unit:
+            discarded.append({"kind": "unit", "id": unit["unit_id"],
+                              "reason": "unit_evidence_invalid"})
+            affected.update(cited_core)
+            continue
+        clean = deepcopy(unit)
+        clean["facets"] = []
+        for facet in unit["facets"]:
+            if (not facet["value"].strip() or not facet["evidence_ids"]
+                    or any(ref not in checked_evidence for ref in facet["evidence_ids"])):
+                discarded.append({"kind": "facet", "id": unit["unit_id"] + ":" + facet["facet_id"],
+                                  "reason": "facet_evidence_invalid"})
+                affected.update(cited_core)
+                continue
+            clean["facets"].append(facet)
+        retained_units.append(clean)
+        retained_unit_ids.add(unit["unit_id"])
+
+    account_by_id = {row["u_id"]: row for row in report["source_accounting"]}
+    retained_accounting = []
+    for u_id in core_ids:
+        row = account_by_id.get(u_id)
+        if row is None:
+            discarded.append({"kind": "source_accounting", "id": u_id,
+                              "reason": "accounting_missing"})
+            affected.add(u_id)
+            retained_accounting.append({"u_id": u_id, "disposition": "uncertain",
+                                        "unit_ids": [], "note": "local_inventory_salvage"})
+            continue
+        clean = deepcopy(row)
+        clean["unit_ids"] = [ref for ref in row["unit_ids"] if ref in retained_unit_ids]
+        if len(clean["unit_ids"]) != len(row["unit_ids"]):
+            affected.add(u_id)
+            discarded.append({"kind": "source_accounting", "id": u_id,
+                              "reason": "unit_reference_discarded"})
+        if row["disposition"] == "content" and not any(
+                any(checked_evidence[ref]["u_id"] == u_id
+                    for ref in unit["evidence_ids"])
+                for unit in retained_units if unit["unit_id"] in clean["unit_ids"]):
+            affected.add(u_id)
+            discarded.append({"kind": "source_accounting", "id": u_id,
+                              "reason": "content_without_own_source_evidence"})
+        if u_id in affected:
+            clean["disposition"] = "uncertain"
+            clean["note"] = "local_inventory_salvage"
+        retained_accounting.append(clean)
+
+    retained_links = []
+    for number, link in enumerate(report["open_links"]):
+        if (link["unit_id"] not in retained_unit_ids
+                or any(ref not in checked_evidence for ref in link["evidence_ids"])):
+            discarded.append({"kind": "open_link", "id": str(number),
+                              "reason": "link_evidence_or_unit_invalid"})
+            affected.update(row["u_id"] for row in retained_accounting
+                            if link["unit_id"] in row["unit_ids"])
+            continue
+        retained_links.append(link)
+    for row in retained_accounting:
+        if row["u_id"] in affected:
+            row["disposition"] = "uncertain"
+            row["note"] = "local_inventory_salvage"
+
+    sanitized = {**report, "complete": False, "evidence": retained_evidence,
+                 "units": retained_units, "source_accounting": retained_accounting,
+                 "open_links": retained_links}
+    checked = validate_inventory(sanitized, packet, snapshot)
+    checked["native_report"] = raw
+    checked["salvaged"] = True
+    checked["discarded"] = discarded
+    checked["uncertain_core_ids"] = [u_id for u_id in core_ids
+                                     if checked["source_accounting"][u_id]["disposition"] == "uncertain"]
+    return checked
 
 
 def normalize_inventories(inventories: list[dict], packets: tuple[dict, ...],

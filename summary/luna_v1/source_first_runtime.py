@@ -47,7 +47,7 @@ from .source_first_core import (
     POLICY_VERSION, SourceSnapshot, accepted_patch_document, build_surfaces,
     canonical_bytes, digest, load_snapshot, normalize_inventories,
     partition_surfaces, plan_dimensions, plan_packets, stage_patch_candidate,
-    validate_audit, validate_global, validate_inventory, validate_patch_plan,
+    salvage_inventory, validate_audit, validate_global, validate_inventory, validate_patch_plan,
     validate_verification, safe_mark_document, remap_mark_targets,
 )
 from .tasks import ReconciliationConflict, RevisionConflict, TaskStore
@@ -1018,8 +1018,11 @@ def _inventory_or_placeholder(raw: dict | None, packet: dict,
     if raw is not None:
         try:
             return validate_inventory(raw, packet, snapshot), None
-        except (ValueError, KeyError, TypeError) as exc:
-            reason = "inventory_validation_failed"
+        except (ValueError, KeyError, TypeError):
+            try:
+                return salvage_inventory(raw, packet, snapshot), "inventory_salvaged_incomplete"
+            except (ValueError, KeyError, TypeError):
+                reason = "inventory_validation_failed"
     else:
         reason = "inventory_item_unavailable"
     return {
