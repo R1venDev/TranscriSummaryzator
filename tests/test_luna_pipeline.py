@@ -540,6 +540,8 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
         self.assertIn('id="u-U00001"', result_page)
         self.assertIn('id="u-U00002"', result_page)
         self.assertEqual(result_page.count('id="t-400"'), 1)
+        self.assertIn('class="turn"><time><span id="t-400"></span>', result_page)
+        self.assertIn('</time><div class="speech">', result_page)
 
 
 if __name__ == "__main__":
