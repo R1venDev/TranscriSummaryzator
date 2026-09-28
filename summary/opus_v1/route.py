@@ -117,14 +117,14 @@ class Route:
 
 def verify_batch_route(
     client: BatchClient, request_body: dict[str, Any], *,
-    max_output_tokens: int, as_of=None,
+    max_output_tokens: int, as_of=None, allow_prompt_json: bool = False,
 ) -> Route:
     """Verify this key/model/endpoint and reserve a full-miss price bound.
 
     `as_of` is retained for test/caller compatibility; live prices come from
     current route metadata, not a calendar-dated tariff constant.
     """
-    request = canonical_request(request_body)
+    request = canonical_request(request_body, allow_prompt_json=allow_prompt_json)
     if (type(max_output_tokens) is not int
             or request["max_completion_tokens"] != max_output_tokens):
         raise RouteBlocked("output_cap_mismatch")
@@ -144,8 +144,10 @@ def verify_batch_route(
         raise RouteBlocked("model_not_allowed_for_key")
     if model.get("id") != MODEL or endpoint_data.get("id") != MODEL:
         raise RouteBlocked("batch_model_identity_changed")
+    required_params = ({"reasoning"} if allow_prompt_json
+                       else {"response_format", "reasoning"})
     params = model.get("supported_parameters")
-    if not isinstance(params, list) or not {"response_format", "reasoning"}.issubset(set(params)):
+    if not isinstance(params, list) or not required_params.issubset(set(params)):
         raise RouteBlocked("required_parameters_unavailable")
     endpoints = endpoint_data.get("endpoints")
     if not isinstance(endpoints, list):
@@ -159,7 +161,7 @@ def verify_batch_route(
         raise RouteBlocked("anthropic_endpoint_unverified")
     endpoint = anthropic[0]
     ep_params = endpoint.get("supported_parameters")
-    if isinstance(ep_params, list) and not {"response_format", "reasoning"}.issubset(set(ep_params)):
+    if isinstance(ep_params, list) and not required_params.issubset(set(ep_params)):
         raise RouteBlocked("endpoint_parameters_unavailable")
     context = _positive_int(model.get("context_length"))
     top = model.get("top_provider")

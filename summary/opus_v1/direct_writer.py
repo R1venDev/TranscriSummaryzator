@@ -16,7 +16,7 @@ from pathlib import Path
 
 from scripts.summary_credentials import (CredentialError, CredentialStore,
                                          credential_dispatch_guard)
-from summary.luna_v1.contract import SCHEMA, SCHEMA_ID, validate_document
+from summary.luna_v1.contract import SCHEMA, validate_document
 from summary.luna_v1.ledger import (Ledger, OPUS_DIRECT_CALL_CAP_MICROUSD,
                                     OPUS_DIRECT_KIND, OPUS_DIRECT_POLICY,
                                     OPUS_DIRECT_WEEK_CAP_MICROUSD,
@@ -30,7 +30,7 @@ from .batch import (BATCH_MODEL_IDS, MODEL, PRIVACY_MODE, PROVIDER,
 from .route import RouteBlocked, verify_batch_route
 
 
-PROMPT_PATH = Path(__file__).with_name("prompt_direct_writer_v1.md")
+PROMPT_PATH = Path(__file__).with_name("prompt_direct_writer_v2.md")
 OUTPUT_CAP = 24_000
 REASONING_EFFORT = "low"
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}\Z")
@@ -52,14 +52,18 @@ def build_request(source_text: str) -> dict:
             or not isinstance(source.get("utterances"), list)
             or not source["utterances"]):
         raise ValueError("noncanonical_transcript_source")
+    # The production schema remains the local acceptance contract. Passing it
+    # as a provider grammar failed for the full document; here it is static
+    # instruction text, and the entire response is validated locally.
+    instructions = (PROMPT_PATH.read_text(encoding="utf-8")
+                    + "\n\n<output_schema_json>\n"
+                    + _json_bytes(SCHEMA).decode("utf-8")
+                    + "\n</output_schema_json>")
     return {
         "messages": [
-            {"role": "system", "content": PROMPT_PATH.read_text(encoding="utf-8")},
+            {"role": "system", "content": instructions},
             {"role": "user", "content": source_text},
         ],
-        "response_format": {"type": "json_schema", "json_schema": {
-            "name": SCHEMA_ID, "strict": True, "schema": SCHEMA,
-        }},
         "max_completion_tokens": OUTPUT_CAP,
         "reasoning": {"effort": REASONING_EFFORT},
     }
@@ -157,6 +161,7 @@ def _seal_reserved(*, ledger: Ledger, job: dict, plan: dict,
         "workspace_io_logging_enabled": WORKSPACE_IO_LOGGING_ENABLED,
         "prompt_sha256": plan["prompt_sha256"],
         "schema_sha256": plan["schema_sha256"],
+        "output_contract": "prompt_json_with_local_luna_summary_v1_validation",
         "request_sha256": plan["request_sha256"],
         "inline_request_count": 1,
         "max_completion_tokens": OUTPUT_CAP,
@@ -195,7 +200,8 @@ def _dispatch(ledger: Ledger, job: dict, *, store: CredentialStore,
     if not ledger.mark_submitting(job["id"]):
         return {"status": "submission_state_conflict", "job_id": job["id"]}
     try:
-        reply = client_factory(token).submit(job["custom_id"], request)
+        reply = client_factory(token).submit(job["custom_id"], request,
+                                             allow_prompt_json=True)
         write_private_json(artifacts / "submit_response.json", reply.body)
         remote_id = batch_id_from_submit(reply.body)
         if reply.status_code != 202:
@@ -245,7 +251,8 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
                     token = store.reveal_for_dispatch(selected["id"], selected["version"],
                                                       role="judge")
                     route = route_factory(client_factory(token), plan["request"],
-                                          max_output_tokens=OUTPUT_CAP)
+                                          max_output_tokens=OUTPUT_CAP,
+                                          allow_prompt_json=True)
                     _seal_reserved(ledger=ledger, job=prior, plan=plan,
                                    transcript_path=transcript_path, output_dir=output_dir,
                                    run_id=run_id, route=route)
@@ -256,7 +263,8 @@ def submit(*, transcript_path: Path, output_dir: Path, private_root: Path,
             token = store.reveal_for_dispatch(selected["id"], selected["version"],
                                               role="judge")
             route = route_factory(client_factory(token), plan["request"],
-                                  max_output_tokens=OUTPUT_CAP)
+                                  max_output_tokens=OUTPUT_CAP,
+                                  allow_prompt_json=True)
             if route.workspace_id != selected["workspace_id"]:
                 raise RouteBlocked("credential_workspace_changed_since_check")
             reserve = route.reserve_microusd(limit_microusd=OPUS_DIRECT_CALL_CAP_MICROUSD)

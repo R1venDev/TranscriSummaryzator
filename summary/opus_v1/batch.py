@@ -66,8 +66,14 @@ class Reply:
     body: dict[str, Any]
 
 
-def canonical_request(request_body: dict[str, Any]) -> dict[str, Any]:
-    """Accept only a text-only Opus Chat judge with bounded JSON output."""
+def canonical_request(request_body: dict[str, Any], *,
+                      allow_prompt_json: bool = False) -> dict[str, Any]:
+    """Accept a bounded text-only Opus request.
+
+    Audits require strict structured output. The isolated direct writer may
+    explicitly opt into prompt-only JSON after its schema proved too complex
+    for Anthropic's grammar compiler; local validation still gates the result.
+    """
     if not isinstance(request_body, dict):
         raise ValueError("invalid_chat_request")
     allowed = {"messages", "response_format", "max_completion_tokens",
@@ -87,17 +93,21 @@ def canonical_request(request_body: dict[str, Any]) -> dict[str, Any]:
     cap = request_body.get("max_completion_tokens")
     if type(cap) is not int or not 1 <= cap <= 128_000:
         raise ValueError("invalid_output_cap")
-    fmt = request_body.get("response_format")
-    if (not isinstance(fmt, dict) or set(fmt) != {"type", "json_schema"}
-            or fmt["type"] != "json_schema"):
-        raise ValueError("structured_output_required")
-    schema = fmt["json_schema"]
-    if (not isinstance(schema, dict)
-            or set(schema) != {"name", "strict", "schema"}
-            or not isinstance(schema["name"], str) or not schema["name"]
-            or schema["strict"] is not True
-            or not isinstance(schema["schema"], dict)):
-        raise ValueError("invalid_output_schema")
+    if "response_format" not in request_body:
+        if not allow_prompt_json:
+            raise ValueError("structured_output_required")
+    else:
+        fmt = request_body["response_format"]
+        if (not isinstance(fmt, dict) or set(fmt) != {"type", "json_schema"}
+                or fmt["type"] != "json_schema"):
+            raise ValueError("structured_output_required")
+        schema = fmt["json_schema"]
+        if (not isinstance(schema, dict)
+                or set(schema) != {"name", "strict", "schema"}
+                or not isinstance(schema["name"], str) or not schema["name"]
+                or schema["strict"] is not True
+                or not isinstance(schema["schema"], dict)):
+            raise ValueError("invalid_output_schema")
     if (not isinstance(request_body.get("reasoning"), dict)
             or set(request_body["reasoning"]) != {"effort"}
             or request_body["reasoning"]["effort"] not in {"low", "medium", "high", "xhigh", "max"}):
@@ -169,10 +179,11 @@ class BatchClient:
         # The endpoints API requires the variant colon percent-encoded.
         return self._request("GET", "/models/anthropic/claude-opus-5.5%3Abatch/endpoints")
 
-    def submit(self, custom_id: str, request_body: dict[str, Any]) -> Reply:
+    def submit(self, custom_id: str, request_body: dict[str, Any], *,
+               allow_prompt_json: bool = False) -> Reply:
         if not isinstance(custom_id, str) or _CUSTOM_ID.fullmatch(custom_id) is None:
             raise ValueError("invalid custom_id")
-        request = canonical_request(request_body)
+        request = canonical_request(request_body, allow_prompt_json=allow_prompt_json)
         # OpenRouter stream-parses the object: headers must precede requests.
         payload = {
             "endpoint": "/v1/chat/completions", "model": MODEL,

@@ -19,7 +19,8 @@ WEEK_CAP_MICROUSD = 1_000_000
 # same rolling sum; unrelated runs keep WEEK_CAP_MICROUSD.
 OPUS_V3_TRIAL_WEEK_CAP_MICROUSD = 2_000_000
 OPUS_V3_TRIAL_POLICY = "claude_opus_5_5_partitioned_audit_v3"
-OPUS_DIRECT_POLICY = "claude_opus_5_5_direct_writer_v1"
+OPUS_DIRECT_POLICY_V1 = "claude_opus_5_5_direct_writer_v1"
+OPUS_DIRECT_POLICY = "claude_opus_5_5_direct_writer_v2_prompt_json"
 OPUS_DIRECT_KIND = "opus_direct_writer"
 OPUS_DIRECT_WEEK_CAP_MICROUSD = 1_600_000
 OPUS_DIRECT_CALL_CAP_MICROUSD = 550_000
@@ -309,7 +310,7 @@ class Ledger:
             if (row["quality_policy_version"] == OPUS_V3_TRIAL_POLICY
                     and row["cap_microusd"] == OPUS_V3_TRIAL_WEEK_CAP_MICROUSD):
                 return OPUS_V3_TRIAL_WEEK_CAP_MICROUSD
-            if (row["quality_policy_version"] == OPUS_DIRECT_POLICY
+            if (row["quality_policy_version"] in {OPUS_DIRECT_POLICY_V1, OPUS_DIRECT_POLICY}
                     and row["cap_microusd"] == OPUS_DIRECT_WEEK_CAP_MICROUSD):
                 return OPUS_DIRECT_WEEK_CAP_MICROUSD
         return WEEK_CAP_MICROUSD

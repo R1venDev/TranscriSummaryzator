@@ -143,6 +143,31 @@ class OpusBatchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_reasoning_profile"):
             canonical_request(bad)
 
+    def test_prompt_only_json_is_explicit_direct_writer_exception(self):
+        request = _request()
+        del request["response_format"]
+        with self.assertRaisesRegex(ValueError, "structured_output_required"):
+            canonical_request(request)
+        self.assertEqual(canonical_request(request, allow_prompt_json=True), request)
+        opener = _Opener((202, {"id": "batch_direct_001", "status": "validating"}))
+        client = BatchClient("fake-secret", opener=opener)
+        with self.assertRaisesRegex(ValueError, "structured_output_required"):
+            client.submit("direct.001", request)
+        self.assertEqual(opener.calls, [])
+        client.submit("direct.001", request, allow_prompt_json=True)
+        self.assertEqual(json.loads(opener.calls[0][0].data)["requests"][0]["body"], request)
+        bad = dict(request, tools=[])
+        with self.assertRaisesRegex(ValueError, "unapproved_chat_parameter"):
+            canonical_request(bad, allow_prompt_json=True)
+        route = verify_batch_route(
+            BatchClient("fake-secret", opener=_Opener(*_route_replies())),
+            request, max_output_tokens=1000, allow_prompt_json=True)
+        self.assertEqual(route.provider, PROVIDER)
+        with self.assertRaisesRegex(ValueError, "structured_output_required"):
+            verify_batch_route(
+                BatchClient("fake-secret", opener=_Opener(*_route_replies())),
+                request, max_output_tokens=1000)
+
     def test_redacted_transport_and_exact_terminal_item(self):
         secret, source = "fake-secret-do-not-log", "PRIVATE CONTENT DO NOT LOG"
         error = urllib.error.HTTPError(

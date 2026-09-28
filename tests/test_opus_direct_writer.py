@@ -9,9 +9,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from summary.luna_v1.engine import poll_once
-from summary.luna_v1.ledger import Ledger, OPUS_DIRECT_KIND
+from summary.luna_v1.contract import SCHEMA
+from summary.luna_v1.ledger import (Ledger, OPUS_DIRECT_KIND, OPUS_DIRECT_POLICY,
+                                    OPUS_DIRECT_POLICY_V1)
 from summary.luna_v1.source import load_source
-from summary.opus_v1.batch import BatchError, MODEL, Reply
+from summary.opus_v1.batch import BatchError, MODEL, Reply, canonical_request
 from summary.opus_v1.direct_writer import authorize, submit
 from tests.test_opus_engine import _SavedKeys, _source
 
@@ -49,7 +51,9 @@ class _Client:
     def __init__(self, token):
         assert token == "synthetic-openrouter-judge"
 
-    def submit(self, custom_id, request_body):
+    def submit(self, custom_id, request_body, *, allow_prompt_json=False):
+        assert allow_prompt_json is True
+        canonical_request(request_body, allow_prompt_json=True)
         type(self).posts += 1
         batch_id = f"batch_direct_{type(self).posts:03d}"
         type(self).submissions[batch_id] = (custom_id, request_body)
@@ -61,7 +65,8 @@ class _Client:
     def get(self, batch_id):
         custom_id, request = type(self).submissions[batch_id]
         document = _document() if type(self).mode != "invalid" else {"wrong": True}
-        message = ({"content": json.dumps(document, ensure_ascii=False)}
+        message = ({"content": ("{invalid" if type(self).mode == "invalid_json"
+                                else json.dumps(document, ensure_ascii=False))}
                    if type(self).mode != "invalid_message" else ["malformed"])
         body = {"model": MODEL, "choices": [{"finish_reason": "stop",
                                               "message": message}]}
@@ -76,9 +81,11 @@ class _Client:
         return Reply(200, {"id": batch_id, "deleted": True})
 
 
-def _route(_client, request, *, max_output_tokens):
+def _route(_client, request, *, max_output_tokens, allow_prompt_json=False):
     assert max_output_tokens == 24_000
-    assert request["response_format"]["json_schema"]["name"] == "luna_summary_v1"
+    assert allow_prompt_json is True
+    assert "response_format" not in request
+    canonical_request(request, allow_prompt_json=True)
     return SimpleNamespace(
         workspace_id="judge-workspace", reserve_microusd=lambda **kw: 95_000,
         prompt_usd_per_token="0.000002", completion_usd_per_token="0.00001",
@@ -98,15 +105,27 @@ class DirectOpusWriterTests(unittest.TestCase):
 
     def _authorize(self, transcript, output, private):
         return authorize(transcript_path=transcript, output_dir=output,
-                         private_root=private, run_id="opus-direct-test-001",
-                         authorization_ref="user-20260928-opus-direct-trial-1p6",
+                         private_root=private, run_id="opus-direct-v2-test-001",
+                         authorization_ref="user-20260928-opus-direct-v2-trial-1p6",
                          store_factory=lambda _root: _SavedKeys())
 
     def _submit(self, transcript, output, private):
         return submit(transcript_path=transcript, output_dir=output,
-                      private_root=private, run_id="opus-direct-test-001",
+                      private_root=private, run_id="opus-direct-v2-test-001",
                       client_factory=_Client, store_factory=lambda _root: _SavedKeys(),
                       route_factory=_route)
+
+    def test_historical_v1_cap_remains_readable_without_reusing_authorization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Ledger(Path(tmp))
+            ledger.db.execute("""INSERT INTO weekly_spending_authorizations
+                (semantic_key,source_sha256,output_dir,quality_policy_version,
+                 authorization_ref,cap_microusd,authorized_at,root_job_id)
+                VALUES (?,?,?,?,?,?,?,?)""",
+                ("a" * 64, "b" * 64, "/old/isolated", OPUS_DIRECT_POLICY_V1,
+                 "historical-v1", 1_600_000, 1.0, "old-root"))
+            self.assertEqual(ledger.weekly_cap_microusd("old-root"), 1_600_000)
+            ledger.close()
 
     def test_exact_authorization_one_post_full_source_terminal_and_no_publication(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +143,14 @@ class DirectOpusWriterTests(unittest.TestCase):
             self.assertEqual(again["job_id"], started["job_id"])
             self.assertEqual(_Client.posts, 1)
             submitted = next(iter(_Client.submissions.values()))[1]
+            self.assertEqual(OPUS_DIRECT_POLICY, "claude_opus_5_5_direct_writer_v2_prompt_json")
+            self.assertNotIn("response_format", submitted)
+            with self.assertRaisesRegex(ValueError, "structured_output_required"):
+                canonical_request(submitted)
+            system = submitted["messages"][0]["content"]
+            schema_text = system.split("<output_schema_json>\n", 1)[1].split(
+                "\n</output_schema_json>", 1)[0]
+            self.assertEqual(json.loads(schema_text), SCHEMA)
             self.assertEqual(json.loads(submitted["messages"][1]["content"]),
                              json.loads(load_source(transcript)[0]))
             self.assertNotIn("DRAFT_DOCUMENT", submitted["messages"][1]["content"])
@@ -202,6 +229,31 @@ class DirectOpusWriterTests(unittest.TestCase):
             self.assertEqual(job["status"], "failed_validation")
             self.assertTrue((Path(job["artifact_dir"]) / "native_response.json").is_file())
             self.assertFalse((output / "summary_current.json").exists())
+
+    def test_invalid_json_retains_exact_raw_without_retry_or_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript, output, private = self._paths(Path(tmp))
+            self._authorize(transcript, output, private)
+            _Client.mode = "invalid_json"
+            started = self._submit(transcript, output, private)
+            ledger = Ledger(private)
+            ledger.db.execute("UPDATE jobs SET next_poll_at=0 WHERE id=?", (started["job_id"],))
+            ledger.close()
+            with patch("summary.luna_v1.engine._credential_store", return_value=_SavedKeys()):
+                outcomes = poll_once(private_root=private, opus_client_factory=_Client)
+            self.assertTrue(any(item["status"] == "failed_validation" for item in outcomes))
+            ledger = Ledger(private)
+            job = ledger.get(started["job_id"])
+            ledger.close()
+            artifacts = Path(job["artifact_dir"])
+            self.assertEqual(job["status"], "failed_validation")
+            self.assertEqual(json.loads((artifacts / "native_response.json").read_text())["text"],
+                             "{invalid")
+            self.assertFalse((artifacts / "candidate_document.json").exists())
+            self.assertFalse((output / "summary_current.json").exists())
+            self.assertEqual(self._submit(transcript, output, private)["status"],
+                             "failed_validation")
+            self.assertEqual(_Client.posts, 1)
 
     def test_malformed_message_is_failed_validation_without_scheduler_crash(self):
         with tempfile.TemporaryDirectory() as tmp:
