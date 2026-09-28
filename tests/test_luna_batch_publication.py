@@ -1,14 +1,17 @@
 """Publication and identity boundaries for the source-first Batch path."""
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from summary.luna_v1 import load_source
-from summary.luna_v1.publication import publish_document
+from summary.luna_v1.publication import adopt_sealed_generation, publish_document
 from summary.luna_v1.render import render_document
 from summary.luna_v1.tasks import ReconciliationConflict, TaskStore
 from tests.test_luna_task_api import fake_document
@@ -139,6 +142,74 @@ class BatchPublicationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "review_sidecar_quality_status_mismatch"):
                     self._publish(sidecar=sidecar, status=quality_status)
                 self.assertFalse((self.output / "summary_current.json").exists())
+
+    def test_adoption_preserves_old_pointer_and_manual_task_edit(self):
+        peer = self.root / "real-output"
+        peer.mkdir()
+        peer_source = peer / "transcript.json"
+        shutil.copyfile(self.source, peer_source)
+        store = TaskStore(self.root / "private" / "tasks.sqlite3")
+
+        def publish_at(output, transcript, generation_id, created_at, *, accepted):
+            plan = store.preview_reconcile(self.source_sha, self.document["tasks"])
+            with patch("summary.luna_v1.publication.datetime") as clock:
+                clock.now.return_value = created_at
+                return publish_document(
+                    document=self.document, source_index=self.index,
+                    transcript_path=transcript, output_dir=output,
+                    semantic_key="accepted-key" if accepted else "old-key",
+                    job_id="accepted-job" if accepted else "old-job",
+                    remote_batch_id="batch-accepted" if accepted else "batch-old",
+                    credential_id="credential-1", prompt_sha256="a" * 64,
+                    schema_sha256="b" * 64,
+                    effective_tasks=plan.effective_tasks,
+                    generation_id=generation_id,
+                    quality_review={"status": "source_first_checked",
+                                    "unresolved_count": 0} if accepted else None,
+                    review_sidecar=_sidecar() if accepted else None,
+                    before_pointer=lambda: store.commit_reconcile(plan),
+                )
+
+        old_id, _ = publish_at(peer, peer_source,
+            "20260927-010203-" + "b" * 12,
+            datetime(2026, 9, 27, 1, 2, 3, tzinfo=timezone.utc), accepted=False)
+        new_id, donor = publish_at(self.output, self.source,
+            "20260928-010203-" + "a" * 12,
+            datetime(2026, 9, 28, 1, 2, 3, tzinfo=timezone.utc), accepted=True)
+        old_pointer = (peer / "summary_current.json").read_bytes()
+        action_id = json.loads((donor / "tasks.json").read_text())[0]["action_id"]
+        store.update(action_id, 0, {"assignee": "А"}, actor="test-admin")
+        args = dict(source_generation=donor, source_output_dir=self.output,
+            output_dir=peer, transcript_path=peer_source,
+            task_db_path=self.root / "private" / "tasks.sqlite3",
+            source_sha256=self.source_sha, semantic_key="accepted-key",
+            job_id="accepted-job", credential_id="credential-1",
+            remote_batch_id="batch-accepted", prompt_sha256="a" * 64,
+            schema_sha256="b" * 64,
+            accepted_document_sha256=_sha(donor / "model_document.json"))
+
+        original_summary = (donor / "summary.md").read_bytes()
+        (donor / "summary.md").write_bytes(b"tampered")
+        with self.assertRaises(ValueError):
+            adopt_sealed_generation(**args)
+        self.assertEqual((peer / "summary_current.json").read_bytes(), old_pointer)
+        (donor / "summary.md").write_bytes(original_summary)
+
+        with patch("summary.luna_v1.publication._switch_pointer",
+                   side_effect=OSError("simulated pointer crash")):
+            with self.assertRaisesRegex(OSError, "simulated pointer crash"):
+                adopt_sealed_generation(**args)
+        self.assertEqual((peer / "summary_current.json").read_bytes(), old_pointer)
+        selected_id, selected = adopt_sealed_generation(**args)
+        self.assertEqual(selected_id, new_id)
+        self.assertEqual(selected, peer / "summary_generations" / new_id)
+        from pipeline import current_summary_output
+        self.assertEqual(current_summary_output(peer), selected)
+        from summary.luna_v1.task_api import read_current
+        self.assertEqual(read_current(peer, peer_source, args["task_db_path"],
+            current_summary_output).tasks[0]["assignee"], "А")
+        self.assertTrue((peer / "summary_generations" / old_id).is_dir())
+        self.assertEqual(adopt_sealed_generation(**args)[0], new_id)
 
 
 class SourceActionIdentityTests(unittest.TestCase):

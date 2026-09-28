@@ -1018,7 +1018,8 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                         additional_unit: bool = False,
                         source_revision_drift: bool = False,
                         verification_new_finding: bool = False,
-                        truncated_stage: str | None = None):
+                        truncated_stage: str | None = None,
+                        adopt_to_peer: bool = False):
         transcript = Path(self.temp.name) / "transcript.json"
         transcript.write_text(json.dumps({
             "source": "01.01.2026 test.mkv", "duration_seconds": 18,
@@ -1195,6 +1196,16 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                 output_dir=output, private_root=replay_private_root,
                 client_factory=lambda token: client)
             self.assertEqual(submitted["status"], "submitted")
+            if adopt_to_peer:
+                peer = Path(self.temp.name) / "peer-output"
+                peer.mkdir()
+                (peer / "transcript.json").write_bytes(transcript.read_bytes())
+                active = submit_source_first(transcript_path=peer / "transcript.json",
+                    output_dir=peer, private_root=replay_private_root,
+                    client_factory=lambda token: client)
+                self.assertEqual(active["status"], "source_identity_output_conflict")
+                self.assertEqual(client.posts, ["writer", "extract"])
+                self.assertFalse((peer / "summary_current.json").exists())
             if source_revision_drift:
                 transcript.write_text(transcript.read_text(encoding="utf-8").replace(
                     "Или взять другую запись.", "Или взять исправленную запись."),
@@ -1288,9 +1299,35 @@ class SourceFirstRuntimeTests(unittest.TestCase):
             cached = submit_source_first(transcript_path=transcript,
                 output_dir=output, private_root=replay_private_root)
         self.assertEqual(cached["status"], "accepted_cache_hit")
+        if adopt_to_peer:
+            peer = Path(self.temp.name) / "peer-output"
+            before_posts = list(client.posts)
+            with (patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential),
+                  patch("summary.luna_v1.source_first_runtime.verify_source_first_batch_route",
+                        return_value=route)):
+                adopted = submit_source_first(transcript_path=peer / "transcript.json",
+                    output_dir=peer, private_root=replay_private_root,
+                    client_factory=lambda token: client)
+                again = submit_source_first(transcript_path=peer / "transcript.json",
+                    output_dir=peer, private_root=replay_private_root,
+                    client_factory=lambda token: client)
+            self.assertEqual(adopted["status"], "accepted_cache_hit", adopted)
+            self.assertEqual(again["status"], "accepted_cache_hit", again)
+            self.assertEqual(client.posts, before_posts)
+            self.assertEqual((peer / "summary_current.json").read_bytes(),
+                             (output / "summary_current.json").read_bytes())
+            from pipeline import current_summary_output
+            self.assertIsNotNone(current_summary_output(peer))
+            from summary.luna_v1.task_api import read_current
+            view = read_current(peer, peer / "transcript.json",
+                replay_private_root / "tasks.sqlite3", current_summary_output)
+            self.assertTrue(view.tasks)
 
     def test_full_offline_wave_replay_publishes_one_generation(self):
         self._offline_replay()
+
+    def test_accepted_source_adopts_to_real_output_without_new_batch(self):
+        self._offline_replay(adopt_to_peer=True)
 
     def test_incomplete_inventory_cannot_be_review_completed(self):
         self._offline_replay(incomplete_inventory=True)

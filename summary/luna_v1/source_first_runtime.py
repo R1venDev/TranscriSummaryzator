@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import time
 import uuid
 
@@ -50,7 +51,7 @@ from .source_first_core import (
     validate_verification, safe_mark_document, remap_mark_targets,
 )
 from .tasks import ReconciliationConflict, RevisionConflict, TaskStore
-from .publication import publish_document
+from .publication import adopt_sealed_generation, publish_document
 
 
 STAGE_CAPS = {"writer": 32_000, "extract": 25_000, "audit": 25_000,
@@ -498,8 +499,41 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                 if row["semantic_key"] == semantic_key), None)
             if existing is not None:
                 if Path(existing["output_dir"]) != Path(output_dir):
-                    return {"status": "source_identity_output_conflict",
-                            "workflow_id": existing["id"]}
+                    if existing["status"] != "accepted":
+                        return {"status": "source_identity_output_conflict",
+                                "workflow_id": existing["id"]}
+                    try:
+                        saved = _read_sealed(Path(existing["manifest_path"]),
+                                             existing["manifest_sha256"])
+                        if (not _saved_policy_matches(existing, saved, snapshot,
+                                Path(existing["output_dir"]), force_nonce)
+                                or existing["workspace_id"] != route.workspace_id):
+                            raise ValueError("adoption_policy_mismatch")
+                        _read_sealed(Path(existing["accepted_document_path"]),
+                                     existing["accepted_document_sha256"])
+                        writer = _stage_attempt(ledger, existing["id"], "writer")
+                        if not writer or not valid_batch_id(writer["remote_id"]):
+                            raise ValueError("adoption_writer_receipt_missing")
+                        generation_id, _ = adopt_sealed_generation(
+                            source_generation=Path(existing["accepted_document_path"]).parent,
+                            source_output_dir=Path(existing["output_dir"]),
+                            output_dir=Path(output_dir), transcript_path=Path(transcript_path),
+                            task_db_path=Path(private_root) / "tasks.sqlite3",
+                            source_sha256=snapshot.source_sha256,
+                            semantic_key=semantic_key, job_id=existing["id"],
+                            credential_id=existing["credential_id"],
+                            remote_batch_id=writer["remote_id"],
+                            prompt_sha256=saved["prompt_hashes"]["writer"],
+                            schema_sha256=saved["schema_hashes"]["writer"],
+                            accepted_document_sha256=existing["accepted_document_sha256"],
+                        )
+                    except (OSError, ValueError, KeyError, TypeError,
+                            sqlite3.Error) as exc:
+                        return {"status": "adoption_blocked", "workflow_id": existing["id"],
+                                "reason": str(exc)[:120] if isinstance(exc, ValueError)
+                                else type(exc).__name__}
+                    return {"status": "accepted_cache_hit", "workflow_id": existing["id"],
+                            "generation_id": generation_id}
                 if (existing["status"] == "failed"
                         and existing["error_code"] == "rolling_week_budget_exceeded"):
                     try:
