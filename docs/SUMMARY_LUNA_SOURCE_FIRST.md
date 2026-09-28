@@ -1,0 +1,67 @@
+# Luna source-first через OpenRouter Batch: устройство и выпуск
+
+Состояние: инженерный кандидат в этом checkout, 28.09.2026. Этот документ описывает policy `luna_batch_source_first_v1` для **новых** summary jobs. Он не является подтверждением развёртывания, приватной отправки или качества полного конспекта. История старых Luna/Gemini/Opus jobs и их закреплённые контракты остаётся в [SUMMARY_LUNA_BATCH.md](SUMMARY_LUNA_BATCH.md). ASR, диаризация, speech service и Plane в этот маршрут не входят.
+
+## Исходное состояние перед правками
+
+Первый инженерный worktree `codex/luna-batch-production-20260928` создан из чистого checkout `b5881294ff7ddbf4654adafac63e6d94197d97fb`. У него действовали WriterSchema `output_schema_v1.json` (SHA-256 `652ffa8f8ad65e1994092bae9222fe172e13c9b8b895d4735abf85c64968edc7`), Luna prompt `prompt_v1.md` (SHA-256 `4e9fbf912ea3f7fc8d7ba97495a2eb59d5715b07a2cea045466ceef3b49d2c01`) и legacy default quality policy `claude_opus_5_5_partitioned_audit_v3`. До изменений этот checkout не имел незакоммиченного diff. Feature diff перенесён на актуальный GitHub `main` `4276dfcfb3f2087886895a30f5f376a68531995e`; удалённые на `main` исследовательские Gemini/Opus модули не возвращались.
+
+На Linux активная `transcri-luna-summary-scheduler` запускает `pipeline.py` из release `/mnt/shared-data/transcri-work/summary-opus-openrouter-r12-20260928` на commit `b2c24433969ba460219ecc81446f2a730124d4b2`; сама release-копия кода чистая, а каталоги `inbox`, `outputs`, `state`, `work` остаются локальными untracked данными. Этот документ не меняет active service и не считает checkout уже развёрнутым.
+
+## Выполнение
+
+Штатный `pipeline.py` вызывает `scripts/luna_summary_worker.py`; его `submit` и `poll` используют `summary/luna_v1/source_first_runtime.py`, существующий `CredentialStore`, `Ledger`, source resolver, `TaskStore` и `publish_document`. `summary_backend` в [примерной конфигурации](../config.example.json) пока равен `legacy_local`. Новый job закрепляет SHA исходного `transcript.json`, версии policy/prompts/schemas, workspace и route в неизменяемом manifest. Стадии независимы по контексту; ответ одной стадии попадает в следующую только после локального сохранения и проверки.
+
+| Волна | Работа | Batch create POST | Items при K=M=3 |
+|---|---|---:|---:|
+| 1 | S1W: один full-source writer; параллельно S1E: K source-only извлечений | 2 | 1 + 3 |
+| 2 | S2: локальная нормализация и реестр surfaces; S3: M двунаправленных проверок | 1 | 3 |
+| 3 | S4: один full-source global check связей, поправок и `needs_context` | 1 | 1 |
+| 4, при findings | S5: один адресный repair | 1 | 1 |
+| 5, при bundles | S6: одна проверка D0, D1 и diff; затем S7: локальная публикация | 1 | 1 |
+
+Итого для K=M=3: **4–6 Batch create POST и 8–10 inference items**. Это разные счётчики; один POST может содержать несколько items. Верхний предел — 12 потенциально оплачиваемых items; при K=M=3 остаются два дополнительных слота, при K=M=4 все 12 заняты штатными стадиями. Планировщик строит K/M из фактического объёма source, не обрезая стенограмму. Если нужное число пакетов превышает 12 items, job получает `dimension_budget_blocked`. Восстановление output-limit split/retry пока не реализовано: проблемный item фиксируется как неполный, writer без целого результата не публикуется, а пригодный D0 при сбое дальнейшей стадии показывается с `review_incomplete`.
+
+Writer сохраняет прежний [WriterSchema](../summary/luna_v1/contract.py); названия API-полей не совпадают с восемью заголовками [renderer](../summary/luna_v1/render.py). Источник имеет уникальные U-ID даже при одинаковых таймкодах. Навигационный диапазон главы и связанная с ней поздняя цитата могут различаться. Карточка с содержательными `title` и `description` остаётся видимой при неизвестных `assignee`, `due`, `priority` или `recipient`; статус обсуждения отделён от статуса проверки модели. UUID/якоря задач и пользовательские edits принадлежат приложению, а не модельному выводу.
+
+## Запрос и контракты
+
+Единственный модельный транспорт новой policy — `POST https://openrouter.ai/api/v1/batches`. Сохранённый перед резервом конверт отправляется теми же байтами: top-level поля `endpoint`, `model`, `provider`, `completion_window`, затем `requests`. Их значения: `/v1/chat/completions`, `openai/gpt-6-luna`, `{ "only": ["openai"] }`, `24h`; каждый item имеет уникальный `custom_id`, `messages`, свою schema, reasoning и output cap. Суффикс `:batch` обозначает проверяемый Batch endpoint/тариф в каталоге, а не вторую скидку. `endpoint` внутри конверта задаёт формат Chat item и не разрешает sync вызов. При отказе Batch нет sync, другой модели или другого провайдера.
+
+`verify_source_first_batch_route` проверяет inference key, workspace, разрешённую модель, единственный OpenAI Batch endpoint, параметры, capacity и текущий тариф до приватного POST. Привязка проверенного workspace задаётся `TRANSCRI_SUMMARY_VERIFIED_WORKSPACE_ID`; сам `GET /api/v1/key` не подтверждает account privacy/region policy. Если обязательную характеристику endpoint или privacy-контроль нельзя доказать, отправка блокируется. В Batch `provider` нельзя переносить sync-настройки `allow_fallbacks`, `order`, `sort`, `require_parameters`, `zdr`.
+
+Версия промптов — `luna_batch_stage_v1`: [общий текст и файлы writer/extract/audit/global/repair/verify](../summary/luna_v1/prompts_batch_v1/00_common.md). [Типизированные sidecar-контракты](../summary/luna_v1/batch_stage_contracts_v1.py) и выгруженные JSON Schema inventory/audit/global/patch/verify/review — в [schemas_batch_v1](../summary/luna_v1/schemas_batch_v1/inventory_v1.json). Runtime передаёт общий developer-текст плюс одну стадию, сериализованный JSON данных в user message и только схему этой стадии. Для writer используется настоящий WriterSchema. Поля wire-схем обязательны, неизвестные business values nullable, лишние поля запрещены. Строковые U-ID, membership, цитаты, source hash, бюджеты, task identity и право на публикацию проверяет код. Отчёт Luna остаётся оценкой, а не ground truth.
+
+| Стадия | Reasoning | Верхний `max_completion_tokens` |
+|---|---|---:|
+| Writer | medium | 32 000 |
+| Extraction | medium | 25 000 на item |
+| Audit, global, repair, verify | high | 25 000 на item |
+
+Лимит включает billed reasoning и видимый ответ; это cap, а не размер, к которому надо стремиться. Запросы не содержат tools, web, MCP, stream, temperature, top_p или logprobs. Модель должна возвращать проверяемые evidence и краткий вывод, без скрытой цепочки рассуждений. Для audit каждое ожидаемое source/surface ID получает результат; отсутствующее не трактуется как `supported`. Локальная проверка inventory подтверждает координаты и цитаты, но не объявляет интерпретацию верной. `needs_context` переходит в полный S4; поздняя поправка меняет лишь доказанно связанное утверждение.
+
+## Durable recovery и публикация
+
+`Ledger` хранит workflow, immutable Batch intent и envelope hash, expected `custom_id`, attempt, credential/workspace, remote batch ID, lease, следующий poll, raw/usage и денежные holds. Существующий немодельный scheduler делает GET только по наступлении `next_poll_at`; перезапуск продолжает тот же remote ID. После неизвестного исхода create POST используется workspace list и GET кандидата с проверкой его фактических item IDs. Неоднозначное совпадение остаётся `submission_unknown` с удержанным резервом; локальный lock не гарантирует exactly-once у gateway.
+
+Завершённый Batch разбирается по `custom_id`, а не порядку `results`. Item error, refusal, `length`, missing, duplicate и лишние IDs остаются отдельными исходами; `completed` у Batch не превращает их в успех. Текущий OpenRouter GET `/api/v1/batches/{id}` возвращает завершённые результаты inline. Для failed/expired/cancelled `results` может быть `null`; доступные raw/usage сохраняются, отсутствующие outcome и bill остаются неизвестными. Никакого выдуманного `/results` или `output_file_id` у этого gateway нет.
+
+Repair состоит из минимальных typed bundles с source evidence, app-issued target и expected-before hash. Только принятые S6 bundles применяются к D0; reject, unresolved и отсутствующий verdict откатывают связанную группу. Известное спорное утверждение получает локальную оговорку. При неполном review целостный D0 показывается с `review_incomplete`; при отсутствии пригодного writer output UI показывает источник и `generation_failed`. Нового смыслового цикла нет.
+
+Публикация связывает canonical JSON, `review_sidecar.json`, Markdown, HTML и task projection с одним sealed generation. `TaskStore` сохраняет ручные изменения как отдельную ревизию; конфликт CAS не переписывает их. Перед переключением current pointer файлы sealed и проверены. Перед релизом требуется failure injection на границе task transaction и файлового pointer: отсутствие mixed generation нельзя утверждать только по локальному lock.
+
+## Деньги и хранение
+
+Сохранённый кодовый предел для этой policy — **$0.10 на logical job** (`JOB_CAP_MICROUSD=100_000`) и **$1.00 за скользящие семь дней across keys** (`WEEK_CAP_MICROUSD=1_000_000`). Рекомендованные в production spec $0.20/job не являются текущим разрешённым cap. Если прогноз полного плана или атомарный hold конкретного Batch превышает сохранённый предел, job блокируется до POST; его нельзя разбить на другие ключи ради обхода лимита. Показывать отдельно прогноз, hold, фактический bill и unknown. Batch total и per-item costs сверяются и учитываются один раз; cache hit заранее не предполагается. Тариф, long-context, регион, cache write и BYOK проверяются по фактическому endpoint перед допуском. [Карточка Luna Batch](https://openrouter.ai/openai/gpt-6-luna:batch/) даёт ориентир, не receipt этого checkout.
+
+Batch хранит вход и результат у OpenRouter до 30 дней; `store=false` не означает ZDR. Gateway I/O logs, upstream retention, prompt cache и локальное хранение имеют отдельные правила. Наличие ключа и `provider.only` сами по себе не доказывают регион или состояние workspace logging. После terminal сначала нужен durable local capture и сверка хэшей/usage, затем разрешённый DELETE; он не отменяет активную генерацию и не удаляет автоматически отдельные I/O или billing logs. Для **нового** runtime наличие этого cleanup пути ещё надо подтвердить end-to-end; не заявлять его выполненным из-за существования `BatchClient.delete`.
+
+## Включение и откат
+
+До включения сохранить текущие HEAD, dirty status, accepted generation, active schema/prompt/policy и разрешённые budget/privacy параметры. Пройти приложенный `05_RELEASE_CHECKLIST.md` и локальные offline/integration проверки: Batch-only transport, переставленные/пропавшие/дублированные IDs, individual errors, lost POST/restart, partial billing, task edits/CAS, seal/transaction/pointer failure injection, U-ID/timestamp/nullable/OR/AND/поздние поправки. Mocks проверяют механизм, не смысловую точность модели. На дату документа **live private API receipt для нового маршрута отсутствует**.
+
+После отдельного допуска проверить фактические workspace privacy/region и endpoint, сохранить значение `TRANSCRI_SUMMARY_VERIFIED_WORKSPACE_ID`, авторизованный cap и ключи в существующем защищённом UI. Включать только summary backend (`summary_backend: luna_batch`) и флаг `TRANSCRI_LUNA_SOURCE_FIRST_ENABLED=1` в разрешённом summary release; без флага новые submit получают `policy_disabled` до POST. Speech окружения не обновлять. Новые jobs получают `luna_batch_source_first_v1`; уже созданные generations и закреплённые старые jobs сохраняют свою lineage. Первый штатный Batch сопоставить с raw/usage, sidecar, ссылками и карточками до расширения rollout.
+
+При дефекте отключить новые summary dispatch и вернуть прежний backend/версию release. Уже отправленный Batch продолжить безопасно сверять по его ID; неизвестный POST не повторять и не отправлять ту же встречу sync. Для видимого отката выбирать предыдущую sealed generation вместе с её task revision, сохранив последующие пользовательские edits или явно показав конфликт. Если предыдущего поколения нет, показывать источник и состояние отказа.
+
+Официальный gateway contract: [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart), [Chat completion](https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion), [endpoint metadata](https://openrouter.ai/docs/api/api-reference/endpoints/list-all-endpoints-for-a-model). Предел Chat output и reasoning: [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create); модель: [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna); приватность: [OpenAI data controls](https://developers.openai.com/api/docs/guides/your-data), [OpenRouter I/O logging](https://openrouter.ai/docs/guides/features/input-output-logging).

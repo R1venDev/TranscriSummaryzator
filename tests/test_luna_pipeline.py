@@ -160,6 +160,50 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
         self.assertEqual((row["status"], row["summary_status"]), ("done", "pending_batch"))
         self.assertEqual(pipeline.load_json(self.output / "summary_attempt.json")["remote_batch_id"], "batch_synthetic")
 
+    def test_source_first_workflow_reconciles_without_legacy_job_or_speech(self):
+        db = pipeline.connect()
+        queue_id = _job(db, self.output, self.work, summary_status="running",
+                        attempt_id="source-first-attempt")
+        db.close()
+        private = self.state / "summary_private"
+        ledger = Ledger(private)
+        semantic = "a" * 64
+        source_sha = hashlib.sha256((self.output / "transcript.json").read_bytes()).hexdigest()
+        manifest = private / "source_first" / semantic / "manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('{"policy":"synthetic"}\n', encoding="utf-8")
+        decision = ledger.create_source_first_job(
+            semantic_key=semantic, source_sha256=source_sha, output_dir=self.output,
+            manifest_path=manifest, manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            credential_id="synthetic", credential_version=1,
+            workspace_id="synthetic-workspace")
+        workflow_id = decision.job_id
+        ledger.close()
+        pipeline.write_json(self.output / "summary_luna_attempt.json", {
+            "status": "submitted", "workflow_id": workflow_id})
+        pipeline.write_json(self.output / "summary_attempt.json", {
+            "attempt_id": "source-first-attempt", "luna_job_id": workflow_id})
+        self.assertTrue(pipeline._luna_output_has_active_batch(self.output))
+        pipeline.reconcile_luna_summary_queue()
+        row = pipeline.connect().execute("SELECT summary_status FROM jobs WHERE id=?",
+                                         (queue_id,)).fetchone()
+        self.assertEqual(row["summary_status"], "pending_batch")
+        generation, _ = self._seal_luna_generation(
+            job_id=workflow_id, source_sha=source_sha, semantic_key=semantic,
+            remote_batch_id="batch_synthetic")
+        accepted = private / "source_first" / semantic / "accepted.json"
+        accepted.write_text('{"synthetic":true}\n', encoding="utf-8")
+        ledger = Ledger(private)
+        ledger.finish_batch_workflow(workflow_id, status="accepted", result_path=accepted,
+                                     result_sha256=hashlib.sha256(accepted.read_bytes()).hexdigest())
+        ledger.close()
+        pipeline.reconcile_luna_summary_queue()
+        row = pipeline.connect().execute("SELECT status,summary_status FROM jobs WHERE id=?",
+                                         (queue_id,)).fetchone()
+        self.assertEqual((row["status"], row["summary_status"]), ("done", "done"))
+        self.assertEqual(pipeline.load_json(self.output / "summary_attempt.json")["displayed_generation_id"],
+                         generation)
+
     def test_worker_preflight_refusal_stays_blocked_not_submission_unknown(self):
         db = pipeline.connect(); job_id = _job(db, self.output, self.work); db.close()
 
@@ -440,7 +484,9 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
             "source": "01.09.2026 — Test.mkv", "duration_seconds": 8,
             "speakers": {"p1": "А"},
             "utterances": [{"start": 0.4, "end": 7.5, "speaker": "p1",
-                            "text": "Предлагаю проверить X или Y, не оба."}],
+                            "text": "Предлагаю проверить X или Y, не оба."},
+                           {"start": 0.4, "end": 7.5, "speaker": "p1",
+                            "text": "Вторая реплика с тем же временем."}],
         }, ensure_ascii=False), encoding="utf-8")
         document = fake_document()
         _, source_index, source_sha = load_source(self.output / "transcript.json")
@@ -469,7 +515,7 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
 
         status, page = get("/summary?id={}".format(job_id))
         self.assertEqual(status, 200)
-        self.assertIn('href="/result?id={}#t-400"'.format(job_id), page)
+        self.assertIn('href="/result?id={}#u-U00001"'.format(job_id), page)
         self.assertIn("Проверить выбранный X либо Y.", page)
         self.assertIn("/summary-tasks?id={}".format(job_id), page)
         status, markdown = get("/download?id={}&file=summary.md".format(job_id))
@@ -486,6 +532,14 @@ class LunaPipelineIntegrationTests(unittest.TestCase):
         status, transcript_html = get("/download?id={}&file=transcript.html".format(job_id))
         self.assertEqual(status, 200)
         self.assertIn('id="t-400"', transcript_html)
+        self.assertIn('id="u-U00001"', transcript_html)
+        self.assertIn('id="u-U00002"', transcript_html)
+        self.assertEqual(transcript_html.count('id="t-400"'), 1)
+        status, result_page = get("/result?id={}".format(job_id))
+        self.assertEqual(status, 200)
+        self.assertIn('id="u-U00001"', result_page)
+        self.assertIn('id="u-U00002"', result_page)
+        self.assertEqual(result_page.count('id="t-400"'), 1)
 
 
 if __name__ == "__main__":

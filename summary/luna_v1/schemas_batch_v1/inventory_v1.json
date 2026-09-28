@@ -1,0 +1,234 @@
+{
+  "$defs": {
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string"
+        },
+        "u_id": {
+          "type": "string"
+        },
+        "quote": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "u_id",
+        "quote"
+      ],
+      "type": "object"
+    },
+    "Facet": {
+      "additionalProperties": false,
+      "properties": {
+        "facet_id": {
+          "type": "string"
+        },
+        "axis": {
+          "enum": [
+            "action",
+            "actor",
+            "recipient",
+            "object",
+            "scope",
+            "status",
+            "condition",
+            "alternatives",
+            "conjunction",
+            "negation",
+            "quantity",
+            "unit",
+            "time",
+            "sequence",
+            "parallelism",
+            "causality",
+            "uncertainty",
+            "correction"
+          ],
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "facet_id",
+        "axis",
+        "value",
+        "evidence_ids"
+      ],
+      "type": "object"
+    },
+    "OpenLink": {
+      "additionalProperties": false,
+      "properties": {
+        "unit_id": {
+          "type": "string"
+        },
+        "relation_kind": {
+          "type": "string"
+        },
+        "cue": {
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "unit_id",
+        "relation_kind",
+        "cue",
+        "evidence_ids"
+      ],
+      "type": "object"
+    },
+    "SourceAccounting": {
+      "additionalProperties": false,
+      "properties": {
+        "u_id": {
+          "type": "string"
+        },
+        "disposition": {
+          "enum": [
+            "content",
+            "context_only",
+            "non_material",
+            "uncertain"
+          ],
+          "type": "string"
+        },
+        "unit_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "u_id",
+        "disposition",
+        "unit_ids",
+        "note"
+      ],
+      "type": "object"
+    },
+    "SourceUnit": {
+      "additionalProperties": false,
+      "properties": {
+        "unit_id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "statement",
+            "action",
+            "decision",
+            "question",
+            "hypothesis",
+            "constraint",
+            "rationale",
+            "example"
+          ],
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "facets": {
+          "items": {
+            "$ref": "#/$defs/Facet"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "unit_id",
+        "kind",
+        "text",
+        "evidence_ids",
+        "facets"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "luna_inventory_v1"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      },
+      "type": "array"
+    },
+    "units": {
+      "items": {
+        "$ref": "#/$defs/SourceUnit"
+      },
+      "type": "array"
+    },
+    "source_accounting": {
+      "items": {
+        "$ref": "#/$defs/SourceAccounting"
+      },
+      "type": "array"
+    },
+    "open_links": {
+      "items": {
+        "$ref": "#/$defs/OpenLink"
+      },
+      "type": "array"
+    },
+    "unprocessed_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "complete",
+    "evidence",
+    "units",
+    "source_accounting",
+    "open_links",
+    "unprocessed_ids"
+  ],
+  "type": "object"
+}

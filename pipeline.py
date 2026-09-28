@@ -105,7 +105,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "c3f153665ecc373626884dadc91f5a02d7e4b0b60114bfcb1182f437ca44c128"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "b5e6f6566e7d3c35a46a3f8bd44c76db3d70f6822d9bf896a39e9dbb9ea676f5"
 
 
 def _stage_pipeline_sha256(source):
@@ -2101,7 +2101,7 @@ def _process_luna_summary(db, job, transcript, output_dir, job_dir, log, summary
         elif state in {"submitted", "pending", "polling", "completed_raw"}:
             update_job(db, job_id, summary_status="pending_batch", summary_stage="summary_pending_batch", summary_progress=10,
                        summary_detail="OpenRouter Batch выполняется", summary_error=None)
-        elif state in {"submission_unknown", "submitting", "reserved"}:
+        elif state in {"submission_unknown", "submitting", "reserved", "wave1_incomplete"}:
             update_job(db, job_id, summary_status="submission_unknown", summary_stage="summary_recovery_required",
                        summary_progress=5, summary_detail="Исход отправки требует восстановления по ledger",
                        summary_error=str(attempt.get("reason") or state))
@@ -2116,7 +2116,7 @@ def _process_luna_summary(db, job, transcript, output_dir, job_dir, log, summary
                        summary_finished_at=now())
         write_json(output_dir / "summary_attempt.json", {
             "schema_version": 2, "job_id": job_id, "attempt_id": summary_run_id,
-            "attempt_status": state, "luna_job_id": attempt.get("job_id"),
+            "attempt_status": state, "luna_job_id": attempt.get("workflow_id") or attempt.get("job_id"),
             "remote_batch_id": attempt.get("remote_id"),
             "privacy_mode": "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized",
             "displayed_generation_id": current_summary_generation_id(output_dir),
@@ -2300,7 +2300,15 @@ def _luna_output_has_active_batch(output_dir):
                 WHERE (j.output_dir=? OR c.output_dir=?) AND j.status IN
                 ('reserved','submitting','submission_unknown','submitted','polling','credential_required','completed_raw')""",
                 (str(output_dir), str(output_dir))).fetchone()[0]
-            return count > 0
+            if count:
+                return True
+            has_source_first = ledger.execute("""SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='source_first_workflows'""").fetchone()
+            if not has_source_first:
+                return False
+            return ledger.execute("""SELECT 1 FROM source_first_workflows
+                WHERE output_dir=? AND status='active' LIMIT 1""",
+                (str(output_dir),)).fetchone() is not None
         finally:
             ledger.close()
     except sqlite3.Error:
@@ -2348,6 +2356,69 @@ def reconcile_luna_accepted_attempt(output_dir, queue_job_id, attempt_id, ledger
     return True
 
 
+def _reconcile_source_first_workflow(db, ledger, row, workflow):
+    """Project the new durable workflow into the existing summary queue UI."""
+    output_dir = Path(row["output_dir"])
+    status = workflow["status"]
+    attempts = ledger.execute("""SELECT stage,status,remote_id FROM batch_attempts
+        WHERE workflow_id=? ORDER BY created_at,id""", (workflow["id"],)).fetchall()
+    remote_id = next((item["remote_id"] for item in attempts if item["stage"] == "writer"
+                      and item["remote_id"]), None)
+    if status == "accepted":
+        package = current_summary_output(output_dir)
+        try:
+            run = load_json(package / "run_manifest.json") if package else {}
+            sealed = load_json(package / "generation_manifest.json") if package else {}
+            source_sha = hashlib.sha256((output_dir / "transcript.json").read_bytes()).hexdigest()
+            valid = (package is not None and source_sha == workflow["source_sha256"]
+                     and run.get("job_id") == workflow["id"]
+                     and run.get("semantic_key") == workflow["semantic_key"]
+                     and run.get("source_sha256") == source_sha
+                     and sealed.get("source_sha256") == source_sha
+                     and sealed.get("generation_id") == package.name)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            valid = False
+        if valid:
+            write_json(output_dir / "summary_attempt.json", {
+                "schema_version": 2, "job_id": row["id"],
+                "attempt_id": row["summary_attempt_id"], "attempt_status": "accepted",
+                "luna_job_id": workflow["id"], "remote_batch_id": remote_id,
+                "privacy_mode": "batch_gateway_retention_up_to_30d_provider_zdr_off_user_authorized",
+                "displayed_generation_id": package.name,
+            })
+            update_job(db, row["id"], summary_status="done", summary_stage="summary_done",
+                       summary_progress=100, summary_detail="Саммари готово",
+                       summary_error=None, summary_finished_at=now())
+        else:
+            update_job(db, row["id"], summary_status="submission_unknown",
+                       summary_stage="summary_recovery_required", summary_progress=5,
+                       summary_detail="Опубликованное поколение не совпадает с реестром",
+                       summary_error="source_first_pointer_mismatch")
+        return True
+    if status in {"failed", "cancelled"}:
+        update_job(db, row["id"], summary_status="failed", summary_stage="summary_failed",
+                   summary_progress=0, summary_detail="Суммаризация завершилась без пригодного конспекта",
+                   summary_error=str(workflow["error_code"] or status)[:240],
+                   summary_finished_at=now())
+        return True
+    uncertain = any(item["status"] in {"submitting", "submission_unknown"}
+                    for item in attempts)
+    if uncertain:
+        if row["summary_status"] != "submission_unknown":
+            update_job(db, row["id"], summary_status="submission_unknown",
+                       summary_stage="summary_recovery_required", summary_progress=5,
+                       summary_detail="Исход Batch-отправки требует восстановления",
+                       summary_error="source_first_submission_unknown")
+            return True
+        return False
+    if row["summary_status"] != "pending_batch":
+        update_job(db, row["id"], summary_status="pending_batch",
+                   summary_stage="summary_pending_batch", summary_progress=10,
+                   summary_detail="OpenRouter Batch выполняется", summary_error=None)
+        return True
+    return False
+
+
 def reconcile_luna_summary_queue():
     """Recover queue display from the durable external-job ledger, never POST."""
     db = connect()
@@ -2377,6 +2448,27 @@ def reconcile_luna_summary_queue():
             except (OSError, ValueError, json.JSONDecodeError):
                 envelope, attempt = {}, {}
             matching_attempt = envelope.get("attempt_id") == row["summary_attempt_id"]
+            source_first_table = ledger.execute("""SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='source_first_workflows'""").fetchone()
+            source_first = None
+            if source_first_table:
+                workflow_id = attempt.get("workflow_id") if matching_attempt else None
+                if workflow_id:
+                    source_first = ledger.execute(
+                        "SELECT * FROM source_first_workflows WHERE id=? AND output_dir=?",
+                        (workflow_id, str(output_dir))).fetchone()
+                if source_first is None:
+                    try:
+                        started = datetime.fromisoformat(row["summary_started_at"]).timestamp()
+                    except (TypeError, ValueError):
+                        started = time.time()
+                    source_first = ledger.execute("""SELECT * FROM source_first_workflows
+                        WHERE output_dir=? AND created_at>=?
+                        ORDER BY created_at DESC LIMIT 1""",
+                        (str(output_dir), started - 2)).fetchone()
+            if source_first is not None:
+                changed += int(_reconcile_source_first_workflow(db, ledger, row, source_first))
+                continue
             ledger_job_id = attempt.get("job_id") if matching_attempt else None
             ledger_job = ledger.execute("SELECT * FROM jobs WHERE id=?", (ledger_job_id,)).fetchone() if ledger_job_id else None
             if ledger_job is None:
@@ -3440,7 +3532,8 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             transcript_data = load_json(transcript)
             labels = transcript_data.get("speakers", {})
             rendered_turns = []
-            for item in transcript_data.get("utterances", []):
+            legacy_anchors = set()
+            for number, item in enumerate(transcript_data.get("utterances", []), 1):
                 speaker = item.get("speaker")
                 label = html.escape(speaker_display(speaker, labels))
                 text = html.escape(item.get("text", ""))
@@ -3449,12 +3542,16 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                 speaker_class = "unknown" if speaker is None else "speaker-{}".format(sum(ord(character) for character in str(speaker)) % 6)
                 warning = '<span class="warning">Проверить</span>' if needs_review else ""
                 start_seconds = float(item.get("start", 0))
-                anchor = "t-{}".format(round(start_seconds * 1000))
+                start_ms = round(start_seconds * 1000)
+                legacy_anchor = ('<span id="t-{}"></span>'.format(start_ms)
+                                 if start_ms not in legacy_anchors else "")
+                legacy_anchors.add(start_ms)
                 rendered_turns.append(
-                    '<section id="{}" data-start="{:.3f}" class="turn{}"><time>{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
-                        anchor,
+                    '<section id="u-U{:05d}" data-start="{:.3f}" class="turn{}">{}<time>{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
+                        number,
                         start_seconds,
                         " needs-review" if needs_review else "",
+                        legacy_anchor,
                         timecode,
                         speaker_class,
                         label,

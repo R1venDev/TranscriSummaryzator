@@ -1,0 +1,338 @@
+{
+  "$defs": {
+    "ContextResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "resolved",
+            "unresolved"
+          ],
+          "type": "string"
+        },
+        "conclusion": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "affected_surface_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "status",
+        "conclusion",
+        "evidence_ids",
+        "affected_surface_ids"
+      ],
+      "type": "object"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string"
+        },
+        "u_id": {
+          "type": "string"
+        },
+        "quote": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "u_id",
+        "quote"
+      ],
+      "type": "object"
+    },
+    "Facet": {
+      "additionalProperties": false,
+      "properties": {
+        "facet_id": {
+          "type": "string"
+        },
+        "axis": {
+          "enum": [
+            "action",
+            "actor",
+            "recipient",
+            "object",
+            "scope",
+            "status",
+            "condition",
+            "alternatives",
+            "conjunction",
+            "negation",
+            "quantity",
+            "unit",
+            "time",
+            "sequence",
+            "parallelism",
+            "causality",
+            "uncertainty",
+            "correction"
+          ],
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "facet_id",
+        "axis",
+        "value",
+        "evidence_ids"
+      ],
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "minor",
+            "material",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "affected_surface_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "affected_unit_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "problem": {
+          "type": "string"
+        },
+        "required_preservation": {
+          "type": "string"
+        },
+        "proposed_resolution": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "finding_id",
+        "kind",
+        "severity",
+        "affected_surface_ids",
+        "affected_unit_ids",
+        "evidence_ids",
+        "problem",
+        "required_preservation",
+        "proposed_resolution"
+      ],
+      "type": "object"
+    },
+    "LinkCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "link_id": {
+          "type": "string"
+        },
+        "unit_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "relation": {
+          "enum": [
+            "same_action",
+            "distinct_actions",
+            "acceptance",
+            "reported_commitment",
+            "alternative",
+            "conjunction",
+            "sequential",
+            "parallel",
+            "correction",
+            "retraction",
+            "unresolved"
+          ],
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "conclusion": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "link_id",
+        "unit_ids",
+        "relation",
+        "evidence_ids",
+        "conclusion"
+      ],
+      "type": "object"
+    },
+    "SourceUnit": {
+      "additionalProperties": false,
+      "properties": {
+        "unit_id": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "statement",
+            "action",
+            "decision",
+            "question",
+            "hypothesis",
+            "constraint",
+            "rationale",
+            "example"
+          ],
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "facets": {
+          "items": {
+            "$ref": "#/$defs/Facet"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "unit_id",
+        "kind",
+        "text",
+        "evidence_ids",
+        "facets"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "luna_global_v1"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      },
+      "type": "array"
+    },
+    "resolutions": {
+      "items": {
+        "$ref": "#/$defs/ContextResolution"
+      },
+      "type": "array"
+    },
+    "link_checks": {
+      "items": {
+        "$ref": "#/$defs/LinkCheck"
+      },
+      "type": "array"
+    },
+    "additional_units": {
+      "items": {
+        "$ref": "#/$defs/SourceUnit"
+      },
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "type": "array"
+    },
+    "affected_surfaces": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "unprocessed_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "complete",
+    "evidence",
+    "resolutions",
+    "link_checks",
+    "additional_units",
+    "findings",
+    "affected_surfaces",
+    "unprocessed_ids"
+  ],
+  "type": "object"
+}

@@ -8,7 +8,7 @@
 - Удаление terminal legacy-записей работает через отдельный `record_dashboard_wrapper.py` и dashboard в серверной конфигурации. Luna-связанные записи эта обёртка пока защищённо отклоняет (HTTP 409); совместное включение требует отдельной проверки.
 - Luna Batch запущен только в изолированном release `/mnt/shared-data/transcri-work/summary-luna-openrouter` на commit `4ada035`. Синтетический платный smoke был принят; для полной частной стенограммы на последнем зафиксированном checkpoint был зарегистрирован Batch. Его итог и качество полного конспекта нельзя считать подтверждёнными без terminal raw/usage и проверки содержания. Production на Luna не переключён.
 
-[Текущая архитектура и границы deployment](ARCHITECTURE.md) отделяют эти контуры. [Summary-only Batch](docs/SUMMARY_LUNA_BATCH.md) описывает контракт, разрешённое хранение и бюджет; [управление ключами](docs/SUMMARY_ADMIN_KEYS.md) — защищённый интерфейс. В `main` код новых функций не включает их автоматически в работающей службе.
+[Текущая архитектура и границы deployment](ARCHITECTURE.md) отделяют эти контуры. [Новая source-first policy Luna Batch](docs/SUMMARY_LUNA_SOURCE_FIRST.md) описывает подготовленный маршрут и условия выпуска; [исторический одновызовный Batch](docs/SUMMARY_LUNA_BATCH.md) — предыдущий контракт, [управление ключами](docs/SUMMARY_ADMIN_KEYS.md) — защищённый интерфейс. Новый маршрут не включён автоматически в работающей службе.
 
 ## Возможности legacy-релиза
 

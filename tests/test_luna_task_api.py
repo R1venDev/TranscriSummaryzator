@@ -106,6 +106,24 @@ class LocalTaskApiTests(unittest.TestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["actor"], "admin")
 
+    def test_effective_view_preserves_sealed_review_warning(self):
+        store = TaskStore(self.task_db)
+        plan = store.preview_reconcile(self.source_sha, self.document["tasks"])
+        publish_document(
+            document=self.document, source_index=self.index,
+            transcript_path=self.source, output_dir=self.output,
+            semantic_key="review-test-key", job_id="review-job",
+            remote_batch_id="review-batch", credential_id="fake-key",
+            prompt_sha256="c" * 64, schema_sha256="d" * 64,
+            effective_tasks=plan.effective_tasks,
+            quality_review={"status": "review_incomplete", "unresolved_count": 1},
+            before_pointer=lambda: store.commit_reconcile(plan),
+        )
+        selected = read_current(self.output, self.source, self.task_db, verified_resolver)
+        self.assertEqual(selected.rendered["summary.json"]["quality_review"]["status"],
+                         "review_incomplete")
+        self.assertIn("не полностью", selected.rendered["summary.md"])
+
     def test_stale_revision_generation_and_unknown_card_do_not_edit(self):
         selected = read_current(self.output, self.source, self.task_db, verified_resolver)
         action_id = selected.tasks[0]["action_id"]

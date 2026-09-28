@@ -88,12 +88,12 @@ class TaskStoreTests(unittest.TestCase):
         chosen = first[0]["action_id"]
         self.store.update(chosen, 0, {"assignee": "А"}, "admin")
         revised = deepcopy(self.generated)
-        revised[0]["description"] = "Проверить одну из двух альтернатив после согласования выбора."
+        revised[0]["discussion_status"] = "in_progress"
         reordered = self.store.reconcile(SOURCE_SHA, list(reversed(revised)))
         self.assertEqual(reordered[1]["action_id"], chosen)
         self.assertEqual(reordered[1]["assignee"], "А")
         self.assertEqual(reordered[1]["revision"], 1)
-        self.assertEqual(reordered[1]["description"], revised[0]["description"])
+        self.assertEqual(reordered[1]["discussion_status"], "in_progress")
 
     def test_rejected_candidate_preview_does_not_touch_old_generation_or_db(self):
         accepted = self.store.reconcile(SOURCE_SHA, self.generated)
@@ -103,7 +103,7 @@ class TaskStoreTests(unittest.TestCase):
         old_export = render_document(document(self.generated), INDEX, old_effective)
         before = hashlib.sha256(self.path.read_bytes()).hexdigest()
         candidate = deepcopy(self.generated)
-        candidate[0]["description"] = "Новая, пока не принятая версия описания задачи."
+        candidate[0]["discussion_status"] = "in_progress"
         plan = self.store.preview_reconcile(SOURCE_SHA, candidate)
         self.assertEqual(plan.effective_tasks[0]["assignee"], "А")
         self.assertEqual(hashlib.sha256(self.path.read_bytes()).hexdigest(), before)

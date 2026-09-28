@@ -61,6 +61,19 @@ def _action_sources(task: dict) -> tuple[str, ...]:
     return tuple(sorted(set(task["field_sources"]["action"])))
 
 
+def _anchor_id(source_sha: str, task: dict, *, duplicate_anchor: bool = False) -> str:
+    """Derive a local card ID from action evidence, not its display title.
+
+    Two actions may cite the same utterance. Their full fingerprints only
+    disambiguate the initial IDs; later changes to either action must then
+    reconcile through an exact match or stop at an explicit conflict.
+    """
+    material = {"source_sha256": source_sha, "action_sources": _action_sources(task)}
+    if duplicate_anchor:
+        material["action_fingerprint"] = _fingerprint(task)
+    return "A-" + _digest(material)[:24]
+
+
 def _fingerprint(task: dict) -> str:
     return _digest({
         "action_sources": _action_sources(task),
@@ -109,19 +122,6 @@ def _valid_edit(changes: object) -> dict:
         elif value is not None and (not isinstance(value, str) or not value.strip() or len(value) > 1000):
             raise ValueError(f"invalid {field}; use null to clear it")
     return deepcopy(changes)
-
-
-def _may_match(old: dict, fresh: dict) -> bool:
-    old_sources, new_sources = set(_action_sources(old)), set(_action_sources(fresh))
-    if not old_sources & new_sources:
-        return False
-    old_title, new_title = _normal(old["title"]), _normal(fresh["title"])
-    old_description, new_description = _normal(old["description"]), _normal(fresh["description"])
-    # Lexical similarity is unsafe here: "X или Y" and "X и Y" differ by
-    # one word but mean different actions. Preserve identity only while one
-    # complete human-readable action field remains stable. If both change,
-    # an edited action becomes an explicit reconciliation conflict.
-    return old_title == new_title or old_description == new_description
 
 
 def _effective(generated: dict, action_id: str, revision: int, patch: dict) -> dict:
@@ -252,6 +252,7 @@ class TaskStore:
     def _plan(source_sha: str, fresh: list[dict], rows: list[sqlite3.Row]) -> tuple[dict[int, str], list[dict]]:
         fingerprints = [_fingerprint(item) for item in fresh]
         old = {row["action_id"]: row for row in rows}
+        old_tasks = {row["action_id"]: json.loads(row["generated_json"]) for row in rows}
         assignments: dict[int, str] = {}
         used: set[str] = set()
 
@@ -263,20 +264,25 @@ class TaskStore:
                 assignments[position] = candidates[0]
                 used.add(candidates[0])
 
+        # An exact source action anchor is the only fallback. In particular,
+        # a matching title with changed action evidence is never identity.
         possibilities: dict[int, list[str]] = {}
         for position, task in enumerate(fresh):
             if position in assignments:
                 continue
             possibilities[position] = [
                 row["action_id"] for row in rows if row["action_id"] not in used
-                and _may_match(json.loads(row["generated_json"]), task)
+                and _action_sources(old_tasks[row["action_id"]]) == _action_sources(task)
             ]
         for position, candidates in possibilities.items():
             if len(candidates) > 1:
-                raise ReconciliationConflict("ambiguous source/action match", candidates)
+                raise ReconciliationConflict("ambiguous source action anchor", candidates)
             if candidates and sum(candidates[0] in other for other in possibilities.values()) > 1:
-                raise ReconciliationConflict("multiple generated tasks match one action", candidates)
+                raise ReconciliationConflict("multiple generated tasks share a source action anchor", candidates)
             if candidates:
+                prior = old[candidates[0]]
+                if prior["revision"] > 0 and prior["fingerprint"] != fingerprints[position]:
+                    raise ReconciliationConflict("edited action content changed at source anchor", candidates)
                 assignments[position] = candidates[0]
                 used.add(candidates[0])
 
@@ -285,10 +291,13 @@ class TaskStore:
             raise ReconciliationConflict("manually edited action missing from regeneration", missing_edits)
 
         result: list[dict] = []
+        anchor_counts = {anchor: sum(_action_sources(item) == anchor for item in fresh)
+                         for anchor in {_action_sources(item) for item in fresh}}
         for position, task in enumerate(fresh):
             action_id = assignments.get(position)
             if action_id is None:
-                action_id = "A-" + hashlib.sha256(f"{source_sha}:{fingerprints[position]}".encode()).hexdigest()[:24]
+                action_id = _anchor_id(source_sha, task,
+                    duplicate_anchor=anchor_counts[_action_sources(task)] > 1)
                 if action_id in old:
                     raise ReconciliationConflict("action ID collision", [action_id])
                 assignments[position] = action_id

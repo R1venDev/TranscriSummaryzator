@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -21,6 +22,34 @@ REQUIRED_FILES = frozenset({
     "summary.md", "summary.html", "summary.fragment.html", "summary.json",
     "tasks.json", "transcript.html", "run_manifest.json", "model_document.json",
 })
+REVIEW_SIDECAR_FILE = "review_sidecar.json"
+
+
+def _sidecar_for_generation(template: dict, *, generation_id: str,
+                            source_sha: str, artifact_sha256: dict[str, str]) -> dict:
+    """Bind a local review report to the exact sealed source and artifacts.
+
+    The sidecar hashes canonical generation files, excluding itself and the
+    generation manifest, so its own digest can be placed in that manifest
+    without a circular hash dependency.
+    """
+    if not isinstance(template, dict):
+        raise ValueError("review_sidecar_invalid")
+    sidecar = deepcopy(template)
+    for field, expected in (("generation_id", generation_id),
+                            ("source_revision", source_sha)):
+        supplied = sidecar.get(field)
+        if supplied not in (None, "", expected):
+            raise ValueError(f"review_sidecar_{field}_mismatch")
+        sidecar[field] = expected
+    hashes = [{"name": name, "sha256": artifact_sha256[name]}
+              for name in sorted(REQUIRED_FILES)]
+    supplied_hashes = sidecar.get("artifact_hashes")
+    if supplied_hashes not in (None, []) and supplied_hashes != hashes:
+        raise ValueError("review_sidecar_artifact_hashes_mismatch")
+    sidecar["artifact_hashes"] = hashes
+    from .batch_stage_contracts_v1 import PublicationReviewSidecar
+    return PublicationReviewSidecar.model_validate(sidecar).model_dump()
 
 
 def _bytes(name: str, value) -> bytes:
@@ -34,17 +63,20 @@ def _bytes(name: str, value) -> bytes:
 def _verify_staged_target(target: Path, *, generation_id: str, document: dict,
                           source_sha: str, semantic_key: str, job_id: str,
                           remote_batch_id: str, credential_id: str,
-                          prompt_sha256: str, schema_sha256: str) -> dict:
+                          prompt_sha256: str, schema_sha256: str,
+                          quality_review: dict | None = None,
+                          review_sidecar: dict | None = None) -> dict:
     """A prior crash may have sealed the target before switching the pointer."""
     manifest = json.loads((target / "generation_manifest.json").read_text(encoding="utf-8"))
     digests = manifest.get("artifact_sha256")
     if (manifest.get("contract_version") != CONTRACT_VERSION
             or manifest.get("generation_id") != generation_id
             or manifest.get("source_sha256") != source_sha
-            or not isinstance(digests, dict) or set(digests) != REQUIRED_FILES
+            or not isinstance(digests, dict)
+            or set(digests) != (REQUIRED_FILES | ({REVIEW_SIDECAR_FILE} if review_sidecar is not None else set()))
             or manifest.get("verified_artifact_sha256") != digests.get("summary.md")):
         raise ValueError("staged_generation_manifest_mismatch")
-    for name in REQUIRED_FILES:
+    for name in digests:
         expected = digests[name]
         if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
             raise ValueError("staged_generation_digest_invalid")
@@ -59,8 +91,16 @@ def _verify_staged_target(target: Path, *, generation_id: str, document: dict,
     }
     if any(run.get(key) != value for key, value in expected_run.items()):
         raise ValueError("staged_generation_identity_mismatch")
+    if run.get("quality_review") != quality_review:
+        raise ValueError("staged_generation_quality_mismatch")
     if hashlib.sha256(_bytes("model_document.json", document)).hexdigest() != digests["model_document.json"]:
         raise ValueError("staged_generation_document_mismatch")
+    if review_sidecar is not None:
+        expected_sidecar = _sidecar_for_generation(review_sidecar,
+            generation_id=generation_id, source_sha=source_sha,
+            artifact_sha256=digests)
+        if hashlib.sha256(_bytes(REVIEW_SIDECAR_FILE, expected_sidecar)).hexdigest() != digests[REVIEW_SIDECAR_FILE]:
+            raise ValueError("staged_generation_review_sidecar_mismatch")
     return manifest
 
 
@@ -88,13 +128,25 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
                      prompt_sha256: str, schema_sha256: str,
                      effective_tasks: list[dict] | None = None,
                      generation_id: str | None = None,
+                     quality_review: dict | None = None,
+                     review_sidecar: dict | None = None,
                      before_pointer: Callable[[], None] | None = None) -> tuple[str, Path]:
     """Commit a complete generation or leave the old pointer untouched."""
     validate_document(document, source_index)
     original_sha = source_index["source_sha256"]
     if hashlib.sha256(Path(transcript_path).read_bytes()).hexdigest() != original_sha:
         raise ValueError("source_changed_before_publication")
-    rendered = render_document(document, source_index, effective_tasks)
+    if review_sidecar is not None:
+        if not isinstance(quality_review, dict):
+            raise ValueError("review_sidecar_requires_quality_review")
+        expected_status = {
+            "review_completed": "source_first_checked",
+            "reviewed_with_uncertainties": "unresolved",
+            "review_incomplete": "review_incomplete",
+        }.get(review_sidecar.get("review_status"))
+        if expected_status is None or quality_review.get("status") != expected_status:
+            raise ValueError("review_sidecar_quality_status_mismatch")
+    rendered = render_document(document, source_index, effective_tasks, quality_review)
     target_parent = Path(output_dir) / "summary_generations"
     target_parent.mkdir(parents=True, exist_ok=True)
     generation_id = generation_id or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
@@ -106,7 +158,8 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
         staged = _verify_staged_target(target, generation_id=generation_id, document=document,
             source_sha=original_sha, semantic_key=semantic_key, job_id=job_id,
             remote_batch_id=remote_batch_id, credential_id=credential_id,
-            prompt_sha256=prompt_sha256, schema_sha256=schema_sha256)
+            prompt_sha256=prompt_sha256, schema_sha256=schema_sha256,
+            quality_review=quality_review, review_sidecar=review_sidecar)
         pointer_path = Path(output_dir) / "summary_current.json"
         if pointer_path.exists():
             current = json.loads(pointer_path.read_text(encoding="utf-8"))
@@ -145,6 +198,7 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
             "credential_id": credential_id,
             "prompt_sha256": prompt_sha256,
             "schema_sha256": schema_sha256,
+            "quality_review": quality_review,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         rendered["run_manifest.json"] = run_manifest
@@ -162,6 +216,17 @@ def _publish_locked(*, document: dict, source_index: dict, transcript_path: Path
             digests[name] = hashlib.sha256(payload).hexdigest()
         if set(digests) != REQUIRED_FILES:
             raise ValueError("generation file set incomplete")
+        if review_sidecar is not None:
+            sidecar = _sidecar_for_generation(review_sidecar,
+                generation_id=generation_id, source_sha=original_sha,
+                artifact_sha256=digests)
+            payload = _bytes(REVIEW_SIDECAR_FILE, sidecar)
+            path = candidate / REVIEW_SIDECAR_FILE
+            with path.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            digests[REVIEW_SIDECAR_FILE] = hashlib.sha256(payload).hexdigest()
         manifest = {
             "contract_version": CONTRACT_VERSION,
             "generation_id": generation_id,

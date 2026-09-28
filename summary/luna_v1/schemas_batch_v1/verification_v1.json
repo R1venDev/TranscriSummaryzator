@@ -1,0 +1,173 @@
+{
+  "$defs": {
+    "BundleCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle_id": {
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "accept",
+            "reject",
+            "unresolved"
+          ],
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "type": "array"
+        },
+        "preserved_surface_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "regressions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "bundle_id",
+        "verdict",
+        "evidence",
+        "preserved_surface_ids",
+        "regressions",
+        "note"
+      ],
+      "type": "object"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "type": "string"
+        },
+        "u_id": {
+          "type": "string"
+        },
+        "quote": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "u_id",
+        "quote"
+      ],
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "minor",
+            "material",
+            "critical"
+          ],
+          "type": "string"
+        },
+        "affected_surface_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "affected_unit_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "problem": {
+          "type": "string"
+        },
+        "required_preservation": {
+          "type": "string"
+        },
+        "proposed_resolution": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "finding_id",
+        "kind",
+        "severity",
+        "affected_surface_ids",
+        "affected_unit_ids",
+        "evidence_ids",
+        "problem",
+        "required_preservation",
+        "proposed_resolution"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "luna_verification_v1"
+      ]
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "bundle_checks": {
+      "items": {
+        "$ref": "#/$defs/BundleCheck"
+      },
+      "type": "array"
+    },
+    "new_findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "type": "array"
+    },
+    "unprocessed_bundle_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "complete",
+    "bundle_checks",
+    "new_findings",
+    "unprocessed_bundle_ids"
+  ],
+  "type": "object"
+}
