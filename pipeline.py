@@ -3547,7 +3547,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                                  if start_ms not in legacy_anchors else "")
                 legacy_anchors.add(start_ms)
                 rendered_turns.append(
-                    '<section id="u-U{:05d}" data-start="{:.3f}" class="turn{}">{}<time>{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
+                    '<section id="u-U{:05d}" data-start="{:.3f}" class="turn{}"><time>{}{}</time><div class="speech"><div class="who"><span class="speaker {}">{}</span>{}</div><div class="text">{}</div></div></section>'.format(
                         number,
                         start_seconds,
                         " needs-review" if needs_review else "",
