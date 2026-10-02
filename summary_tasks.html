@@ -22,12 +22,15 @@
     @media(max-width:650px){.grid{grid-template-columns:1fr}}
   </style>
   <script src="/summary-tasks.js" defer></script>
+  <script src="/plane-actions.js" defer></script>
 </head>
 <body>
   <main>
-    <nav><a id="summaryLink" href="/">← Конспект</a><a id="resultLink" href="/">Стенограмма</a></nav>
+    <nav><a id="summaryLink" href="/">← Конспект</a><a id="resultLink" href="/">Стенограмма</a><a href="/plane-settings">Настройки Plane</a></nav>
     <h1>Карточки задач</h1>
     <p class="muted">Сохранённая генерация остаётся неизменной. Ручные правки создают новую ревизию карточки и сразу отражаются в конспекте и экспортах без запроса к модели.</p>
+    <p class="muted">В Plane отправляется сохранённая карточка. Задачу можно создать и без назначенного исполнителя.</p>
+    <div id="plane-meeting-page" role="status" aria-live="polite"></div>
     <div id="notice" class="banner" role="status">Загружаю выбранную версию…</div>
     <section id="cards" aria-label="Карточки"></section>
   </main>

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Настройки Plane — TranscriSummaryzator</title>
+  <style>
+    :root{color-scheme:dark;font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,sans-serif}
+    *{box-sizing:border-box}body{margin:0;background:#0c0e13;color:#eef1f7}
+    main{width:min(960px,calc(100% - 32px));margin:30px auto 70px}
+    nav{display:flex;gap:18px;flex-wrap:wrap}a{color:#add2ff}h1{font-size:28px;margin:28px 0 8px}h2{font-size:20px;margin:0 0 16px}
+    p{margin:8px 0}.muted{color:#abb4c5}.card{padding:24px;margin:20px 0;background:#171a22;border:1px solid #30394a;border-radius:18px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.wide{grid-column:1/-1}
+    label{display:grid;gap:6px;font-size:14px;font-weight:600}small{font-size:13px;font-weight:400;color:#abb4c5}
+    input{min-width:0;width:100%;background:#0e131b;border:1px solid #44516a;border-radius:9px;padding:11px;color:#f5f7fa;font:inherit}
+    input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #a6cbff;outline-offset:3px}
+    .switch{display:grid;grid-template-columns:24px 1fr;align-items:start;column-gap:12px;padding:16px 0;border-top:1px solid #30394a;cursor:pointer}
+    .switch:first-of-type{border-top:0;padding-top:0}.switch input{width:20px;height:20px;accent-color:#4b93ff;margin:3px 0}.switch span{display:grid;gap:4px}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:22px}
+    button{background:#2d75e8;color:white;border:1px solid #2d75e8;border-radius:9px;padding:10px 14px;font:600 14px system-ui,sans-serif;cursor:pointer}
+    button.secondary{background:#293141;border-color:#43516d}button:disabled{opacity:.5;cursor:wait}
+    .status{padding:12px 16px;border:1px solid #34445a;border-radius:10px;background:#172234;overflow-wrap:anywhere}
+    .status.error{border-color:#80404a;color:#ffb3bd;background:#342028}.status.success{border-color:#326449;color:#8ee0b0;background:#182b24}
+    #message:empty{display:none}.connection{margin-top:14px}.mask{font-family:ui-monospace,monospace;overflow-wrap:anywhere}
+    @media(max-width:650px){.grid{grid-template-columns:1fr}.card{padding:18px}h1{font-size:25px}.controls button{width:100%}}
+  </style>
+  <script src="/plane-settings.js" defer></script>
+</head>
+<body><main>
+  <nav><a href="/">← К записям</a><a href="/summary-settings">Ключи суммаризатора</a></nav>
+  <h1>Настройки → Plane</h1>
+  <p class="muted">Конспекты встреч, задачи и гипотезы можно отправлять в выбранное рабочее пространство Plane. Автоматическая отправка задач и гипотез включается отдельно.</p>
+  <p id="connectionStatus" class="status connection" role="status" aria-live="polite">Загружаю настройки…</p>
+  <form id="planeForm" autocomplete="off">
+    <fieldset id="planeFields" disabled style="border:0;padding:0;margin:0;min-width:0">
+      <section class="card" aria-labelledby="connectionHeading">
+        <h2 id="connectionHeading">Подключение</h2>
+        <div class="grid">
+          <label class="wide">Адрес Plane
+            <input name="base_url" type="url" maxlength="2000" placeholder="https://plane.example.com" autocomplete="off" spellcheck="false">
+            <small>Адрес вашего сервера Plane, без пути к проекту.</small>
+          </label>
+          <label>Рабочее пространство (slug)
+            <input name="workspace_slug" maxlength="200" placeholder="team" autocomplete="off" spellcheck="false">
+            <small>Часть адреса Plane, которая обозначает рабочее пространство.</small>
+          </label>
+          <label>Проект для задач (ID)
+            <input name="project_id" maxlength="200" list="planeProjects" autocomplete="off" spellcheck="false">
+            <datalist id="planeProjects"></datalist>
+            <small>Список доступных проектов обновляется после проверки подключения.</small>
+          </label>
+          <label>Wiki-коллекция (ID, необязательно)
+            <input name="collection_id" maxlength="200" list="planeCollections" autocomplete="off" spellcheck="false">
+            <datalist id="planeCollections"></datalist>
+            <small>Выберите коллекцию или родительскую страницу.</small>
+          </label>
+          <label>Родительская Wiki-страница (ID, необязательно)
+            <input name="parent_page_id" maxlength="200" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="wide">API-ключ Plane
+            <input name="api_key" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="keyHelp keyMask">
+            <small id="keyHelp">Введите ключ при первом подключении или для замены. Пустое поле сохраняет текущий ключ. После сохранения ключ больше не показывается.</small>
+            <small id="keyMask" class="mask">Сохранённого ключа нет</small>
+          </label>
+        </div>
+      </section>
+      <section class="card" aria-labelledby="automationHeading">
+        <h2 id="automationHeading">После готовности конспекта</h2>
+        <label class="switch"><input name="auto_meeting_page" type="checkbox" checked><span>Создавать Wiki-страницу встречи<small>После настройки подключения сохраняет конспект встречи в Plane. По умолчанию включено.</small></span></label>
+        <label class="switch"><input name="auto_tasks" type="checkbox"><span>Автоматически создавать задачи<small>По умолчанию выключено. Задачу можно отправить и без назначенного исполнителя.</small></span></label>
+        <label class="switch"><input name="auto_hypotheses" type="checkbox"><span>Автоматически отправлять гипотезы<small>По умолчанию выключено. Гипотезы остаются предложениями для проверки, а не подтверждёнными решениями.</small></span></label>
+        <p class="muted">При выключенной автоматической отправке задачи и гипотезы можно отправлять по одной из конспекта. Изменения настроек начнут действовать после сохранения.</p>
+        <div class="controls"><button id="savePlane" type="submit">Сохранить настройки</button><button id="checkPlane" class="secondary" type="button">Проверить сохранённое подключение</button></div>
+        <p class="muted" style="margin-top:12px">Проверка читает данные подключения и доступные проекты и коллекции.</p>
+      </section>
+    </fieldset>
+  </form>
+  <p id="message" class="status" role="status" aria-live="polite"></p>
+  <button id="reloadPlane" class="secondary" type="button" hidden>Загрузить настройки заново</button>
+</main></body>
+</html>

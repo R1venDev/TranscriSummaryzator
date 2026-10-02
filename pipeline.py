@@ -39,15 +39,16 @@ from summary_credentials import CredentialError, credential_dispatch_guard, veri
 
 
 ROOT = Path(__file__).resolve().parent
-INBOX = ROOT / "inbox"
-STATE = ROOT / "state"
-JOBS = ROOT / "work" / "jobs"
-GLOBAL_STAGE_CACHE = ROOT / "work" / "stage-cache"
-OUTPUTS = ROOT / "outputs"
-VOICE_PROFILES = ROOT / "voice_profiles"
+DATA_ROOT = Path(os.environ.get("TRANSCRI_DATA_DIR", str(ROOT))).resolve()
+INBOX = DATA_ROOT / "inbox"
+STATE = DATA_ROOT / "state"
+JOBS = DATA_ROOT / "work" / "jobs"
+GLOBAL_STAGE_CACHE = DATA_ROOT / "work" / "stage-cache"
+OUTPUTS = DATA_ROOT / "outputs"
+VOICE_PROFILES = DATA_ROOT / "voice_profiles"
 DB_PATH = STATE / "queue.sqlite3"
-CONFIG_PATH = ROOT / "config.json"
-VOCABULARY_PATH = ROOT / "vocabulary.json"
+CONFIG_PATH = Path(os.environ.get("TRANSCRI_CONFIG_FILE", str(DATA_ROOT / "config.json")))
+VOCABULARY_PATH = DATA_ROOT / "vocabulary.json"
 DASHBOARD_PATH = ROOT / "dashboard.html"
 PROFILES_PATH = ROOT / "profiles.html"
 SUMMARY_SETTINGS_PATH = ROOT / "summary_settings.html"
@@ -105,7 +106,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "7a86bfd0f29728538f8841eb69117940226771a6631b949354956f0825da2571"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "fb527d348094b1fe19e7572ecc07238be82e01fac6021812c116773a2408ff57"
 
 
 def _stage_pipeline_sha256(source):
@@ -549,6 +550,68 @@ def luna_effective_view(output_dir):
                         STATE / "summary_private" / "tasks.sqlite3", current_summary_output)
 
 
+def plane_store():
+    from summary.plane import PlaneStore
+    return PlaneStore(STATE / "summary_private" / "plane.sqlite3")
+
+
+def plane_selected(job_id, allow_auto=False, create=None):
+    """Project an accepted generation; never generate or modify a transcript."""
+    from summary.plane_projection import project_view
+    identifier = str(job_id)
+    if not identifier.isdecimal():
+        raise ValueError("Неверный номер записи")
+    db = connect()
+    try:
+        row = db.execute("SELECT status,output_dir FROM jobs WHERE id=?", (int(identifier),)).fetchone()
+    finally:
+        db.close()
+    if not row or row["status"] != "done" or not row["output_dir"]:
+        raise ValueError("Готовая запись не найдена")
+    output = Path(row["output_dir"])
+    # Same meeting lock as publication and human card edits.
+    with (output / ".summary_publication.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        view = luna_effective_view(output)
+        store = plane_store()
+        idea_ids = store.hypothesis_ids(view.source_sha256, view.rendered["summary.json"]["ideas"])
+        origin = os.environ.get("TRANSCRI_SUMMARY_ADMIN_ORIGIN", "http://127.0.0.1:{}".format(config().get("dashboard_port",8765)))
+        items, page = project_view(view, int(identifier), origin, idea_ids)
+        store.observe_generation(int(identifier), view.generation_id, items, page,
+                                 source_id=view.source_sha256, allow_auto=allow_auto)
+        if create is not None:
+            if view.generation_id != create.get("generation_id"):
+                raise ValueError("Конспект обновился; обновите страницу")
+            store.enqueue(int(identifier), create.get("kind"), create.get("item_id"), view.generation_id)
+    return view, idea_ids, store.items(int(identifier))
+
+
+def plane_scheduler_tick(deliver=True):
+    """Independent delivery errors never block summary/speech processing."""
+    try:
+        store = plane_store()
+        db = connect()
+        try:
+            rows = db.execute("SELECT id,output_dir FROM jobs WHERE status='done' AND output_dir IS NOT NULL").fetchall()
+        finally:
+            db.close()
+        baseline = store.baseline_complete()
+        for row in rows:
+            generation = current_summary_generation_id(Path(row["output_dir"]))
+            if not generation or store.known_generation(row["id"]) == generation:
+                continue
+            try:
+                plane_selected(row["id"], allow_auto=baseline)
+            except (ValueError, OSError, sqlite3.Error):
+                continue  # legacy generations remain readable, not auto-exported
+        if not baseline:
+            store.mark_baseline_complete()
+        if deliver:
+            store.drain_one()
+    except Exception as exc:
+        print("Очередь Plane: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
+
+
 def current_release_commit():
     """Return the checked-out release before consulting a deployment hint."""
     try:
@@ -652,7 +715,7 @@ def propagate_profile_name(profile_id, name):
 
 
 def voice_embedding_model_path():
-    matches = sorted((ROOT / "work" / "cache" / "huggingface" / "hub" / "models--pyannote--wespeaker-voxceleb-resnet34-LM" / "snapshots").glob("*/pytorch_model.bin"))
+    matches = sorted((DATA_ROOT / "work" / "cache" / "huggingface" / "hub" / "models--pyannote--wespeaker-voxceleb-resnet34-LM" / "snapshots").glob("*/pytorch_model.bin"))
     if not matches:
         raise FileNotFoundError("Модель голосовых отпечатков не установлена")
     return matches[-1]
@@ -1420,11 +1483,11 @@ def extract_redimnet_embeddings(groups, destination, log, cfg):
             str(ROOT / ".venv-fusion" / "bin" / "python"),
             str(ROOT / "scripts" / "redimnet_worker.py"),
             "--manifest", str(manifest), "--output", str(destination),
-            "--cache", str(ROOT / "work" / "cache"),
+            "--cache", str(DATA_ROOT / "work" / "cache"),
             "--device", str(cfg.get("redimnet_device", "auto")),
             "--repository", cfg["redimnet_repository"],
             "--revision", cfg["redimnet_revision"],
-        ], log, env=dict(os.environ, TORCH_HOME=str(ROOT / "work" / "cache" / "torch"), PYTHONUNBUFFERED="1"))
+        ], log, env=dict(os.environ, TORCH_HOME=str(DATA_ROOT / "work" / "cache" / "torch"), PYTHONUNBUFFERED="1"))
         key_path.write_text(key + "\n", encoding="utf-8")
     finally:
         manifest.unlink(missing_ok=True)
@@ -1876,7 +1939,7 @@ def process_job(job_id):
         diagnostic_decision("stage_cache.diarizen", "hit" if diar_cached else "miss", metrics={"cache_key": diar_key}, refs={"artifacts": ["diarization.json", "diarization.rttm"]})
         if not diar_cached:
             update_job(db, job_id, stage="diarization", progress=15, detail="DiariZen: определяю участников")
-            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "diarizen"), PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "diarizen"), PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(DATA_ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(DATA_ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(DATA_ROOT / "work" / "pycache"))
             def diarization_progress(line):
                 markers = {
                     "Extracting segmentations.": (20, "DiariZen: анализирую участки речи"),
@@ -1905,7 +1968,7 @@ def process_job(job_id):
             diarization_command = [
                 str(ROOT / ".venv-diarizen" / "bin" / "python"), str(ROOT / "scripts" / "diarize_worker.py"),
                 "--audio", str(audio), "--output", str(diar_json), "--rttm", str(rttm),
-                "--model", cfg["diarization_model"], "--cache", str(ROOT / "work" / "cache" / "huggingface" / "hub"),
+                "--model", cfg["diarization_model"], "--cache", str(DATA_ROOT / "work" / "cache" / "huggingface" / "hub"),
                 "--revision", cfg["diarization_model_revision"],
                 "--embedding-model", cfg["diarization_embedding_model"],
                 "--embedding-revision", cfg["diarization_embedding_revision"],
@@ -1923,12 +1986,12 @@ def process_job(job_id):
         diagnostic_decision("stage_cache.ultra", "hit" if ultra_cached else "miss", metrics={"cache_key": ultra_key}, refs={"artifacts": ["ultra.json", "ultra.rttm"]})
         if not ultra_cached:
             update_job(db, job_id, stage="ultra_diarization", progress=57, detail="Ultra Sortformer: независимо проверяю участников")
-            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "ultra"), PYTHONUNBUFFERED="1", HF_HOME=str(ROOT / "work" / "cache" / "ultra"), TORCH_HOME=str(ROOT / "work" / "cache" / "torch"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "ultra"), PYTHONUNBUFFERED="1", HF_HOME=str(DATA_ROOT / "work" / "cache" / "ultra"), TORCH_HOME=str(DATA_ROOT / "work" / "cache" / "torch"))
             run_command([
                 str(ROOT / ".venv-fusion" / "bin" / "python"), str(ROOT / "scripts" / "ultra_worker.py"),
                 "--audio", str(audio), "--output", str(ultra_json), "--rttm", str(ultra_rttm),
                 "--model", cfg.get("ultra_model", "mago-ai/ultra_diar_streaming_sortformer_8spk_v1"),
-                "--cache", str(ROOT / "work" / "cache" / "ultra"), "--device", cfg.get("ultra_device", "auto"),
+                "--cache", str(DATA_ROOT / "work" / "cache" / "ultra"), "--device", cfg.get("ultra_device", "auto"),
                 "--revision", cfg["ultra_model_revision"],
             ], log, env=env)
             mark_stage_cached(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
@@ -1947,7 +2010,7 @@ def process_job(job_id):
         diagnostic_decision("stage_cache.asr", "hit" if asr_cached else "miss", metrics={"cache_key": asr_key}, refs={"artifacts": ["asr.json"]})
         if not asr_cached:
             update_job(db, job_id, stage="transcription", progress=68, detail="GigaAM: готовлю распознавание речи")
-            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "asr"), PYTHONPATH=str(ROOT / "scripts"), PYTORCH_ENABLE_MPS_FALLBACK="1", HF_HOME=str(ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(ROOT / "work" / "pycache"))
+            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "asr"), PYTHONPATH=str(ROOT / "scripts"), PYTORCH_ENABLE_MPS_FALLBACK="1", HF_HOME=str(DATA_ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(DATA_ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(DATA_ROOT / "work" / "pycache"))
             def transcription_progress(line):
                 prefix = "PIPELINE_PROGRESS "
                 if not line.startswith(prefix):
@@ -1960,7 +2023,7 @@ def process_job(job_id):
             run_command([
                 str(ROOT / ".venv-gigaam" / "bin" / "python"), str(ROOT / "scripts" / "asr_worker.py"),
                 "--audio", str(audio), "--output", str(asr_json), "--model", cfg["gigaam_model"],
-                "--cache", str(ROOT / "work" / "cache" / "gigaam"), "--device", cfg["asr_device"],
+                "--cache", str(DATA_ROOT / "work" / "cache" / "gigaam"), "--device", cfg["asr_device"],
                 "--vad-threshold", str(cfg["vad_threshold"]),
                 "--vad-min-speech-ms", str(cfg["vad_min_speech_ms"]),
                 "--vad-min-silence-ms", str(cfg["vad_min_silence_ms"]),
@@ -2574,6 +2637,7 @@ def summary_scheduler(once=False):
                 # The next ordinary scheduler tick may recover a known remote
                 # ID. It must never convert an unknown POST into a new POST.
                 print("Ошибка очереди суммаризатора: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
+            plane_scheduler_tick()
             if once:
                 return
             time.sleep(60)
@@ -2710,7 +2774,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_summary_admin_json({"error": "Управление суммаризатором не настроено"}, 503)
             return False
         try:
-            local_peer = ipaddress.ip_address(self.client_address[0]).is_loopback
+            peer = ipaddress.ip_address(self.client_address[0])
+            local_peer = peer.is_loopback or any(
+                peer in ipaddress.ip_network(network.strip(), strict=True)
+                for network in os.environ.get("TRANSCRI_SUMMARY_ADMIN_ALLOWED_PEERS", "").split(",")
+                if network.strip())
         except ValueError:
             local_peer = False
         if not local_peer or self.headers.get("Host", "").lower() != urlsplit(expected_origin).netloc.lower():
@@ -2872,6 +2940,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/summary/plane/"):
+            if not self.require_summary_admin(write=True):
+                return
+            body = self.summary_admin_request_json(max_bytes=16384)
+            if body is None:
+                return
+            try:
+                store = plane_store()
+                action = parsed.path.removeprefix("/api/summary/plane/")
+                if action == "settings":
+                    # Register the existing library before enabling automation.
+                    # Configuration never silently backfills historical meetings.
+                    plane_scheduler_tick(deliver=False)
+                    result = store.save_settings(body)
+                elif action == "check":
+                    result = store.check()
+                elif action == "create":
+                    result = plane_selected(body.get("job_id"), create=body)[2]
+                else:
+                    self.send_summary_admin_json({"error":"Неизвестная операция"},404)
+                    return
+                self.send_summary_admin_json(result)
+            except (ValueError, CredentialError) as exc:
+                self.send_summary_admin_json({"error":str(exc)[:300]},409)
+            except (OSError, sqlite3.Error):
+                self.send_summary_admin_json({"error":"Хранилище Plane недоступно"},503)
+            return
         if parsed.path.startswith("/api/summary/credentials/"):
             self.handle_summary_credential_write(parsed.path)
             return
@@ -2910,6 +3005,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (OSError, sqlite3.Error):
                 self.send_summary_admin_json({"error": "Карточку не удалось сохранить"}, 500)
                 return
+            try:
+                plane_selected(job_id)
+            except (ValueError, CredentialError, OSError, sqlite3.Error):
+                pass  # A local edit is durable even when Plane is unavailable.
             self.send_summary_admin_json(view.public())
             return
         if parsed.path == "/api/profiles/create":
@@ -3308,6 +3407,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path in ("/plane-settings", "/plane-settings.js", "/plane-actions.js",
+                           "/api/summary/plane/settings", "/api/summary/plane/items"):
+            if not self.require_summary_admin():
+                return
+            try:
+                if parsed.path == "/api/summary/plane/settings":
+                    self.send_summary_admin_json(plane_store().public_settings())
+                elif parsed.path == "/api/summary/plane/items":
+                    job_id = parse_qs(parsed.query).get("job_id", [""])[0]
+                    self.send_summary_admin_json(plane_selected(job_id)[2])
+                else:
+                    filename = {"/plane-settings":"plane_settings.html", "/plane-settings.js":"plane_settings.js", "/plane-actions.js":"plane_actions.js"}[parsed.path]
+                    self.send_summary_admin_bytes((ROOT / filename).read_bytes(),
+                        "text/html; charset=utf-8" if filename.endswith("html") else "text/javascript; charset=utf-8")
+            except (ValueError, CredentialError) as exc:
+                self.send_summary_admin_json({"error":str(exc)[:300]},409)
+            except (OSError, sqlite3.Error):
+                self.send_summary_admin_json({"error":"Plane недоступен"},503)
+            return
         if parsed.path in ("/summary-tasks", "/summary-tasks.js", "/api/summary/tasks"):
             if not self.require_summary_admin():
                 return
@@ -3463,8 +3581,17 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
             ready = bool(body_path and body_path.is_file())
             luna = bool(package and load_json(package / "generation_manifest.json").get("contract_version") == "luna_summary_v1")
             try:
-                content = (luna_effective_view(Path(row["output_dir"])).rendered["summary.fragment.html"]
-                           if ready and luna else body_path.read_text(encoding="utf-8") if ready else "")
+                if ready and luna:
+                    selected = luna_effective_view(Path(row["output_dir"]))
+                    content = selected.rendered["summary.fragment.html"]
+                    try:
+                        from summary.plane_projection import add_action_controls
+                        idea_ids = plane_store().hypothesis_ids(selected.source_sha256, selected.rendered["summary.json"]["ideas"])
+                        content = add_action_controls(content, selected.tasks, idea_ids)
+                    except (ValueError, CredentialError, OSError, sqlite3.Error):
+                        pass  # Plane configuration never hides an accepted summary
+                else:
+                    content = body_path.read_text(encoding="utf-8") if ready else ""
                 content = content.replace('href="transcript.html#', 'href="/result?id={}#'.format(job_id))
             except (ValueError, OSError, sqlite3.Error):
                 ready = False
@@ -3510,8 +3637,9 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                     if (package / name if name in {"summary.md", "summary.html", "transcript.html", "summary.json", "tasks.json", "semantic_records.json", "summary_audit.json", "publication_audit.json", "public_items.json", "run_manifest.json", "candidate_disposition.json", "evidence_versions.json"} else Path(row["output_dir"], name)).is_file()
                 )
             task_link = '<a href="/summary-tasks?id={}">Редактировать карточки</a>'.format(job_id) if ready and luna else ""
-            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}{task_link}<button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id},generation={generation};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST',headers:{{'X-Requested-With':'TranscriSummaryzator-Admin'}}}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';const changed=j.summary_generation_id&&j.summary_generation_id!==generation;if(j.summary_status==='done'&&(changed||document.querySelector('#content').style.display==='none'))location.reload()}}setInterval(refresh,2000)</script></body></html>""".format(
+            page = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Саммари — {title}</title><style>:root{{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}}*{{box-sizing:border-box}}body{{margin:0;background:#0c0e13;color:#eef1f7}}main{{width:min(980px,calc(100% - 32px));margin:32px auto 64px}}nav{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}}a,button{{display:inline-flex;align-items:center;padding:10px 13px;border:0;border-radius:10px;background:#252b37;color:#d8e9ff;text-decoration:none;font:650 14px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;cursor:pointer}}button.primary,a.primary{{background:#2d75e8;color:white}}article,.status{{background:#171a22;border:1px solid #292e3b;border-radius:20px;padding:24px;box-shadow:0 16px 50px #0005}}h1{{font-size:28px}}h2{{margin-top:34px;font-size:21px}}h3{{margin-top:25px;font-size:17px}}p,li{{font-size:17px;line-height:1.6}}li{{margin:8px 0}}.track{{height:16px;background:#292e3b;border-radius:99px;overflow:hidden;margin:18px 0}}.bar{{height:100%;background:linear-gradient(90deg,#377dff,#72d5ff);transition:width .4s}}.muted{{color:#8f99aa}}.error{{color:#ff8f98}}button:disabled{{opacity:.5;cursor:wait}}</style></head><body data-plane-job-id="{job_id}" data-plane-generation-id="{plane_generation}"><main><nav><a href="/">← К записям</a><a href="/result?id={job_id}">Расшифровка</a>{downloads}{task_link}<a href="/plane-settings">Plane</a><button class="primary" id="rerun" type="button">Создать заново</button></nav><div id="state" class="status" style="display:{state_display}"><strong id="statusText">{status}</strong><div class="track"><div class="bar" id="bar" style="width:{progress}%"></div></div><div class="muted" id="percent">{progress}%</div><div class="error">{error}</div></div>{fallback}<div id="plane-meeting-page"></div><article id="content" style="display:{content_display}">{content}</article></main><script>const id={job_id},generation={generation};const button=document.querySelector('#rerun');button.addEventListener('click',async()=>{{button.disabled=true;const r=await fetch('/api/summary?id='+id,{{method:'POST',headers:{{'X-Requested-With':'TranscriSummaryzator-Admin'}}}}),d=await r.json();if(!r.ok){{button.disabled=false;alert(d.error||'Ошибка')}}else location.reload()}});async function refresh(){{const d=await fetch('/api/status',{{cache:'no-store'}}).then(r=>r.json()),j=(d.jobs||[]).find(x=>x.id===id);if(!j)return;const p=Math.round(Number(j.summary_progress)||0);document.querySelector('#statusText').textContent=j.summary_detail||j.summary_status;document.querySelector('#bar').style.width=p+'%';document.querySelector('#percent').textContent=p+'%';const changed=j.summary_generation_id&&j.summary_generation_id!==generation;if(j.summary_status==='done'&&(changed||document.querySelector('#content').style.display==='none'))location.reload()}}setInterval(refresh,2000)</script><script src="/plane-actions.js" defer></script></body></html>""".format(
                 title=title, job_id=int(job_id), content=content,
+                plane_generation=html.escape(package.name if package else "", quote=True),
                 generation=json.dumps(package.name if package else None),
                 status=status, error=error, progress=round(float(row["summary_progress"] or 0)),
                 state_display="none" if ready and row["summary_status"] == "done" else "block", content_display="block" if ready else "none",
@@ -3583,7 +3711,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 def start_dashboard(background=False):
     port = int(config().get("dashboard_port", 8765))
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), DashboardHandler)
+        server = ThreadingHTTPServer((os.environ.get("TRANSCRI_DASHBOARD_HOST", "127.0.0.1"), port), DashboardHandler)
     except OSError:
         if background:
             return None

@@ -1,16 +1,76 @@
 # Архитектура TranscriSummaryzator
 
-## Текущее состояние кода и Linux deployment — 2026-09-28
+## Актуальный продукт — 2026-10-02
 
-| Контур | Фактическое состояние | Граница |
-|---|---|---|
-| Речь и действующий summary | `meeting-transcript.service` работает из `/mnt/shared-data/MeetingTranscript`, основа `87adbbe` с серверными runtime-изменениями. В нём остаётся legacy summary на локальных моделях. | Код `main` не равен автоматически текущему исполняемому release. Изменения summary не должны запускать ASR/диаризацию повторно. |
-| Удаление записей | Серверный dashboard использует `record_dashboard_wrapper.py` через systemd drop-in и актуальную разметку `dashboard.html`. | Обёртка удаляет terminal legacy-записи; output, связанный с Luna ledger, она отклоняет HTTP 409 даже после accepted. Совмещённый rollout пока не покрыт. Deployment-настройки и данные не публикуются в Git. |
-| Luna Batch | Dashboard и summary scheduler используют `/mnt/shared-data/transcri-work/summary-luna-source-first-r1-20260928`, tree `b70d4c5`, с включённой `luna_batch_source_first_v1`; конфигурация выбирает `summary_backend: luna_batch`. | Speech release не менялся. Прежний production pointer сохранён: изолированное поколение нового маршрута имеет `review_incomplete` и известные пропуски, поэтому не заменяло действующий конспект. |
+```mermaid
+flowchart LR
+  A[Запись] --> B[Локальные ASR и диаризация]
+  B --> C[Готовый transcript.json]
+  C --> D[Luna · OpenRouter Batch]
+  D --> E[Запечатанное поколение]
+  E --> F[Единое состояние + ручные правки]
+  F --> G[UI / Markdown / HTML / JSON]
+  F --> H[Очередь Plane]
+  H --> I[Задачи / гипотезы / Wiki встречи]
+```
 
-Этот репозиторий содержит legacy summary и отдельный Luna Batch маршрут. Вход новой policy — **готовый** `transcript.json` с U ID, speaker/time metadata. `summary/luna_v1/source_first_core.py` делает неизменяемый снимок, пакеты источника, реестр смыслов и локальную проверку; `source_first_runtime.py` ведёт последовательные Batch-волны writer/extract/audit/global/repair/verify через существующие scheduler, credential store и ledger. Версионированные инструкции находятся в `prompts_batch_v1/`, а типизированные sidecar-контракты — в `batch_stage_contracts_v1.py`. `summary/luna_v1/publication.py` публикует одно поколение после локальных проверок. `summary/luna_v1/tasks.py` хранит ручные версии карточек с необязательным исполнителем. Markdown, HTML, JSON и локальный task export строятся из одного effective state. Ключи вводятся через защищённый `/summary-settings` и хранятся на сервере в зашифрованном store. Схема, ограничения и откат этой policy описаны в [SUMMARY_LUNA_SOURCE_FIRST.md](docs/SUMMARY_LUNA_SOURCE_FIRST.md). Никакая часть пути не подключает Plane.
+### Границы исполнения
 
-Пользователь разрешил OpenRouter Batch с хранением входа и результата до 30 дней и **без provider ZDR**. Включённое отдельно I/O logging OpenRouter может хранить содержимое дольше; Batch DELETE не удаляет автоматически такие логи. Это внешний inference только для summary; аудио, voice embeddings и полный evidence ledger туда не передаются. Для новой policy разрешён и установлен предел $0.25/job; общий предел — $5 за скользящие семь дней через все ключи. Полный приёмочный прогон занял 8 items и $0.043585. Его `review_incomplete` не является доказательством полной смысловой сверки. Стоимость и качество устанавливаются по terminal ledger и источниковой проверке, а не по описанию архитектуры.
+Речевые модели и их окружения отделены от summary runtime. Вход Luna — готовая
+стенограмма и существующие source IDs; новый конспект не вызывает повторное ASR.
+`source_first_core.py` строит snapshot, пакеты и локальные проверки;
+`source_first_runtime.py` исполняет Batch-волны через общий scheduler/ledger.
+Типизированные sidecars и versioned prompts остаются в `summary/luna_v1/`.
+Подробный контракт: [Luna Batch source-first](docs/SUMMARY_LUNA_SOURCE_FIRST.md).
+Результат проверки моделью не является доказанной истиной или гарантией полноты.
+
+`publication.py` публикует одно sealed generation. `tasks.py` хранит независимые
+ручные правки и постоянные action IDs. `task_api.py` читает принятый документ и
+эти правки; все представления используют один effective state. Неизвестный
+исполнитель не мешает существованию карточки. Старые поколения сохраняются.
+
+### Plane: независимая доставка опубликованного результата
+
+После явного решения пользователя интеграция Plane разрешена. Новый
+`summary/plane_projection.py` читает **принятый** effective document и формирует
+описания карточек/гипотез, Wiki с восемью разделами и ссылки на U IDs.
+`summary/plane.py` хранит зашифрованный ключ, CAS-конфигурацию, identities и durable
+outbox в приватной SQLite `state/summary_private/plane.sqlite3`. Это очередь
+доставки, не второй генератор или источник истины для саммари.
+
+- `/plane-settings` защищён тем же admin/Origin/Host guard, что настройки ключей.
+- Задачи и гипотезы имеют независимые switches; выключенное автосоздание оставляет
+  ручные кнопки под конкретными пунктами. Wiki имеет отдельное управление.
+- Первый запуск запоминает существующие поколения; автоматического backfill нет.
+- Отправка вызывается существующим summary scheduler, без inference. Ошибка Plane
+  не меняет принятую generation и не блокирует speech.
+- Перед POST фиксируется intent; потерянный ответ восстанавливается чтением.
+  Новый POST после неизвестного исхода не выполняется вслепую.
+- Удалённые ручные правки не перезаписываются при regeneration: UI показывает
+  доступное локальное обновление и ссылку на прежний объект.
+- Имена из речи не превращаются в Plane user IDs. Поля остаются в описании;
+  автоматическое назначение человека по сходству имён отсутствует.
+
+[Plane: настройка и семантика](docs/PLANE.md). API v1 сверено с установленной
+Plane 3.1.0; наличие кода не подтверждает доступ к конкретному workspace.
+
+### Установка, данные и приватность
+
+[Docker](docs/DOCKER.md) разделяет исходники `/app`, данные `/data`, ключ шифрования
+и admin verifier `/secrets`. `TRANSCRI_DATA_DIR` меняет корень хранения; без этой
+переменной старые пути сохраняются. Docker peer CIDRs задаются явно, Host/Origin
+и пароль остаются обязательными. Публикация порта по умолчанию только loopback.
+
+Audio и voice metadata обрабатываются локально. OpenRouter получает текстовый
+summary input по отдельно согласованному Batch retention. Plane получает только
+отправляемые карточки и документ встречи. Ключи, частные fixtures, транскрипции,
+результаты и model caches не включаются в Git или Docker build context.
+Стоимость контролируется общим ledger и локальной политикой, а не числом ключей.
+
+Код `main`, собранный образ и реально исполняемый release — разные состояния.
+Проверенные ограничения и история находятся в [STATUS](docs/STATUS.md);
+deployment receipt хранится локально с точным commit/config. Запуск Docker не
+переключает автоматически существующую speech-службу.
 
 ### Legacy v27: архитектура прежнего действующего summary
 
