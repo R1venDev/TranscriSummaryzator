@@ -1,0 +1,21 @@
+# Linux amd64 with NVIDIA Container Toolkit. No production host paths mounted.
+services:
+  bootstrap:
+    image: ${TRANSCRI_SPEECH_IMAGE:-ghcr.io/r1vendev/transcrisummaryzator:speech}
+    platform: linux/amd64
+    build:
+      target: speech
+  app:
+    image: ${TRANSCRI_SPEECH_IMAGE:-ghcr.io/r1vendev/transcrisummaryzator:speech}
+    platform: linux/amd64
+    build:
+      target: speech
+    command: [watch]
+    shm_size: 2gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

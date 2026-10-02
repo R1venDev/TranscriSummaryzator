@@ -95,6 +95,8 @@ async function save(form, task, message, button) {
 }
 
 function render() {
+  document.body.dataset.planeJobId = jobId;
+  document.body.dataset.planeGenerationId = selected.generation_id;
   cards.replaceChildren();
   if (!selected.tasks.length) {
     cards.append(make('p', 'muted', 'В выбранной версии конспекта нет карточек задач.'));
@@ -125,8 +127,19 @@ function render() {
     const message = make('span', 'status');
     actions.append(button, message); form.append(actions);
     form.addEventListener('submit', event => { event.preventDefault(); save(form, task, message, button); });
+    const planeAction = make('div', 'plane-action');
+    planeAction.dataset.planeKind = 'task';
+    planeAction.dataset.planeItemId = task.action_id;
+    const markChanges = () => {
+      planeAction.dataset.planeDirty = String(Object.keys(pendingChanges(form, task)).length > 0);
+      document.dispatchEvent(new Event('plane:render'));
+    };
+    form.addEventListener('input', markChanges);
+    form.addEventListener('change', markChanges);
+    article.append(planeAction);
     cards.append(article);
   });
+  document.dispatchEvent(new Event('plane:refresh'));
 }
 
 async function load() {

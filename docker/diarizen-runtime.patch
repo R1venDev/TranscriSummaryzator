@@ -1,0 +1,179 @@
+diff --git a/diarizen/pipelines/inference.py b/diarizen/pipelines/inference.py
+index 4ec8d26..24b4ee3 100644
+--- a/diarizen/pipelines/inference.py
++++ b/diarizen/pipelines/inference.py
+@@ -3,6 +3,7 @@
+ # Copyright 2025 Brno University of Technology (author: Jiangyu Han, ihan@fit.vut.cz)
+ 
+ import argparse
++import json
+ import os
+ from io import BytesIO
+ from pathlib import Path
+@@ -123,10 +124,25 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
+             f"input must be either a str, BytesIO or a ProtocolFile; there was {type(in_wav)}"
+         in_wav = in_wav if not isinstance(in_wav, ProtocolFile) else in_wav['audio']
+ 
+-        print('Extracting segmentations.')
++        def progress_hook(step, _artifact, total=None, completed=None):
++            if total is None or completed is None:
++                return
++            print(
++                "DIARIZEN_PROGRESS "
++                + json.dumps(
++                    {"step": step, "current": int(completed), "total": int(total)}
++                ),
++                flush=True,
++            )
++
++        print('Extracting segmentations.', flush=True)
+         waveform, sample_rate = torchaudio.load(in_wav)
+         waveform = torch.unsqueeze(waveform[0], 0)      # force to use the SDM data
+-        segmentations = self.get_segmentations({"waveform": waveform, "sample_rate": sample_rate}, soft=False)
++        segmentations = self.get_segmentations(
++            {"waveform": waveform, "sample_rate": sample_rate},
++            hook=progress_hook,
++            soft=False,
++        )
+ 
+         if self.apply_median_filtering:
+             segmentations.data = median_filter(segmentations.data, size=(1, 11, 1), mode='reflect')
+@@ -141,18 +157,26 @@ class DiariZenPipeline(SpeakerDiarizationPipeline):
+             warm_up=(0.0, 0.0),
+         )
+ 
+-        print("Extracting Embeddings.")
++        print("Extracting Embeddings.", flush=True)
+         embeddings = self.get_embeddings(
+             {"waveform": waveform, "sample_rate": sample_rate},
+             binarized_segmentations,
+             exclude_overlap=self.embedding_exclude_overlap,
++            hook=progress_hook,
+         )
+ 
+         # shape: (num_chunks, local_num_speakers, dimension)
+-        print("Clustering.")
++        print("Clustering.", flush=True)
++        requested_num_speakers = getattr(self, "num_speakers", None)
++        print(
++            f"Speaker constraints: exact={requested_num_speakers}, "
++            f"min={self.min_speakers}, max={self.max_speakers}",
++            flush=True,
++        )
+         hard_clusters, _, _ = self.clustering(
+             embeddings=embeddings,
+             segmentations=binarized_segmentations,
++            num_clusters=requested_num_speakers,
+             min_clusters=self.min_speakers,
+             max_clusters=self.max_speakers
+         )
+diff --git a/pyannote-audio/pyannote/audio/core/model.py b/pyannote-audio/pyannote/audio/core/model.py
+index a13212d..c116ed1 100644
+--- a/pyannote-audio/pyannote/audio/core/model.py
++++ b/pyannote-audio/pyannote/audio/core/model.py
+@@ -457,7 +457,13 @@ class Model(nn.Module):
+                 map_location = default_map_location
+ 
+             # obtain model class from the checkpoint
+-            loaded_checkpoint = pl_load(path_for_pl, map_location=map_location)
++            # This is an official pyannote checkpoint downloaded from the
++            # configured Hugging Face model. PyTorch 2.6+ defaults to the
++            # restricted weights-only loader, while this legacy Lightning
++            # checkpoint also stores architecture metadata.
++            loaded_checkpoint = pl_load(
++                path_for_pl, map_location=map_location, weights_only=False
++            )
+             module_name: str = loaded_checkpoint["pyannote.audio"]["architecture"]["module"]
+             module = import_module(module_name)
+             class_name: str = loaded_checkpoint["pyannote.audio"]["architecture"]["class"]
+@@ -469,6 +475,7 @@ class Model(nn.Module):
+                     map_location=map_location,
+                     hparams_file=hparams_file,
+                     strict=strict,
++                    weights_only=False,
+                     **kwargs,
+                 )
+             except RuntimeError as e:
+@@ -484,6 +491,7 @@ class Model(nn.Module):
+                         map_location=map_location,
+                         hparams_file=hparams_file,
+                         strict=False,
++                        weights_only=False,
+                         **kwargs,
+                     )
+                     return model
+@@ -493,4 +501,4 @@ class Model(nn.Module):
+             return model
+ 
+ if __name__ == '__main__':
+-    nnet = Model()
+\ No newline at end of file
++    nnet = Model()
+diff --git a/pyannote-audio/pyannote/audio/pipelines/clustering.py b/pyannote-audio/pyannote/audio/pipelines/clustering.py
+index 60de6ba..4401a96 100644
+--- a/pyannote-audio/pyannote/audio/pipelines/clustering.py
++++ b/pyannote-audio/pyannote/audio/pipelines/clustering.py
+@@ -637,7 +637,7 @@ class VBxClustering(BaseClustering):
+         min_clusters: Optional[int] = None,     # not used but kept for compatibility
+         max_clusters: Optional[int] = None,     # not used but kept for compatibility
+     ) -> np.ndarray:
+-        train_embeddings, _, _ = self.filter_embeddings(
++        train_embeddings, train_chunk_idx, train_speaker_idx = self.filter_embeddings(
+             embeddings,
+             segmentations=segmentations,
+             min_frames_ratio=0.1
+@@ -668,6 +668,29 @@ class VBxClustering(BaseClustering):
+             Fa=self.Fa, Fb=self.Fb, maxIters=self.maxIters 
+         )
+ 
++        # Upstream VBx keeps these arguments only for API compatibility and
++        # otherwise ignores them.  That can return more speakers than the
++        # caller explicitly allows.  When an exact count is requested, or
++        # VBx exceeds the maximum, fall back to the already computed AHC tree
++        # and cut it at the requested number of speakers.
++        vbx_num_clusters = int(np.sum(sp > 1e-7))
++        forced_num_clusters = num_clusters
++        if forced_num_clusters is None and max_clusters is not None:
++            if vbx_num_clusters > max_clusters:
++                forced_num_clusters = max_clusters
++        if forced_num_clusters is not None:
++            forced_clusters = (
++                fcluster(dendrogram, forced_num_clusters, criterion="maxclust") - 1
++            )
++            _, forced_clusters = np.unique(forced_clusters, return_inverse=True)
++            return self.assign_embeddings(
++                embeddings,
++                train_chunk_idx,
++                train_speaker_idx,
++                forced_clusters,
++                constrained=self.constrained_assignment,
++            )
++
+         # calculate distance
+         num_chunks, num_speakers, dimension = embeddings.shape
+         centroids = (q[:, sp > 1e-7].T @ train_embeddings.reshape(-1, dimension))  # not division needed, cos-sim follows
+diff --git a/pyannote-audio/pyannote/audio/tasks/segmentation/mixins.py b/pyannote-audio/pyannote/audio/tasks/segmentation/mixins.py
+index cf6e300..e0f6003 100644
+--- a/pyannote-audio/pyannote/audio/tasks/segmentation/mixins.py
++++ b/pyannote-audio/pyannote/audio/tasks/segmentation/mixins.py
+@@ -31,7 +31,19 @@ import torch
+ from pyannote.database.protocol.protocol import Scope, Subset
+ from pytorch_lightning.loggers import MLFlowLogger, TensorBoardLogger
+ from torch.utils.data._utils.collate import default_collate
+-from torchaudio import AudioMetaData
++try:
++    from torchaudio import AudioMetaData
++except ImportError:
++    from typing import NamedTuple
++
++    class AudioMetaData(NamedTuple):
++        """Compatibility type removed from recent torchaudio releases."""
++
++        sample_rate: int
++        num_frames: int
++        num_channels: int
++        bits_per_sample: int
++        encoding: str
+ from torchmetrics import Metric
+ from torchmetrics.classification import BinaryAUROC, MulticlassAUROC, MultilabelAUROC
+ 

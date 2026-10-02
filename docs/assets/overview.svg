@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="460" viewBox="0 0 1440 460" role="img" aria-labelledby="title description">
+  <title id="title">TranscriSummaryzator</title>
+  <desc id="description">A meeting workflow with local speech processing, remote Luna Batch summaries, and optional Plane pages and tasks.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#101b2d"/><stop offset="1" stop-color="#0c111b"/></linearGradient>
+    <linearGradient id="accent" x2="1"><stop stop-color="#56dfc6"/><stop offset="1" stop-color="#83b4ff"/></linearGradient>
+  </defs>
+  <rect width="1440" height="460" rx="26" fill="url(#background)"/>
+  <path d="M52 100h8m10-20v40m14-54v68m14-48v28m14-38v48m14-29h8" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="166" y="103" fill="#f1f5fb" font-size="42" font-weight="700" letter-spacing="-1.2">TranscriSummaryzator</text>
+    <text x="56" y="164" fill="#aab9cd" font-size="23">Meeting notes with traceable sources.</text>
+    <g transform="translate(56 218)">
+      <rect width="390" height="160" rx="16" fill="#182436" stroke="#34485e"/>
+      <text x="26" y="36" fill="#64ddc9" font-size="13" font-weight="700" letter-spacing="2">ON YOUR MACHINE</text>
+      <text x="26" y="76" fill="#f1f5fb" font-size="27" font-weight="600">Audio → transcript</text>
+      <text x="26" y="108" fill="#aab9cd" font-size="18">Speech · speakers · timestamps</text>
+      <text x="26" y="137" fill="#778ba7" font-size="15">GigaAM / DiariZen / voice profiles</text>
+    </g>
+    <path d="M462 298h40m-9-9 9 9-9 9" fill="none" stroke="#6b859f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g transform="translate(518 218)">
+      <rect width="390" height="160" rx="16" fill="#182436" stroke="#34485e"/>
+      <text x="26" y="36" fill="#91b9ff" font-size="13" font-weight="700" letter-spacing="2">REMOTE SUMMARY</text>
+      <text x="26" y="76" fill="#f1f5fb" font-size="27" font-weight="600">Sources → meeting notes</text>
+      <text x="26" y="108" fill="#aab9cd" font-size="18">Decisions · tasks · hypotheses</text>
+      <text x="26" y="137" fill="#778ba7" font-size="15">Luna via OpenRouter Batch</text>
+    </g>
+    <path d="M924 298h40m-9-9 9 9-9 9" fill="none" stroke="#6b859f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <g transform="translate(980 218)">
+      <rect width="404" height="160" rx="16" fill="#182436" stroke="#34485e"/>
+      <text x="26" y="36" fill="#d9bbff" font-size="13" font-weight="700" letter-spacing="2">OPTIONAL · PLANE</text>
+      <text x="26" y="76" fill="#f1f5fb" font-size="27" font-weight="600">Notes → next steps</text>
+      <text x="26" y="108" fill="#aab9cd" font-size="18">Meeting Wiki · work items</text>
+      <text x="26" y="137" fill="#778ba7" font-size="15">Manual actions or separate auto switches</text>
+    </g>
+    <text x="56" y="420" fill="#778ba7" font-size="16">Review the source. Edit a task. Keep the history.</text>
+  </g>
+</svg>

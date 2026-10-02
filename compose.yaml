@@ -1,0 +1,64 @@
+name: transcri
+
+x-runtime: &runtime
+  image: ${TRANSCRI_IMAGE:-ghcr.io/r1vendev/transcrisummaryzator:summary}
+  build:
+    context: .
+    target: summary
+    args:
+      SOURCE_REVISION: ${TRANSCRI_SOURCE_REVISION:-unknown}
+  restart: unless-stopped
+  read_only: true
+  user: "10001:10001"
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 2m
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=256m,mode=1777
+  volumes:
+    - data:/data
+    - secrets:/secrets:ro
+  environment: &environment
+    TRANSCRI_DATA_DIR: /data
+    TRANSCRI_CONFIG_FILE: /data/config.json
+    TRANSCRI_SUMMARY_ADMIN_ORIGIN: ${TRANSCRI_PUBLIC_ORIGIN:-http://127.0.0.1:8765}
+    TRANSCRI_SUMMARY_ADMIN_ALLOWED_PEERS: ${TRANSCRI_ADMIN_ALLOWED_PEERS:-172.16.0.0/12,192.168.0.0/16}
+    TRANSCRI_LUNA_SOURCE_FIRST_ENABLED: "1"
+    TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD: "0.25"
+    TRANSCRI_SUMMARY_VERIFIED_WORKSPACE_ID: ${TRANSCRI_SUMMARY_VERIFIED_WORKSPACE_ID:-}
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  bootstrap:
+    <<: *runtime
+    profiles: [setup]
+    restart: "no"
+    command: [bootstrap]
+    volumes:
+      - data:/data
+      - secrets:/secrets
+  app:
+    <<: *runtime
+    command: [dashboard]
+    ports:
+      - "127.0.0.1:${TRANSCRI_PORT:-8765}:8765"
+    healthcheck:
+      test: [CMD, /opt/summary/bin/python, /app/docker/healthcheck.py]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+  scheduler:
+    <<: *runtime
+    command: [summary-scheduler]
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  data:
+  secrets:

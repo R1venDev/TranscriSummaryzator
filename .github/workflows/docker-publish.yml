@@ -1,0 +1,111 @@
+name: Publish Docker images
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Optional new immutable release version (for example 2026.10.02)
+        required: false
+        type: string
+
+# Serialize main/tag/manual publication so one commit tag is built only once.
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [summary, speech]
+    env:
+      IMAGE_VARIANT: ${{ matrix.variant }}
+      RELEASE_VERSION: ${{ inputs.release_version || '' }}
+    steps:
+      # SHAs resolved against these official repositories on 2026-10-02.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve immutable commit image
+        id: identity
+        run: python3 docker/publish.py prepare
+      - name: Make room for the speech image on this disposable hosted runner
+        if: matrix.variant == 'speech' && steps.identity.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache
+          available_kb=$(df --output=avail -k / | tail -1)
+          if (( available_kb < 50 * 1024 * 1024 )); then
+            echo 'Speech build needs at least 50 GiB free on this temporary runner.' >&2
+            exit 1
+          fi
+          df -h /
+      - name: Build, verify, and publish commit image
+        if: steps.identity.outputs.exists != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: ${{ matrix.variant }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.identity.outputs.commit_image }}
+          build-args: |
+            SOURCE_REVISION=${{ github.sha }}
+            RELEASE_VERSION=sha-${{ github.sha }}
+          cache-from: type=registry,ref=${{ steps.identity.outputs.image }}:buildcache-${{ matrix.variant }}
+          cache-to: type=registry,ref=${{ steps.identity.outputs.image }}:buildcache-${{ matrix.variant }},mode=max
+          provenance: mode=max
+          sbom: true
+      - name: Verify summary install and restart with synthetic data
+        if: matrix.variant == 'summary'
+        env:
+          TEST_IMAGE: ${{ steps.identity.outputs.commit_image }}
+        run: |
+          docker pull "$TEST_IMAGE"
+          python3 docker/smoke.py --image "$TEST_IMAGE"
+  promote:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_VERSION: ${{ inputs.release_version || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote both verified images after the entire build matrix passes
+        run: |
+          IMAGE_VARIANT=summary python3 docker/publish.py validate
+          IMAGE_VARIANT=speech python3 docker/publish.py validate
+          IMAGE_VARIANT=summary python3 docker/publish.py promote
+          IMAGE_VARIANT=speech python3 docker/publish.py promote
