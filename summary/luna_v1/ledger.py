@@ -976,8 +976,10 @@ class Ledger:
                              evidence_path: Path, evidence_sha256: str) -> str:
         """A missing remote record is locally unavailable, never a zero bill.
 
-        Require two workspace-confirmed observations at least five minutes
-        apart. This permits partial-review publication without resubmitting
+        Require repeated workspace-confirmed observations across the entire
+        24-hour Batch completion window after the first absence. Temporary
+        404s have been observed during legitimate in-flight processing.
+        This permits partial-review publication without resubmitting
         the missing items or declaring an upstream terminal outcome.
         """
         if (not _full_hash(evidence_sha256)
@@ -1004,14 +1006,14 @@ class Ledger:
                 raise ValueError("missing Batch identity or lease changed")
             first = row["missing_since"] if row["missing_since"] is not None else now
             count = row["missing_reads"] + 1
-            unavailable = count >= 2 and now - first >= 300
+            unavailable = count >= 2 and now - first >= 24 * 3600
             status = "remote_unavailable" if unavailable else "polling"
             self.db.execute("""UPDATE batch_attempts SET status=?,missing_since=?,
                 missing_reads=?,missing_evidence_path=?,missing_evidence_sha256=?,
                 error_code='remote_batch_not_found',next_poll_at=?,updated_at=?,
                 lease_owner=NULL,lease_until=NULL WHERE id=?""",
                 (status, first, count, str(evidence_path), evidence_sha256,
-                 None if unavailable else now + 300, now, attempt_id))
+                 None if unavailable else now + min(3600, count * 300), now, attempt_id))
             if unavailable:
                 self.db.execute("""UPDATE batch_items SET status='unavailable',
                     error_code='remote_batch_not_found',updated_at=? WHERE attempt_id=?

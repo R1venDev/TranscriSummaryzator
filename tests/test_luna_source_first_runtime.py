@@ -242,7 +242,8 @@ class SourceFirstRuntimeTests(unittest.TestCase):
             def submit_prepared(self, *_a, **_kw): raise AssertionError("Never retry missing Batch")
         base = time.time()
         with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
-            for offset, expected in ((121, "polling"), (422, "remote_unavailable")):
+            for offset, expected in ((121, "polling"), (422, "polling"),
+                                     (86_522, "remote_unavailable")):
                 with patch("summary.luna_v1.ledger.time.time", return_value=base + offset):
                     result = _poll_attempt(ledger=self.ledger,
                         attempt=self.ledger.get_batch_attempt(attempt_id), workflow=self.workflow,
