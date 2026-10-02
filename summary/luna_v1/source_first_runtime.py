@@ -43,6 +43,7 @@ from .ledger import (
 )
 from .render import HEADINGS
 from .route import Route, RouteBlocked, verify_source_first_batch_route
+from .capacity import CAPACITY_POLICY, allocate_outputs, input_cost
 from .source_first_core import (
     POLICY_VERSION, SourceSnapshot, accepted_patch_document, build_surfaces,
     canonical_bytes, digest, load_snapshot, normalize_inventories,
@@ -50,12 +51,12 @@ from .source_first_core import (
     salvage_inventory, validate_audit, validate_global, validate_inventory, validate_patch_plan,
     validate_verification, safe_mark_document, remap_mark_targets,
 )
+from .review_salvage import salvage_review
 from .tasks import ReconciliationConflict, RevisionConflict, TaskStore
 from .publication import adopt_sealed_generation, publish_document
 
 
-STAGE_CAPS = {"writer": 32_000, "extract": 25_000, "audit": 25_000,
-              "global": 25_000, "repair": 25_000, "verify": 25_000}
+STAGES = ("writer", "extract", "audit", "global", "repair", "verify")
 STAGE_EFFORT = {"writer": "medium", "extract": "medium", "audit": "high",
                 "global": "high", "repair": "high", "verify": "high"}
 _DEFINITE_REJECTION = frozenset({400, 401, 402, 403, 404, 422})
@@ -141,15 +142,16 @@ def _manifest(snapshot: SourceSnapshot, packets: tuple[dict, ...], dimensions: d
         "model_submit_slug": route.model,
         "resolved_batch_endpoint": route.batch_endpoint_model,
         "provider_endpoint_tag": route.provider_endpoint_tag,
-        "prompt_hashes": {stage: prompt_sha256_for_stage(stage) for stage in STAGE_CAPS},
-        "schema_hashes": {stage: digest(schema_for_stage(stage)) for stage in STAGE_CAPS},
+        "prompt_hashes": {stage: prompt_sha256_for_stage(stage) for stage in STAGES},
+        "schema_hashes": {stage: digest(schema_for_stage(stage)) for stage in STAGES},
         "force_nonce": force_nonce,
         "dimensions": dimensions,
         "planned_capacity_microusd": planned_capacity_microusd,
         "capacity_basis": {
             "forecast_microusd": forecast_microusd,
             "source_bytes": len(snapshot.source_text.encode("utf-8")),
-            "item_caps": STAGE_CAPS,
+            "output_capacity_policy": CAPACITY_POLICY,
+            "verified_endpoint_output_limit": route.max_completion_tokens,
             "prompt_usd_per_token": str(route.prompt_usd_per_token),
             "completion_usd_per_token": str(route.completion_usd_per_token),
             "cache_write_usd_per_token": str(route.cache_write_usd_per_token),
@@ -170,17 +172,19 @@ def _user_json(payload: dict) -> str:
     return canonical_bytes(payload).decode("utf-8")
 
 
-def _chat_body(stage: str, payload: dict) -> dict:
+def _chat_body(stage: str, payload: dict, *, output_cap: int | None = None) -> dict:
     """OpenRouter Chat item body; no tools, sampling, stream or sync endpoint."""
-    return {
+    body = {
         "messages": [
             {"role": "developer", "content": developer_message_for_stage(stage)},
             {"role": "user", "content": _user_json(payload)},
         ],
         "response_format": response_format_for_stage(stage),
-        "max_tokens": STAGE_CAPS[stage],
         "reasoning": {"effort": STAGE_EFFORT[stage]},
     }
+    if output_cap is not None:
+        body["max_tokens"] = output_cap
+    return body
 
 
 def _writer_payload(snapshot: SourceSnapshot) -> dict:
@@ -239,7 +243,7 @@ def _batch_intent(*, ledger: Ledger, workflow: dict, stage: str,
     item_intents: list[BatchItemIntent] = []
     for custom_id, body in items:
         reserve = route.reserve_microusd(canonical_bytes(body),
-                                         max_completion_tokens=STAGE_CAPS[stage],
+                                         max_completion_tokens=body["max_tokens"],
                                          authorized_job_cap_microusd=workflow["planned_reserve_microusd"])
         item_intents.append(batch_item_intent_for_body(
             custom_id, body, reserve_microusd=reserve))
@@ -284,26 +288,58 @@ def _post_reserved(*, ledger: Ledger, attempt_id: str, payload_path: Path,
 
 def _planned_capacity_hold(route: Route, snapshot: SourceSnapshot,
                            packets: tuple[dict, ...]) -> int:
-    """Conservative full-chain admission based on real source and item caps.
+    """Known source-input cost only; output is allocated from the saved cap.
 
-    The future D0 cannot be measured before S1.  This intentionally excludes
-    its bytes but includes every potential output cap and the actual source
-    bytes required by future source checks.  Each later exact intent is still
-    reserved against the shared ledger before POST.
+    The UI must not present this floor as a quote for unknown future reports.
+    Later exact bodies and reasoning/output capacity are reserved before POST.
     """
     source_bytes = len(snapshot.source_text.encode("utf-8"))
     packet_bytes = sum(len(canonical_bytes(packet["records"])) for packet in packets)
-    input_bytes = source_bytes * 4 + packet_bytes * 2
-    input_upper = (input_bytes * 6 + 4) // 5
-    # Budget the stages this implementation can actually dispatch. The two
-    # optional recovery slots are not implemented and cannot incur a bill.
-    item_count = 1 + len(packets) * 2 + 1 + 2
-    output_tokens = STAGE_CAPS["writer"] + (item_count - 1) * STAGE_CAPS["extract"]
-    charge = (Decimal(input_upper) * max(route.prompt_usd_per_token,
-                                          route.cache_write_usd_per_token)
-              + Decimal(output_tokens) * route.completion_usd_per_token
-              + Decimal(item_count) * route.request_usd)
-    return int((charge * 1_000_000).to_integral_value(rounding=ROUND_UP))
+    input_upper = ((source_bytes * 4 + packet_bytes * 2) * 6 + 4) // 5
+    return input_cost(route, input_upper)
+
+
+def _capacity_items(*, ledger: Ledger, workflow: dict, route: Route,
+                    snapshot: SourceSnapshot, packets: tuple[dict, ...],
+                    stage: str, items: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
+    """Seal allocations before intents; restart reuses identical request bytes."""
+    path = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "capacity" / (stage + ".json")
+    input_hash = digest(items)
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if saved["input_hash"] != input_hash or saved["policy"] != CAPACITY_POLICY:
+            raise RouteBlocked("saved_capacity_identity_changed")
+        if len(saved["items"]) != len(items):
+            raise RouteBlocked("saved_capacity_identity_changed")
+        for (identity, body), (expected, original) in zip(saved["items"], items, strict=True):
+            cap = body.get("max_tokens")
+            if (identity != expected or type(cap) is not int or not 1 <= cap <= route.max_completion_tokens
+                    or {key: value for key, value in body.items() if key != "max_tokens"} != original):
+                raise RouteBlocked("saved_capacity_identity_changed")
+        return [(row[0], row[1]) for row in saved["items"]]
+    attempts = ledger.list_batch_attempts(workflow["id"])
+    spent_or_held = sum(row["billed_microusd"] if row["billed_microusd"] is not None
+        else row["reserved_microusd"] for row in attempts
+        if row["status"] not in {"rejected_no_charge", "cancelled_before_submit"})
+    available = workflow["planned_reserve_microusd"] - spent_or_held
+    source_bytes = len(snapshot.source_text.encode("utf-8"))
+    # Reserve known future source input, plus one output share per future item.
+    if stage == "wave1":
+        future = len(packets) + 3
+        future_bytes = sum(len(canonical_bytes(p["records"])) for p in packets) + source_bytes * 3
+    else:
+        future = {"audit": 3, "global": 2, "repair": 1, "verify": 0}[stage]
+        future_bytes = source_bytes * future
+    pricing = replace(route, key_limit_remaining_usd=None)
+    bodies, basis = allocate_outputs(pricing, [body for _, body in items],
+        available_microusd=available, future_items=future,
+        future_input_tokens=(future_bytes * 6 + 4) // 5)
+    prepared = [(identity, body) for (identity, _), body in zip(items, bodies, strict=True)]
+    saved = {"policy": CAPACITY_POLICY, "input_hash": input_hash,
+             "items": prepared, "basis": basis}
+    _json_file_once(path, saved)
+    # Canonical key order must be identical on the first send and a restart.
+    return [(row[0], row[1]) for row in json.loads(canonical_bytes(saved))["items"]]
 
 
 def _reserve_and_post_wave1(*, ledger: Ledger, workflow: dict,
@@ -314,6 +350,9 @@ def _reserve_and_post_wave1(*, ledger: Ledger, workflow: dict,
     extract = _items_for_wave(workflow["id"], "extract",
                               [(packet["packet_id"], _extraction_payload(packet))
                                for packet in packets])
+    allocated = _capacity_items(ledger=ledger, workflow=workflow, route=route,
+        snapshot=snapshot, packets=packets, stage="wave1", items=writer + extract)
+    writer, extract = allocated[:len(writer)], allocated[len(writer):]
     prior = {attempt["stage"]: attempt for attempt in
              ledger.list_batch_attempts(workflow["id"])
              if attempt["stage"] in {"writer", "extract"}}
@@ -338,7 +377,7 @@ def _reserve_and_post_wave1(*, ledger: Ledger, workflow: dict,
     for stage, items in (("writer", writer), ("extract", extract)):
         for _, body in items:
             reserve = pricing_route.reserve_microusd(canonical_bytes(body),
-                                                     max_completion_tokens=STAGE_CAPS[stage],
+                                                     max_completion_tokens=body["max_tokens"],
                                                      authorized_job_cap_microusd=workflow["planned_reserve_microusd"])
             if not prior.get(stage) or prior[stage]["post_count"] == 0:
                 remaining_wave_reserve += reserve
@@ -391,8 +430,8 @@ def _reserve_and_post_wave1(*, ledger: Ledger, workflow: dict,
 def _saved_policy_matches(row: dict, manifest: dict, snapshot: SourceSnapshot,
                           output_dir: Path, force_nonce: str | None) -> bool:
     """Require the saved job to match this source and current code policy."""
-    expected_prompts = {stage: prompt_sha256_for_stage(stage) for stage in STAGE_CAPS}
-    expected_schemas = {stage: digest(schema_for_stage(stage)) for stage in STAGE_CAPS}
+    expected_prompts = {stage: prompt_sha256_for_stage(stage) for stage in STAGES}
+    expected_schemas = {stage: digest(schema_for_stage(stage)) for stage in STAGES}
     saved_snapshot = manifest.get("snapshot")
     return (row["source_sha256"] == snapshot.source_sha256
             and Path(row["output_dir"]) == output_dir
@@ -486,8 +525,8 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
             semantic_key = digest({
                 "source_sha256": snapshot.source_sha256,
                 "policy_version": POLICY_VERSION,
-                "prompt_hashes": {stage: prompt_sha256_for_stage(stage) for stage in STAGE_CAPS},
-                "schema_hashes": {stage: digest(schema_for_stage(stage)) for stage in STAGE_CAPS},
+                "prompt_hashes": {stage: prompt_sha256_for_stage(stage) for stage in STAGES},
+                "schema_hashes": {stage: digest(schema_for_stage(stage)) for stage in STAGES},
                 "workspace_id": route.workspace_id,
                 "model_submit_slug": route.model,
                 "resolved_batch_endpoint": route.batch_endpoint_model,
@@ -937,9 +976,9 @@ def _verify_reserved_dispatch(*, ledger: Ledger, workflow: dict,
             or route.provider_endpoint_tag != manifest.get("provider_endpoint_tag")):
         raise RouteBlocked("reserved_batch_route_identity_changed")
     if (manifest.get("prompt_hashes") !=
-            {name: prompt_sha256_for_stage(name) for name in STAGE_CAPS}
+            {name: prompt_sha256_for_stage(name) for name in STAGES}
             or manifest.get("schema_hashes") !=
-            {name: digest(schema_for_stage(name)) for name in STAGE_CAPS}):
+            {name: digest(schema_for_stage(name)) for name in STAGES}):
         raise RouteBlocked("stage_contract_changed_during_job")
     pending = [attempt]
     if attempt["stage"] in {"writer", "extract"}:
@@ -1100,16 +1139,26 @@ def _validated_audits(ledger: Ledger, workflow: dict, snapshot: SourceSnapshot,
         if report is None:
             failures.append(packet["packet_id"] + ":audit_unavailable")
             continue
+        arguments = dict(packet=packet, packet_inventory=context["inventories"][number],
+            surfaces=context["partitions"][number], full_registry=context["registry"], snapshot=snapshot)
         try:
-            checked = validate_audit(report, packet=packet,
-                packet_inventory=context["inventories"][number],
-                surfaces=context["partitions"][number],
-                full_registry=context["registry"], snapshot=snapshot)
-            audits.append(checked)
-            if not checked["complete"]:
-                failures.append(packet["packet_id"] + ":audit_incomplete")
-        except (ValueError, KeyError, TypeError):
-            failures.append(packet["packet_id"] + ":audit_validation_failed")
+            checked = validate_audit(report, **arguments)
+        except (ValueError, KeyError, TypeError) as exc:
+            try:
+                inventory = context["inventories"][number]
+                checked = salvage_review(report, stage="audit", snapshot=snapshot,
+                    registry=context["registry"], packet=packet,
+                    known_evidence=inventory["evidence"], known_units=set(inventory["units"]),
+                    known_context_targets=set(inventory["units"]) | set(inventory["facets"]) | set(context["registry"]))
+                checked["validation_error"] = str(exc)
+            except (ValueError, KeyError, TypeError):
+                failures.append(packet["packet_id"] + ":audit_validation_failed")
+                continue
+        audits.append(checked)
+        normalized_path = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "normalized" / (packet["packet_id"] + "-audit.json")
+        _json_file_once(normalized_path, checked)
+        if not checked["complete"]:
+            failures.append(packet["packet_id"] + ":audit_incomplete")
     return audits, failures
 
 
@@ -1150,17 +1199,27 @@ def _validated_global(ledger: Ledger, workflow: dict, snapshot: SourceSnapshot,
     expected_context = {row["request_id"] for audit in audits
                         for row in audit["context_requests"]}
     links = _links_with_ids(context["combined"]["open_links"])
+    known_evidence = dict(context["combined"]["evidence"])
+    for audit in audits:
+        known_evidence.update(audit["evidence"])
+    unit_ids = set(context["combined"]["units"]) | {unit_id for audit in audits
+                                                   for unit_id in audit["additional_units"]}
+    link_ids = {row["link_id"] for row in links}
     try:
         checked = validate_global(report, snapshot=snapshot,
-            expected_context_ids=expected_context,
-            full_registry=context["registry"],
-            expected_link_ids={row["link_id"] for row in links},
-            expected_unit_ids=(set(context["combined"]["units"]) |
-                               {unit_id for audit in audits
-                                for unit_id in audit["additional_units"]}))
-        return checked, [] if checked["complete"] else ["global_incomplete"]
-    except (ValueError, KeyError, TypeError):
-        return None, ["global_validation_failed"]
+            expected_context_ids=expected_context, full_registry=context["registry"],
+            expected_link_ids=link_ids, expected_unit_ids=unit_ids, known_evidence=known_evidence)
+    except (ValueError, KeyError, TypeError) as exc:
+        try:
+            checked = salvage_review(report, stage="global", snapshot=snapshot,
+                registry=context["registry"], known_evidence=known_evidence,
+                known_units=unit_ids, known_contexts=expected_context, known_links=link_ids)
+            checked["validation_error"] = str(exc)
+        except (ValueError, KeyError, TypeError):
+            return None, ["global_validation_failed"]
+    normalized_path = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "normalized" / "global.json"
+    _json_file_once(normalized_path, checked)
+    return checked, [] if checked["complete"] else ["global_incomplete"]
 
 
 def _dispatch_wave(*, ledger: Ledger, workflow: dict, manifest: dict,
@@ -1183,11 +1242,14 @@ def _dispatch_wave(*, ledger: Ledger, workflow: dict, manifest: dict,
                     or route.provider_endpoint_tag != manifest["provider_endpoint_tag"]):
                 raise RouteBlocked("batch_route_identity_changed")
             if (manifest["prompt_hashes"] !=
-                    {name: prompt_sha256_for_stage(name) for name in STAGE_CAPS}
+                    {name: prompt_sha256_for_stage(name) for name in STAGES}
                     or manifest["schema_hashes"] !=
-                    {name: digest(schema_for_stage(name)) for name in STAGE_CAPS}):
+                    {name: digest(schema_for_stage(name)) for name in STAGES}):
                 raise RouteBlocked("stage_contract_changed_during_job")
             items = _items_for_wave(workflow["id"], stage, payloads)
+            items = _capacity_items(ledger=ledger, workflow=workflow, route=route,
+                snapshot=_snapshot_from_manifest(manifest), packets=tuple(manifest["packets"]),
+                stage=stage, items=items)
             decision, path, payload_sha = _batch_intent(
                 ledger=ledger, workflow=workflow, stage=stage, items=items, route=route)
             if decision.kind == "blocked":
@@ -1210,11 +1272,12 @@ def _dispatch_wave(*, ledger: Ledger, workflow: dict, manifest: dict,
 
 
 def _repair_payload(snapshot: SourceSnapshot, context: dict, findings: dict,
-                    global_report: dict | None) -> dict:
+                    global_report: dict | None, evidence: dict) -> dict:
     return {
         "DRAFT": context["document"],
         "SOURCE_CONTEXT": list(snapshot.records),
         "FINDINGS": list(findings.values()),
+        "SOURCE_EVIDENCE": evidence,
         "RELATION_RESOLUTIONS": list(global_report["resolutions"].values()) if global_report else [],
         "AFFECTED_SURFACES": list(context["registry"].values()),
         "ALLOWED_OPERATIONS": ["replace_field", "update_task", "add_section_item", "create_task"],
@@ -1378,6 +1441,7 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
     }
     quality = {"status": quality_status, "unresolved_count": len(unresolved) +
                len(global_ambiguities) + len(synthetic_marks),
+               "applied_bundle_count": len(accepted),
                "technical_failures": sidecar["technical_failures"],
                "reviewed_source_ids": sidecar["checked_ids"],
                "local_marks": marks, "policy_version": POLICY_VERSION,
@@ -1577,7 +1641,7 @@ def _advance_workflow(*, ledger: Ledger, workflow: dict,
             dispatched = _dispatch_wave(
                 ledger=ledger, workflow=workflow, manifest=manifest, stage="repair",
                 payloads=[("findings", _repair_payload(snapshot, context,
-                    findings, global_report))], private_root=private_root,
+                    findings, global_report, evidence))], private_root=private_root,
                 client_factory=client_factory)
             if dispatched["status"] == "budget_blocked":
                 return _publish(ledger=ledger, workflow=workflow, manifest=manifest,

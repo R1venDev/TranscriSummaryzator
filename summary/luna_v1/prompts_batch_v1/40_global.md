@@ -21,3 +21,5 @@ FULL_SOURCE, FULL_DRAFT, UNITS, ALL_TASKS, CONTEXT_REQUESTS, OPEN_LINKS, COMPACT
 ## Выход
 
 GlobalReport. На каждый expected review ID — resolution или unprocessed. Evidence, sparse link_checks и findings; никаких переписываний DRAFT и общих численных оценок качества.
+
+OPEN_LINKS содержит app-issued link_id: используй именно его для link_checks. Unit ID, U-ID и request_id не являются link_id. Дополнительную связь без назначенного link_id изложи в finding с evidence, не подменяя ID ожидаемой связи. На каждый OPEN_LINKS link_id верни одну проверку, включая unresolved при неясности.

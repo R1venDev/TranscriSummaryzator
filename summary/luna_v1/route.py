@@ -125,13 +125,13 @@ def verify_batch_route(client: BatchClient) -> Route:
         completion_cap = int(completion_cap)
     except (TypeError, ValueError):
         raise RouteBlocked("context_capacity_unverified") from None
-    if context < 1 or completion_cap < MAX_COMPLETION_TOKENS:
+    if context < 1 or completion_cap < 1:
         raise RouteBlocked("context_capacity_unverified")
     remaining = key.get("limit_remaining")
     return Route(
         model=MODEL, provider="openai", workspace_id=workspace_id,
         max_context_tokens=context,
-        max_completion_tokens=MAX_COMPLETION_TOKENS,
+        max_completion_tokens=completion_cap,
         prompt_usd_per_token=highest_price("prompt"),
         completion_usd_per_token=highest_price("completion"),
         # Luna can bill automatic cache writes above the plain prompt rate.
@@ -183,7 +183,7 @@ def verify_source_first_batch_route(client: BatchClient, *,
         completion_cap = int(completion_cap)
     except (TypeError, ValueError):
         raise RouteBlocked("endpoint_capacity_unavailable") from None
-    if context < 1 or completion_cap < MAX_COMPLETION_TOKENS:
+    if context < 1 or completion_cap < 1:
         raise RouteBlocked("endpoint_capacity_unavailable")
     endpoint_pricing = endpoint.get("pricing")
     if not isinstance(endpoint_pricing, dict):

@@ -28,7 +28,7 @@ from .contract import (
 )
 
 
-STAGE_PROMPT_VERSION = "luna_batch_stage_v1"
+STAGE_PROMPT_VERSION = "luna_batch_stage_v2"
 PROMPT_DIR = Path(__file__).with_name("prompts_batch_v1")
 SCHEMA_DIR = Path(__file__).with_name("schemas_batch_v1")
 REVIEW_SIDECAR_SCHEMA_PATH = SCHEMA_DIR / "review_sidecar_v1.json"

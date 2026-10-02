@@ -60,6 +60,15 @@ class WaveOneBudgetTests(unittest.TestCase):
             plan_sha256=manifest_sha, reserve_microusd=100_000).kind, "new")
         self.workflow = self.ledger.get_batch_workflow(created.job_id)
 
+    def _allocated_wave(self, route):
+        items = runtime._items_for_wave(self.workflow["id"], "writer",
+            [("full", runtime._writer_payload(self.snapshot))])
+        items += runtime._items_for_wave(self.workflow["id"], "extract",
+            [(p["packet_id"], runtime._extraction_payload(p)) for p in self.packets])
+        return runtime._capacity_items(ledger=self.ledger, workflow=self.workflow,
+            route=route, snapshot=self.snapshot, packets=self.packets,
+            stage="wave1", items=items)
+
     def _wave(self, *, route=None, client=None):
         return runtime._reserve_and_post_wave1(
             ledger=self.ledger, workflow=self.workflow, snapshot=self.snapshot,
@@ -125,8 +134,8 @@ class WaveOneBudgetTests(unittest.TestCase):
                 return Reply(202, {"id": f"batch_test{self.posts:03d}"})
 
         client = Client()
-        writer_items = runtime._items_for_wave(self.workflow["id"], "writer",
-            [("full", runtime._writer_payload(self.snapshot))])
+        all_items = self._allocated_wave(_route())
+        writer_items = all_items[:1]
         decision, payload, payload_sha = runtime._batch_intent(
             ledger=self.ledger, workflow=self.workflow, stage="writer",
             items=writer_items, route=_route())
@@ -134,9 +143,9 @@ class WaveOneBudgetTests(unittest.TestCase):
             ledger=self.ledger, attempt_id=decision.attempt_id,
             payload_path=payload, payload_sha=payload_sha,
             client=client)["status"], "submitted")
-        extract_cost = _route().reserve_microusd(canonical_bytes(runtime._chat_body(
-            "extract", runtime._extraction_payload(self.packets[0]))),
-            max_completion_tokens=runtime.STAGE_CAPS["extract"])
+        body = all_items[1][1]
+        extract_cost = _route().reserve_microusd(canonical_bytes(body),
+            max_completion_tokens=body["max_tokens"])
         limited = _route(key_remaining=Decimal(extract_cost) / 1_000_000)
         result = self._wave(route=limited, client=client)
         self.assertEqual(result["status"], "submitted")
@@ -144,12 +153,9 @@ class WaveOneBudgetTests(unittest.TestCase):
 
     def test_key_balance_covers_sum_of_wave_items_before_any_reservation(self):
         route = _route()
-        writer = route.reserve_microusd(canonical_bytes(runtime._chat_body(
-            "writer", runtime._writer_payload(self.snapshot))),
-            max_completion_tokens=runtime.STAGE_CAPS["writer"])
-        extract = route.reserve_microusd(canonical_bytes(runtime._chat_body(
-            "extract", runtime._extraction_payload(self.packets[0]))),
-            max_completion_tokens=runtime.STAGE_CAPS["extract"])
+        items = self._allocated_wave(route)
+        writer, extract = [route.reserve_microusd(canonical_bytes(body),
+            max_completion_tokens=body["max_tokens"]) for _, body in items]
         self.assertGreater(writer + extract, max(writer, extract))
         limited = replace(route,
             key_limit_remaining_usd=Decimal(max(writer, extract)) / 1_000_000)

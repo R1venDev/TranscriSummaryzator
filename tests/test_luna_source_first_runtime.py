@@ -19,7 +19,7 @@ from summary.luna_v1.route import RouteBlocked
 from summary.luna_v1.source_first_core import SourceSnapshot, digest, load_snapshot, plan_packets
 from summary.luna_v1.tasks import ReconciliationConflict
 from summary.luna_v1.source_first_runtime import (
-    STAGE_CAPS, _batch_file_once, _chat_body, _cleanup_terminal_once,
+    STAGES, _batch_file_once, _chat_body, _cleanup_terminal_once,
     _json_file_once, _planned_capacity_hold, _post_reserved,
     _extraction_payload, _poll_attempt, _recover_unknown, _writer_payload,
     poll_source_first_once, submit_source_first,
@@ -51,7 +51,7 @@ class SourceFirstRuntimeTests(unittest.TestCase):
 
     def _reserved(self):
         custom_id = "sf-test12345678-writer-full-a1"
-        body = _chat_body("writer", {"SOURCE": {"utterances": []}})
+        body = _chat_body("writer", {"SOURCE": {"utterances": []}}, output_cap=32000)
         envelope = build_batch_payload([(custom_id, body)])
         path = self.root / "batch.json"
         digest = _batch_file_once(path, envelope)
@@ -74,9 +74,9 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                     "resolved_batch_endpoint": MODEL,
                     "provider_endpoint_tag": PROVIDER,
                     "prompt_hashes": {stage: prompt_sha256_for_stage(stage)
-                                      for stage in STAGE_CAPS},
+                                      for stage in STAGES},
                     "schema_hashes": {stage: digest(schema_for_stage(stage))
-                                      for stage in STAGE_CAPS},
+                                      for stage in STAGES},
                     "planned_capacity_microusd": 10_000,
                     "capacity_basis": {"offline_test": True},
                     "packets": [], "snapshot": {"transcript_path": str(transcript),
@@ -97,7 +97,7 @@ class SourceFirstRuntimeTests(unittest.TestCase):
 
     def _reserve_stage(self, workflow, stage):
         custom_id = f"sf-{workflow['id'][:12]}-{stage}-full-a1"
-        body = _chat_body(stage, {"SOURCE": {"utterances": []}})
+        body = _chat_body(stage, {"SOURCE": {"utterances": []}}, output_cap=32000)
         path = self.root / f"{workflow['id']}-{stage}.json"
         digest = _batch_file_once(path, build_batch_payload([(custom_id, body)]))
         decision = self.ledger.reserve_batch_intent(
@@ -116,7 +116,7 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                 "created_at": int(self.ledger.get_batch_attempt(attempt_id)["created_at"]),
                 "request_counts": {"total": total}}
 
-    def test_full_chain_capacity_counts_every_item_cap(self):
+    def test_input_forecast_uses_real_source_and_tariff(self):
         snapshot = SourceSnapshot(Path("unused"), "b" * 64, "{\"utterances\":[]}",
                                   {}, ())
         packets = ({"records": [{"id": "U00001", "text": "тест"}]},) * 3
@@ -127,16 +127,16 @@ class SourceFirstRuntimeTests(unittest.TestCase):
                      32_000, Decimal("0.000001"), Decimal("0.000001"),
                      Decimal("0.000001"), Decimal(0), None)
         self.assertLess(_planned_capacity_hold(low, snapshot, packets), 100_000)
-        self.assertGreater(_planned_capacity_hold(high, snapshot, packets), 100_000)
+        self.assertGreater(_planned_capacity_hold(high, snapshot, packets), _planned_capacity_hold(low, snapshot, packets))
 
-    def test_full_chain_forecast_counts_ten_dispatchable_items_for_three_packets(self):
+    def test_output_budget_is_not_a_fixed_token_forecast(self):
         snapshot = SourceSnapshot(Path("unused"), "b" * 64, "{}", {}, ())
         packets = ({"records": []},) * 3
         route = Route(SUBMIT_MODEL, PROVIDER, "workspace-1", 1_000_000, 32_000,
                       Decimal(0), Decimal("0.000001"), Decimal(0),
                       Decimal(0), None)
         self.assertEqual(_planned_capacity_hold(route, snapshot, packets),
-                         257_000)  # 32k writer + nine 25k items
+                         0)  # Source-input floor; no fictional fixed output length
 
     def test_submit_selects_first_luna_eligible_key_without_policy_fallback(self):
         transcript = self.root / "key-selection-transcript.json"
@@ -462,7 +462,7 @@ class SourceFirstRuntimeTests(unittest.TestCase):
 
     def test_terminal_reordered_duplicate_missing_items_settle_once(self):
         ids = [f"sf-test12345678-extract-P00{number}-a1" for number in (1, 2, 3)]
-        items = [(custom_id, _chat_body("extract", {"CORE_SOURCE": []}))
+        items = [(custom_id, _chat_body("extract", {"CORE_SOURCE": []}, output_cap=25000))
                  for custom_id in ids]
         path = self.root / "extract.json"
         digest = _batch_file_once(path, build_batch_payload(items))

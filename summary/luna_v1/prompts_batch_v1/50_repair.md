@@ -21,3 +21,5 @@ DRAFT, SOURCE_CONTEXT, FINDINGS, RELATION_RESOLUTIONS, AFFECTED_SURFACES, ALLOWE
 ## Выход
 
 PatchPlan. App-generated hashes и permanent IDs не вычисляй. Для findings без надёжного исправления — unresolved. Не добавляй «улучшения» помимо исправляемой проблемы.
+
+SOURCE_EVIDENCE — проверенные координаты цитат, на которые ссылаются findings. Они позволяют разрешить IDs, но не делают смысл замечания доказанным. Проверь его по SOURCE_CONTEXT. В evidence_ids bundle используй точные предоставленные IDs. Каждый finding должен оказаться ровно один раз в bundle, unresolved либо unprocessed_finding_ids. Не оставляй подтверждённое существенное замечание без операции только из-за неполноты другой проверки.

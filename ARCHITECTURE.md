@@ -21,6 +21,8 @@ flowchart LR
 `source_first_core.py` строит snapshot, пакеты и локальные проверки;
 `source_first_runtime.py` исполняет Batch-волны через общий scheduler/ledger.
 Типизированные sidecars и versioned prompts остаются в `summary/luna_v1/`.
+Новый summary route `luna_batch_source_first_v2`: `summary/luna_v1/capacity.py` распределяет output/reasoning reserve по реальным endpoint/context/money constraints; фиксированные caps стадий отсутствуют. `review_salvage.py` сохраняет независимые grounded findings из неполного отчёта без положительной оценки покрытия. Repair получает evidence lookup; verification применяет только явно проверенные зависимые группы, а canonical publication сохраняет D0, старые поколения, task UUID и ручные overrides. Неполнота проверки отображается независимо от числа применённых исправлений.
+
 Подробный контракт: [Luna Batch source-first](docs/SUMMARY_LUNA_SOURCE_FIRST.md).
 Результат проверки моделью не является доказанной истиной или гарантией полноты.
 

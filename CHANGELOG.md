@@ -2,6 +2,11 @@
 
 [Русский README](README.md) · [English README](README.en.md) · [Статус проверки / Validation status](docs/STATUS.md)
 
+## 2026.10.03
+
+- RU: Убраны фиксированные output caps нового Luna Batch маршрута: резерв рассчитывается по endpoint, фактическому input, оставшимся стадиям и разрешённым деньгам. Частичные отчёты сохраняют пригодные замечания; repair получает таблицу цитат; проверка не отменяет независимые одобренные patches из-за неполноты соседнего bundle. UI показывает число применённых пакетов отдельно от review-state. Речевой pipeline не изменён. Offline replay: 12 пригодных замечаний из сохранённых отчётов 411 реплик; это не live quality PASS.
+- EN: Replaced fixed Luna stage output caps with endpoint/context/budget allocation. Grounded findings survive incomplete reports; repair receives source evidence; independent verified patch groups survive unrelated incomplete checks. Applied bundle count is separate from review completeness. Speech processing is unchanged. Offline replay recovered 12 usable findings from a saved 411-turn meeting; live content quality remains to be measured.
+
 ## 2026.10.02
 
 ### Русский
