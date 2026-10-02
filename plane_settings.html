@@ -12,7 +12,7 @@
     p{margin:8px 0}.muted{color:#abb4c5}.card{padding:24px;margin:20px 0;background:#171a22;border:1px solid #30394a;border-radius:18px}
     .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.wide{grid-column:1/-1}
     label{display:grid;gap:6px;font-size:14px;font-weight:600}small{font-size:13px;font-weight:400;color:#abb4c5}
-    input{min-width:0;width:100%;background:#0e131b;border:1px solid #44516a;border-radius:9px;padding:11px;color:#f5f7fa;font:inherit}
+    input,select{min-width:0;width:100%;background:#0e131b;border:1px solid #44516a;border-radius:9px;padding:11px;color:#f5f7fa;font:inherit}
     input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid #a6cbff;outline-offset:3px}
     .switch{display:grid;grid-template-columns:24px 1fr;align-items:start;column-gap:12px;padding:16px 0;border-top:1px solid #30394a;cursor:pointer}
     .switch:first-of-type{border-top:0;padding-top:0}.switch input{width:20px;height:20px;accent-color:#4b93ff;margin:3px 0}.switch span{display:grid;gap:4px}
@@ -53,6 +53,14 @@
             <input name="collection_id" maxlength="200" list="planeCollections" autocomplete="off" spellcheck="false">
             <datalist id="planeCollections"></datalist>
             <small>Выберите коллекцию или родительскую страницу.</small>
+          </label>
+          <label>Тип задач из конспекта
+            <select name="task_type_id"><option value="">Тип проекта по умолчанию</option></select>
+            <small>Для автоматических задач выберите Extracted Task. Типы загружаются после проверки сохранённого проекта.</small>
+          </label>
+          <label>Тип гипотез из конспекта
+            <select name="hypothesis_type_id"><option value="">Тип проекта по умолчанию</option></select>
+            <small>Для извлечённых гипотез выберите Extracted Hypothesis.</small>
           </label>
           <label>Родительская Wiki-страница (ID, необязательно)
             <input name="parent_page_id" maxlength="200" autocomplete="off" spellcheck="false">

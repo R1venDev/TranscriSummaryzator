@@ -7,7 +7,7 @@
   const message = document.querySelector('#message');
   const reload = document.querySelector('#reloadPlane');
   const check = document.querySelector('#checkPlane');
-  const textFields = ['base_url', 'workspace_slug', 'project_id', 'collection_id', 'parent_page_id'];
+  const textFields = ['base_url', 'workspace_slug', 'project_id', 'collection_id', 'parent_page_id', 'task_type_id', 'hypothesis_type_id'];
   const switches = ['auto_tasks', 'auto_hypotheses', 'auto_meeting_page'];
   let settings = null;
   let busy = false;
@@ -69,6 +69,7 @@
   function apply(data) {
     if (!data.settings || data.settings.revision == null) throw new Error('Ответ сервера не содержит версию настроек.');
     settings = data.settings;
+    showTypes(data.options || {}, settings);
     textFields.forEach(name => { form.elements[name].value = String(settings[name] || ''); });
     switches.forEach(name => {
       form.elements[name].checked = name === 'auto_meeting_page' ? settings[name] !== false : settings[name] === true;
@@ -80,6 +81,27 @@
     showOptions('#planeCollections', data.options && data.options.collections);
     reload.hidden = true;
   }
+
+  function showTypes(options, values) {
+    ['task_type_id', 'hypothesis_type_id'].forEach(name => {
+      const list = form.elements[name];
+      const selected = String(values[name] || '');
+      list.replaceChildren(new Option('Тип проекта по умолчанию', ''));
+      if (options.types_project_id === values.project_id && Array.isArray(options.types)) {
+        options.types.filter(t => t.is_active === true && t.is_epic === false).forEach(t => {
+          list.append(new Option(String(t.name), String(t.id)));
+        });
+      }
+      if (selected && !Array.from(list.options).some(t => t.value === selected)) {
+        list.append(new Option('Выбранный тип — требуется проверка проекта', selected));
+      }
+      list.value = selected;
+    });
+  }
+
+  form.elements.project_id.addEventListener('change', () => {
+    showTypes({}, {project_id: form.elements.project_id.value});
+  });
 
   async function load() {
     if (busy) return;
@@ -117,6 +139,8 @@
       const current = await request('settings');
       showOptions('#planeProjects', current.options && current.options.projects);
       showOptions('#planeCollections', current.options && current.options.collections);
+      showTypes(current.options || {}, {project_id: form.elements.project_id.value,
+        task_type_id: form.elements.task_type_id.value, hypothesis_type_id: form.elements.hypothesis_type_id.value});
       const status = result.status || current.status || result;
       showConnection(status);
       notify(status.message || 'Проверка завершена.', ['error', 'failed', 'unavailable', 'invalid', 'unauthorized'].includes(status.state));

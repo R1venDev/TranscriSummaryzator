@@ -85,6 +85,46 @@ class PlaneStoreTests(unittest.TestCase):
         self.assertEqual(len(checked["options"]["projects"]), 1)
         self.assertEqual(self.fake.created, [])
 
+    def test_separate_types_and_unsent_rotation_keep_identity(self):
+        self.configure(task_type_id=COLLECTION, hypothesis_type_id=REMOTE)
+        self.observe()
+        self.store.enqueue(1, "task", "task-1", "g1")
+        self.store.enqueue(1, "hypothesis", "idea-1", "g1")
+        with self.store._db() as db:
+            identity = db.execute("SELECT external_id FROM deliveries WHERE kind='task'").fetchone()[0]
+        self.configure(task_type_id=PROJECT)
+        self.store.drain_one()
+        self.store.drain_one()
+        self.assertEqual(json.loads(self.fake.created[0]["payload"])["type_id"], PROJECT)
+        self.assertEqual(json.loads(self.fake.created[1]["payload"])["type_id"], REMOTE)
+        self.assertEqual(self.fake.created[0]["external_id"], identity)
+        self.store.enqueue(1, "task", "task-1", "g1")
+        self.assertEqual(len(self.states()), 2)
+
+    def test_type_rotation_does_not_mutate_unknown_request(self):
+        self.configure(task_type_id=COLLECTION)
+        self.observe()
+        self.store.enqueue(1, "task", "task-1", "g1")
+        self.fake.effect = PlaneError("unknown")
+        self.store.drain_one()
+        self.configure(task_type_id=REMOTE)
+        self.force_due()
+        self.store.drain_one()
+        self.assertEqual(json.loads(self.fake.recovered[0]["payload"])["type_id"], COLLECTION)
+        self.assertEqual(len(self.fake.created), 1)
+
+    def test_legacy_settings_default_and_type_uuid(self):
+        with self.store._db() as db:
+            body = json.loads(self.store._row(db)["body"])
+            body.pop("task_type_id"); body.pop("hypothesis_type_id")
+            db.execute("UPDATE settings SET body=?", (json.dumps(body),))
+        self.assertEqual(self.store.public_settings()["settings"]["task_type_id"], "")
+        self.configure(task_type_id=COLLECTION)
+        self.configure(project_id=REMOTE)
+        self.assertEqual(self.store.public_settings()["settings"]["task_type_id"], "")
+        with self.assertRaises(PlaneError):
+            self.configure(task_type_id="invalid")
+
     def test_baseline_and_get_do_not_consume_new_auto_generation(self):
         self.configure(auto_tasks=True, auto_hypotheses=True)
         self.observe(auto=False)
@@ -294,6 +334,22 @@ class PlaneClientTests(unittest.TestCase):
             with self.assertRaises(PlanePreflightError):
                 client.create(self.row(), {})
             self.assertEqual([c.args[0] for c in request.call_args_list], ["GET"])
+    def test_type_validated_before_post_and_correct_v1_field(self):
+        client = self.client()
+        row = self.row()
+        row["payload"] = json.dumps({"name": "Name", "assignees": [], "type_id": COLLECTION})
+        for types in ([], [{"id": COLLECTION, "is_active": False, "is_epic": False}],
+                      [{"id": COLLECTION, "is_active": True, "is_epic": True}],
+                      [{"id": REMOTE, "is_active": True, "is_epic": False}]):
+            with patch.object(client, "request", return_value={"default_assignee": None}) as request, patch.object(client, "list_all", return_value=types):
+                with self.assertRaises(PlanePreflightError):
+                    client.create(row, {})
+                self.assertEqual([c.args[0] for c in request.call_args_list], ["GET"])
+        with patch.object(client, "request", side_effect=[{"default_assignee": None}, {"id": REMOTE}]) as request, patch.object(client, "list_all", return_value=[{"id": COLLECTION, "is_active": True, "is_epic": False}]):
+            self.assertEqual(client.create(row, {})["id"], REMOTE)
+            self.assertEqual(request.call_args.args[0], "POST")
+            self.assertEqual(request.call_args.args[2]["type_id"], COLLECTION)
+            self.assertEqual(request.call_args.args[2]["assignees"], [])
     def test_work_item_recovery_supported_v1_dict_and_404(self):
         client = self.client()
         with patch.object(client, "request", return_value={"id": REMOTE}) as request:

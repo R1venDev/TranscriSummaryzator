@@ -27,7 +27,8 @@ from scripts.summary_credentials import CredentialError, _fernet, load_master_ke
 
 EXTERNAL_SOURCE = "transcrisummaryzator"
 DEFAULTS = dict(base_url="", workspace_slug="", project_id="", collection_id="",
-                parent_page_id="", auto_tasks=False, auto_hypotheses=False,
+                parent_page_id="", task_type_id="", hypothesis_type_id="",
+                auto_tasks=False, auto_hypotheses=False,
                 auto_meeting_page=True)
 DESTINATION_FIELDS = ("base_url", "workspace_slug", "project_id", "collection_id", "parent_page_id")
 
@@ -170,7 +171,11 @@ class PlaneClient:
         projects = self.list_all(self.prefix + "projects/")
         collections = self.list_all(self.prefix + "collections/")
         # Read permission does not prove create permission; no probe writes.
+        types = self.list_all(self.prefix + "projects/" + self.project + "/work-item-types/") if self.project else []
         return {"projects": [{"id": p["id"], "name": p.get("name", "")} for p in projects],
+                "types": [{"id": t["id"], "name": t.get("name", ""),
+                           "is_active": t.get("is_active") is True, "is_epic": t.get("is_epic") is True}
+                          for t in types], "types_project_id": self.project,
                 "collections": [{"id": p["id"], "name": p.get("name", "")} for p in collections]}
 
     def recover(self, row):
@@ -216,6 +221,18 @@ class PlaneClient:
             # Never accidentally assign or notify a person not named by the source.
             if not isinstance(project, dict) or "default_assignee" not in project or project["default_assignee"] is not None:
                 raise PlanePreflightError("Для неназначенных карточек отключите исполнителя по умолчанию в выбранном проекте Plane")
+            if payload.get("type_id"):
+                try:
+                    types = self.list_all(self.prefix + "projects/" + self.project + "/work-item-types/")
+                except PlaneHTTPError as exc:
+                    if exc.status == 429:
+                        raise
+                    raise PlanePreflightError(str(exc)) from None
+                except PlaneError as exc:
+                    raise PlanePreflightError(str(exc)) from None
+                matches = [t for t in types if t.get("id") == payload["type_id"]]
+                if len(matches) != 1 or matches[0].get("is_active") is not True or matches[0].get("is_epic") is not False:
+                    raise PlanePreflightError("Выбранный тип карточки отсутствует в проекте, отключён или является Epic. Выберите действующий тип в настройках Plane")
             path = self.prefix + "projects/" + self.project + "/work-items/"
         return self.request("POST", path, payload)
 
@@ -290,7 +307,7 @@ class PlaneStore:
         return dict(db.execute("SELECT * FROM settings WHERE id=1").fetchone())
 
     def _settings(self, row):
-        return json.loads(row["body"])
+        return {**DEFAULTS, **json.loads(row["body"])}
 
     def _key(self, row):
         if not row["encrypted_key"]:
@@ -340,12 +357,16 @@ class PlaneStore:
                     raise PlaneError("Недопустимый порт Plane") from None
             if settings["workspace_slug"] and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", settings["workspace_slug"]):
                 raise PlaneError("Недопустимый workspace slug")
-            for name in ("project_id", "collection_id", "parent_page_id"):
+            for name in ("project_id", "collection_id", "parent_page_id", "task_type_id", "hypothesis_type_id"):
                 if settings[name]:
                     try:
                         settings[name] = str(uuid.UUID(settings[name]))
                     except ValueError:
-                        raise PlaneError("Идентификатор проекта/коллекции/страницы должен быть UUID") from None
+                        raise PlaneError("Идентификатор проекта, коллекции, страницы или типа должен быть UUID") from None
+            if old["project_id"] != settings["project_id"]:
+                for name in ("task_type_id", "hypothesis_type_id"):
+                    if name not in data:
+                        settings[name] = ""
             if settings["collection_id"] and settings["parent_page_id"]:
                 raise PlaneError("Выберите коллекцию или родительскую страницу, не оба сразу")
             token = data.get("api_key", "")
@@ -382,6 +403,10 @@ class PlaneStore:
                 raise PlaneError("Сначала сохраните адрес Plane, workspace и ключ")
             try:
                 options = self.client_factory(settings, self._key(row)).check()
+                if options.get("types_project_id") == settings["project_id"]:
+                    for name in ("task_type_id", "hypothesis_type_id"):
+                        if settings[name] and not any(t.get("id") == settings[name] and t.get("is_active") is True and t.get("is_epic") is False for t in options.get("types", [])):
+                            raise PlaneError("Выбранный тип отсутствует или недоступен в проекте Plane")
                 status = {"state": "ready", "message": "Чтение доступно. Права создания проверяются при отправке", "checked_at": time.time()}
             except PlaneError as exc:
                 options = {"projects": [], "collections": []}
@@ -502,6 +527,9 @@ class PlaneStore:
         else:
             payload["assignees"] = []
             payload["priority"] = "none"
+            type_id = settings["task_type_id" if kind == "task" else "hypothesis_type_id"]
+            if type_id:
+                payload["type_id"] = type_id
         encoded = _json(payload)
         if old and old["state"] in {"created", "update_available"}:
             changed = old["payload"] != encoded
@@ -578,6 +606,20 @@ class PlaneStore:
                     self._finish(db, row, "submission_unknown" if recovering else "credential_required", str(exc), 300)
                     return {"state": "credential_required"}
                 if not recovering:
+                    # Only unsent intents follow the current type selection. Type
+                    # is not part of external identity, so rotation cannot duplicate a card.
+                    if row["kind"] != "page":
+                        payload = json.loads(row["payload"])
+                        type_id = settings["task_type_id" if row["kind"] == "task" else "hypothesis_type_id"]
+                        if type_id:
+                            payload["type_id"] = type_id
+                        else:
+                            payload.pop("type_id", None)
+                        encoded = _json(payload)
+                        if encoded != row["payload"]:
+                            row["payload"] = encoded
+                            db.execute("UPDATE deliveries SET payload=? WHERE id=?", (encoded, row["id"]))
+                            self._event(db, row["id"], "unsent_type_changed", {"type_id": type_id})
                     # COMMIT before network. Crash after this point means recovery only.
                     db.execute("UPDATE deliveries SET state='sending',attempts=attempts+1,updated=? WHERE id=?", (time.time(), row["id"]))
                     self._event(db, row["id"], "submission_intent")
