@@ -222,6 +222,97 @@ class SourceFirstRuntimeTests(unittest.TestCase):
         self.assertEqual(again["status"], "pending")
         self.assertEqual(client.calls, 1)
         self.assertEqual(self.ledger.get_batch_attempt(attempt_id)["post_count"], 1)
+        receipt = self.root / "source_first" / self.workflow["semantic_key"] / "submissions" / (attempt_id + ".json")
+        self.assertEqual(json.loads(receipt.read_text()), {"http_status": 202,
+            "payload_sha256": digest, "batch_id": "batch_test123", "reply": {"id": "batch_test123"}})
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+
+    def test_repeated_workspace_confirmed_404_retains_unknown_bill_across_restart(self):
+        from summary.luna_v1.source_first_runtime import _ready, _stage_native
+        attempt_id, _, digest, custom_id = self._reserved()
+        self.ledger.mark_batch_submitting(attempt_id, digest)
+        self.ledger.record_batch_submission(attempt_id, remote_id="batch_missing123")
+        class Credential:
+            def __init__(self, *_): pass
+            def reveal_for_existing_job(self, *_): return "fake-token"
+        class Client:
+            def get(self, _): raise BatchError(404, "request_rejected")
+            def current_key(self): return Reply(200, {"data": {"workspace_id": "workspace-1"}})
+            def list_batches(self, **_): return Reply(200, {"data": [], "has_more": False})
+            def submit_prepared(self, *_a, **_kw): raise AssertionError("Never retry missing Batch")
+        base = time.time()
+        with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
+            for offset, expected in ((121, "polling"), (422, "remote_unavailable")):
+                with patch("summary.luna_v1.ledger.time.time", return_value=base + offset):
+                    result = _poll_attempt(ledger=self.ledger,
+                        attempt=self.ledger.get_batch_attempt(attempt_id), workflow=self.workflow,
+                        private_root=self.root, client_factory=lambda _: Client())
+                self.assertEqual(result["status"], expected)
+        restarted = Ledger(self.root)
+        try:
+            row = restarted.get_batch_attempt(attempt_id)
+            self.assertEqual(row["post_count"], 1)
+            self.assertIsNone(row["billed_microusd"])
+            self.assertIsNone(row["remote_status"])
+            self.assertIsNone(row["terminal_path"])
+            self.assertTrue(_ready(row))
+            self.assertEqual(_stage_native(restarted, row), ({}, {custom_id: "remote_batch_not_found"}))
+            self.assertEqual(restarted.batch_items(attempt_id)[0]["status"], "unavailable")
+            self.assertNotIn(attempt_id, [a["id"] for a in restarted.list_pending_batch_attempts(now=base + 900)])
+            restarted.finish_batch_workflow(self.workflow["id"], status="failed", error_code="writer_unavailable")
+            self.assertEqual(restarted._rolling_spent_microusd(base + 8 * 86400), row["reserved_microusd"])
+        finally:
+            restarted.close()
+
+    def test_404_without_confirmed_workspace_or_complete_list_never_advances(self):
+        attempt_id, _, digest, _ = self._reserved()
+        self.ledger.mark_batch_submitting(attempt_id, digest)
+        self.ledger.record_batch_submission(attempt_id, remote_id="batch_missing123")
+        class Credential:
+            def __init__(self, *_): pass
+            def reveal_for_existing_job(self, *_): return "fake-token"
+        base = time.time()
+        cases = [("other-workspace", [], False), ("workspace-1", [], True),
+                 ("workspace-1", [{"id": "batch_missing123"}], False),
+                 ("workspace-1", [{"id": "invalid"}], False)]
+        with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
+            for i, (workspace, rows, more) in enumerate(cases):
+                class Client:
+                    def get(self, _): raise BatchError(404, "request_rejected")
+                    def current_key(self): return Reply(200, {"data": {"workspace_id": workspace}})
+                    def list_batches(self, **_): return Reply(200, {"data": rows, "has_more": more})
+                with patch("summary.luna_v1.ledger.time.time", return_value=base + 121 + i * 301):
+                    _poll_attempt(ledger=self.ledger, attempt=self.ledger.get_batch_attempt(attempt_id),
+                        workflow=self.workflow, private_root=self.root, client_factory=lambda _: Client())
+                row = self.ledger.get_batch_attempt(attempt_id)
+                self.assertEqual(row["status"], "polling")
+                self.assertEqual(row["missing_reads"], 0)
+                self.assertEqual(row["error_code"], "remote_batch_404_recovery_unconfirmed")
+
+    def test_successful_poll_resets_transient_missing_confirmation(self):
+        attempt_id, _, digest, _ = self._reserved()
+        self.ledger.mark_batch_submitting(attempt_id, digest)
+        self.ledger.record_batch_submission(attempt_id, remote_id="batch_missing123")
+        class Credential:
+            def __init__(self, *_): pass
+            def reveal_for_existing_job(self, *_): return "fake-token"
+        class Client:
+            missing = True
+            def get(self, batch_id):
+                if self.missing: raise BatchError(404, "request_rejected")
+                return Reply(200, {"id": batch_id, "status": "in_progress"})
+            def current_key(self): return Reply(200, {"data": {"workspace_id": "workspace-1"}})
+            def list_batches(self, **_): return Reply(200, {"data": [], "has_more": False})
+        client = Client(); base = time.time()
+        with patch("summary.luna_v1.source_first_runtime.CredentialStore", Credential):
+            for offset, missing in ((121, True), (422, False), (723, True)):
+                client.missing = missing
+                with patch("summary.luna_v1.ledger.time.time", return_value=base + offset):
+                    _poll_attempt(ledger=self.ledger, attempt=self.ledger.get_batch_attempt(attempt_id),
+                        workflow=self.workflow, private_root=self.root, client_factory=lambda _: client)
+        row = self.ledger.get_batch_attempt(attempt_id)
+        self.assertEqual(row["status"], "polling")
+        self.assertEqual(row["missing_reads"], 1)
 
     def test_malformed_sealed_wire_is_rejected_before_post_intent(self):
         attempt_id, path, _, _ = self._reserved()

@@ -4,6 +4,8 @@
 
 ## 2026.10.03
 
+- RU: Подтверждённый исчезнувший Batch больше не удерживает обработку встречи в бесконечном ожидании. Сохраняются неизвестный расход и item-слоты; повторная отправка запрещена, пригодный документ проходит оставшиеся стадии и публикуется с точным неполным review-state. Добавлены приватные create receipts и восстановление после рестарта; gateway cleanup отложен до окончания workflow.
+- EN: Confirmed missing Batch records no longer stall a meeting indefinitely. Unknown charges and item slots remain held; missing requests are never reposted. Usable drafts continue through the remaining stages with explicit incomplete-review status. Added private create receipts and restart-safe missing-record state; gateway cleanup waits for workflow completion.
 - RU: Убраны фиксированные output caps нового Luna Batch маршрута: резерв рассчитывается по endpoint, фактическому input, оставшимся стадиям и разрешённым деньгам. Частичные отчёты сохраняют пригодные замечания; repair получает таблицу цитат; проверка не отменяет независимые одобренные patches из-за неполноты соседнего bundle. UI показывает число применённых пакетов отдельно от review-state. Речевой pipeline не изменён. Offline replay: 12 пригодных замечаний из сохранённых отчётов 411 реплик; это не live quality PASS.
 - EN: Replaced fixed Luna stage output caps with endpoint/context/budget allocation. Grounded findings survive incomplete reports; repair receives source evidence; independent verified patch groups survive unrelated incomplete checks. Applied bundle count is separate from review completeness. Speech processing is unchanged. Offline replay recovered 12 usable findings from a saved 411-turn meeting; live content quality remains to be measured.
 

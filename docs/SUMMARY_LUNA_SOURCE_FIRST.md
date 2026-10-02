@@ -29,6 +29,20 @@ Allocation сохраняется до intent и POST с identity исходны
 
 Новая policy включается существующим `TRANSCRI_LUNA_SOURCE_FIRST_ENABLED=1`, с сохранённым `TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD=0.25`. Отдельный scheduler/ключевой store не создаётся. До смены summary image сохраняются точные compose/digest и checkpoint активных jobs. При отсутствии активных jobs меняются только контейнеры app/scheduler; speech service не перезапускается. Откат — прежний pinned summary digest с теми же томами. Уже отправленные Batch сначала доводятся штатным scheduler новой версии до terminal: старый release не должен отправлять повтор или продолжать job с изменённым prompt. Прежние sealed generations и ручные правки сохраняются.
 
+## Восстановление недоступного Batch — 3 октября 2026
+
+После `202 Accepted` GET может перестать возвращать зарегистрированный Batch. HTTP 404 не доказывает отсутствие генераций или списания. Worker сохраняет remote ID, исходные item-слоты и весь unknown hold; повторный POST этого пакета запрещён.
+
+Два наблюдения 404 с интервалом не менее пяти минут, свежим подтверждением прежнего workspace и полным списком метаданных в окне отправки переводят попытку в **локальное** `remote_unavailable`. Это не upstream `failed`/`cancelled`: remote status и bill остаются неизвестными. Неполный список, другой workspace или transient 404 не разрешают такой переход; успешный GET сбрасывает подтверждение отсутствия. Свои receipts сохраняются приватно, чужие workspace jobs не скачиваются и не изменяются.
+
+Недоступный audit не блокирует существующие global/repair/verify стадии. Они используют сохранённый целый D0, пригодный inventory и полный source, внутри прежних лимитов. Публикуются только явно принятые исправления; отсутствие audit остаётся `review_incomplete`, независимо от успеха global. Если поздней стадии не хватает бюджета, действует существующая публикация с оговорками. Writer без пригодного целого по-прежнему не превращается в выдуманный конспект.
+
+Фактический ответ нового Batch create сохраняется в `submissions/<attempt_id>.json` после durable записи remote ID. Capture failure не разрешает повтор POST. Gateway cleanup теперь выполняется после окончания logical workflow, только для terminal попыток с проверенным локальным raw. Отдельный unknown hold не освобождается из-за публикации, рестарта или возраста. Для дальнейшего billing reconciliation сохраняются ID и диагностические SHA; автоматического освобождения денег по 404 нет.
+
+Миграция ledger аддитивна: nullable missing timestamp/evidence и счётчик наблюдений. Prompts, WriterSchema, source identity, $0.25/job, $5/rolling week и максимум 12 items не меняются. При откате старый worker может не понимать `remote_unavailable`: он не должен пересылать этот пакет; сохранённую generation можно читать, а завершение новых стадий следует возобновить на совместимом release. Источники, ручные edits и история остаются на томах.
+
+Контракт повторно сверён через Context7 `/openrouterteam/docs` и первичный [OpenRouter Batch Quickstart](https://openrouter.ai/docs/batch-quickstart): 202 означает принятие и сохранение, GET выдаёт inline results, listing scoped к workspace, DELETE относится к конкретному terminal Batch. Документация не объясняет исчезновение текущего remote ID; причина не объявляется установленной.
+
 ## Историческое состояние v1
 
 Следующие сведения относятся к прежним native releases и опытам; они не доказывают текущий Docker rollout.

@@ -289,6 +289,13 @@ class Ledger:
             if "planned_reserve_microusd" not in workflow_columns:
                 self.db.execute("ALTER TABLE source_first_workflows ADD COLUMN "
                                 "planned_reserve_microusd INTEGER NOT NULL DEFAULT 0")
+            attempt_columns = {row[1] for row in self.db.execute(
+                "PRAGMA table_info(batch_attempts)")}
+            for name, definition in (("missing_since", "REAL"),
+                    ("missing_reads", "INTEGER NOT NULL DEFAULT 0"),
+                    ("missing_evidence_path", "TEXT"), ("missing_evidence_sha256", "TEXT")):
+                if name not in attempt_columns:
+                    self.db.execute(f"ALTER TABLE batch_attempts ADD COLUMN {name} {definition}")
             self.db.execute("COMMIT")
         except Exception:
             if self.db.in_transaction:
@@ -929,7 +936,7 @@ class Ledger:
                     or row["lease_until"] is None or row["lease_until"] < time.time()):
                 raise ValueError("Batch poll lease expired or changed")
             now = time.time()
-            self.db.execute("""UPDATE batch_attempts SET remote_status=?,
+            self.db.execute("""UPDATE batch_attempts SET remote_status=?,missing_since=NULL,missing_reads=0,
                 next_poll_at=?,error_code=?,lease_owner=NULL,lease_until=NULL,
                 updated_at=? WHERE id=?""",
                 (remote_status, now + delay_seconds,
@@ -960,6 +967,57 @@ class Ledger:
                 ("credential_required" if credential_required else "polling",
                  now + delay_seconds, error_code[:120], now, attempt_id))
             self.db.execute("COMMIT")
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    def record_batch_missing(self, attempt_id: str, owner_id: str, *,
+                             evidence_path: Path, evidence_sha256: str) -> str:
+        """A missing remote record is locally unavailable, never a zero bill.
+
+        Require two workspace-confirmed observations at least five minutes
+        apart. This permits partial-review publication without resubmitting
+        the missing items or declaring an upstream terminal outcome.
+        """
+        if (not _full_hash(evidence_sha256)
+                or _sealed_sha256(Path(evidence_path)) != evidence_sha256):
+            raise ValueError("missing Batch evidence changed")
+        evidence = json.loads(Path(evidence_path).read_text(encoding="utf-8"))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT * FROM batch_attempts WHERE id=?",
+                                  (attempt_id,)).fetchone()
+            now = time.time()
+            if (row is None or row["status"] != "polling"
+                    or row["lease_owner"] != owner_id
+                    or row["lease_until"] is None or row["lease_until"] < now
+                    or evidence.get("kind") != "workspace_confirmed_batch_missing"
+                    or evidence.get("batch_id") != row["remote_id"]
+                    or evidence.get("workspace_id") != row["workspace_id"]
+                    or evidence.get("http_status") != 404
+                    or evidence.get("list_complete") is not True
+                    or evidence.get("listed") is not False
+                    or type(evidence.get("observed_at")) not in (int, float)
+                    or not now - 180 <= evidence["observed_at"] <= now + 1
+                    or evidence_sha256 == row["missing_evidence_sha256"]):
+                raise ValueError("missing Batch identity or lease changed")
+            first = row["missing_since"] if row["missing_since"] is not None else now
+            count = row["missing_reads"] + 1
+            unavailable = count >= 2 and now - first >= 300
+            status = "remote_unavailable" if unavailable else "polling"
+            self.db.execute("""UPDATE batch_attempts SET status=?,missing_since=?,
+                missing_reads=?,missing_evidence_path=?,missing_evidence_sha256=?,
+                error_code='remote_batch_not_found',next_poll_at=?,updated_at=?,
+                lease_owner=NULL,lease_until=NULL WHERE id=?""",
+                (status, first, count, str(evidence_path), evidence_sha256,
+                 None if unavailable else now + 300, now, attempt_id))
+            if unavailable:
+                self.db.execute("""UPDATE batch_items SET status='unavailable',
+                    error_code='remote_batch_not_found',updated_at=? WHERE attempt_id=?
+                    AND status='pending'""", (now, attempt_id))
+            self.db.execute("COMMIT")
+            return status
         except Exception:
             if self.db.in_transaction:
                 self.db.execute("ROLLBACK")
@@ -1058,10 +1116,12 @@ class Ledger:
                               error_code: str | None = None,
                               result_path: Path | None = None,
                               result_sha256: str | None = None) -> bool:
-        """Finish only after every physical attempt is terminal or cancelled.
+        """Finish after each attempt is terminal, cancelled or locally unavailable.
 
         ``accepted`` binds a saved local result; this row does not itself
         publish or alter any legacy current pointer.
+        Locally unavailable is not an upstream outcome; its unknown bill
+        stays reserved, including after this workflow finishes.
         """
         if status not in {"accepted", "failed", "cancelled"}:
             raise ValueError("invalid workflow terminal status")
@@ -1091,7 +1151,7 @@ class Ledger:
             open_attempt = self.db.execute("""SELECT id FROM batch_attempts
                 WHERE workflow_id=? AND status NOT IN
                 ('completed','failed','expired','cancelled','rejected_no_charge',
-                 'cancelled_before_submit') LIMIT 1""",
+                 'cancelled_before_submit','remote_unavailable') LIMIT 1""",
                 (workflow_id,)).fetchone()
             if open_attempt is not None:
                 raise ValueError("workflow still has an active Batch attempt")

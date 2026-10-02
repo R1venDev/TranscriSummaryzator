@@ -274,6 +274,20 @@ def _post_reserved(*, ledger: Ledger, attempt_id: str, payload_path: Path,
                                            error_code="unexpected_submit_response")
             return {"status": "submission_unknown", "attempt_id": attempt_id}
         ledger.record_batch_submission(attempt_id, remote_id=remote_id)
+        # Persist the actual acknowledgement, not a reconstructed terminal.
+        # The remote ID is durable first so a failed receipt write cannot
+        # cause a replacement POST after restart.
+        attempt = ledger.get_batch_attempt(attempt_id)
+        workflow = ledger.get_batch_workflow(attempt["workflow_id"])
+        receipt = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "submissions" / (attempt_id + ".json")
+        try:
+            _json_file_once(receipt, {"http_status": reply.status_code,
+                "payload_sha256": payload_sha, "batch_id": remote_id,
+                "reply": reply.body})
+        except (OSError, ValueError):
+            # Dispatch is known. Capture failure is visible and never retryable.
+            ledger.db.execute("UPDATE batch_attempts SET error_code=? WHERE id=?",
+                              ("submit_receipt_capture_failed", attempt_id))
         return {"status": "submitted", "attempt_id": attempt_id,
                 "remote_batch_id": remote_id}
     except (BatchError, ValueError) as exc:
@@ -831,6 +845,37 @@ def _terminal_route_attestation(client: BatchClient, intent: dict,
             "catalog_provider_name": "OpenAI"}
 
 
+def _missing_batch_observation(*, client, attempt: dict, workflow: dict,
+                               ledger: Ledger, owner: str, private_root: Path) -> dict:
+    # A stale/moved credential or a truncated workspace listing is not
+    # evidence that a submitted job is unavailable. Never rotate or POST here.
+    key = client.current_key().body.get("data", {})
+    if (not isinstance(key, dict) or key.get("workspace_id") != workflow["workspace_id"]
+            or attempt["workspace_id"] != workflow["workspace_id"]):
+        raise ValueError("missing_batch_workspace_unverified")
+    listing = client.list_batches(limit=100,
+        created_after=int(attempt["created_at"]) - 60,
+        created_before=int(attempt["created_at"]) + 3601).body
+    rows = listing.get("data")
+    if (not isinstance(rows, list) or listing.get("has_more") is not False
+            or any(not isinstance(row, dict) or not valid_batch_id(row.get("id")) for row in rows)
+            or any(row["id"] == attempt["remote_id"] for row in rows)):
+        raise ValueError("missing_batch_list_unconfirmed")
+    # Save only this application's identity; foreign workspace jobs are not
+    # downloaded, recorded or touched.
+    observation = {"kind": "workspace_confirmed_batch_missing",
+        "batch_id": attempt["remote_id"], "workspace_id": workflow["workspace_id"],
+        "http_status": 404, "list_complete": True, "listed": False,
+        "observed_at": time.time()}
+    path = private_root / "source_first" / workflow["semantic_key"] / "diagnostics" / (
+        attempt["id"] + "-missing-" + owner + ".json")
+    sha = _json_file_once(path, observation)
+    status = ledger.record_batch_missing(attempt["id"], owner,
+        evidence_path=path, evidence_sha256=sha)
+    return {"attempt_id": attempt["id"], "status": status,
+            "reason": "remote_batch_not_found", "charge": "unknown_hold_retained"}
+
+
 def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
                   private_root: Path, client_factory) -> dict:
     owner = "source-first-" + uuid.uuid4().hex
@@ -905,9 +950,18 @@ def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
         ledger.defer_batch_poll(attempt["id"], owner, delay_seconds=600,
                                 error_code="credential_required", credential_required=True)
         return {"attempt_id": attempt["id"], "status": "credential_required"}
-    except (BatchError, ValueError, OSError):
+    except (BatchError, ValueError, OSError) as exc:
+        if isinstance(exc, BatchError) and exc.code == 404:
+            try:
+                return _missing_batch_observation(client=client, attempt=attempt,
+                    workflow=workflow, ledger=ledger, owner=owner, private_root=private_root)
+            except (BatchError, CredentialError, ValueError, OSError):
+                reason = "remote_batch_404_recovery_unconfirmed"
+        else:
+            reason = ("batch_http_" + str(exc.code) if isinstance(exc, BatchError)
+                      and exc.code is not None else "batch_get_or_parse_failed")
         ledger.defer_batch_poll(attempt["id"], owner, delay_seconds=300,
-                                error_code="batch_get_or_parse_failed")
+                                error_code=reason)
         return {"attempt_id": attempt["id"], "status": "poll_deferred"}
 
 
@@ -1015,6 +1069,8 @@ def _verify_reserved_dispatch(*, ledger: Ledger, workflow: dict,
 
 def _stage_native(ledger: Ledger, attempt: dict) -> tuple[dict[str, dict], dict[str, str]]:
     """Decode only uniquely completed custom IDs from an immutable GET capture."""
+    if attempt and attempt["status"] == "remote_unavailable":
+        return {}, {identity: "remote_batch_not_found" for identity in _expected_ids(ledger, attempt)}
     if not attempt or attempt["status"] not in TERMINAL:
         return {}, {}
     remote = _read_sealed(Path(attempt["terminal_path"]), attempt["terminal_sha256"])
@@ -1479,7 +1535,7 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
 
 def _ready(attempt: dict | None) -> bool:
     return bool(attempt and attempt["status"] in
-                set(TERMINAL) | {"rejected_no_charge", "cancelled_before_submit"})
+                set(TERMINAL) | {"rejected_no_charge", "cancelled_before_submit", "remote_unavailable"})
 
 
 def _advance_workflow(*, ledger: Ledger, workflow: dict,
@@ -1507,7 +1563,7 @@ def _advance_workflow(*, ledger: Ledger, workflow: dict,
                                                   "source_revision_changed")
         unsettled = [attempt["id"] for attempt in ledger.list_batch_attempts(workflow["id"])
                      if attempt["status"] not in set(TERMINAL) |
-                     {"rejected_no_charge", "cancelled_before_submit"}]
+                     {"rejected_no_charge", "cancelled_before_submit", "remote_unavailable"}]
         if unsettled:
             return {"status": "source_revision_obsolete_pending",
                     "workflow_id": workflow["id"], "pending_attempt_ids": unsettled}
@@ -1831,7 +1887,7 @@ def poll_source_first_once(*, private_root: Path,
                                      "workflow_id": workflow["id"],
                                      "reason": str(exc)[:120]})
         for workflow in ledger.list_source_first_workflows(
-                states=("active", "accepted", "failed")):
+                states=("accepted", "failed")):
             for attempt in ledger.list_batch_attempts(workflow["id"]):
                 cleanup = _cleanup_terminal_once(ledger=ledger, attempt=attempt,
                     workflow=workflow, private_root=private_root,
