@@ -18,7 +18,7 @@ from .contract import validate_document
 from .source import load_source
 
 
-POLICY_VERSION = "luna_batch_source_first_v1"
+POLICY_VERSION = "luna_batch_source_first_v2"
 # Size cores by source text plus framing; actual K/M are computed per input.
 # Inputs exceeding the item policy block rather than losing source content.
 CORE_TARGET_CHARS = 36_000
@@ -488,12 +488,35 @@ def partition_surfaces(registry: dict[str, dict], packets: tuple[dict, ...]) -> 
     return tuple(bins)
 
 
+def review_evidence(rows: list[dict], known: dict[str, dict], snapshot: SourceSnapshot,
+                    *, permitted_ids: set[str] | None = None) -> dict:
+    """Resolve exact input IDs as well as new citations, with collision checks.
+
+    Input evidence is rechecked against this source. A locally declared quote
+    may choose a different exact span of the same U-ID: output IDs subsequently
+    receive a report namespace. Moving an ID to another utterance is blocked.
+    No fuzzy ID matching is permitted.
+    """
+    inherited = validate_evidence([
+        {"evidence_id": key, "u_id": value["u_id"], "quote": value["quote"]}
+        for key, value in known.items()], snapshot, permitted_ids=permitted_ids)
+    emitted = validate_evidence(rows, snapshot, permitted_ids=permitted_ids)
+    for key, value in emitted.items():
+        if key in inherited:
+            if value["u_id"] != inherited[key]["u_id"]:
+                raise ValueError("evidence_reference_collision")
+            if value["quote"] != inherited[key]["quote"]:
+                value["input_quote_sha256"] = digest(inherited[key]["quote"])
+                value["reference_resolution"] = "report_local_span_same_u_v1"
+    return {**inherited, **emitted}
+
+
 def validate_audit(raw: dict, *, packet: dict, packet_inventory: dict,
                    surfaces: list[dict], full_registry: dict[str, dict],
                    snapshot: SourceSnapshot) -> dict:
     report = parse_stage_report("audit", raw).model_dump(mode="json")
-    evidence = validate_evidence(report["evidence"], snapshot,
-                                 permitted_ids={row["id"] for row in packet["records"]})
+    evidence = review_evidence(report["evidence"], packet_inventory.get("evidence", {}),
+        snapshot, permitted_ids={row["id"] for row in packet["records"]})
     units = packet_inventory["units"]
     facets = packet_inventory["facets"]
     source_checks = _one_of_each(report["source_checks"], "unit_id",
@@ -619,9 +642,10 @@ def validate_audit(raw: dict, *, packet: dict, packet_inventory: dict,
 def validate_global(raw: dict, *, snapshot: SourceSnapshot,
                     expected_context_ids: set[str], full_registry: dict[str, dict],
                     expected_link_ids: set[str] | None = None,
-                    expected_unit_ids: set[str] | None = None) -> dict:
+                    expected_unit_ids: set[str] | None = None,
+                    known_evidence: dict[str, dict] | None = None) -> dict:
     report = parse_stage_report("global", raw).model_dump(mode="json")
-    evidence = validate_evidence(report["evidence"], snapshot)
+    evidence = review_evidence(report["evidence"], known_evidence or {}, snapshot)
     resolutions = _one_of_each(report["resolutions"], "request_id",
                                expected_context_ids, "global_resolution")
     for row in resolutions.values():
@@ -638,7 +662,9 @@ def validate_global(raw: dict, *, snapshot: SourceSnapshot,
         raise ValueError("global_unknown_unit")
     finding_ids = set()
     for finding in report["findings"]:
-        if (finding["finding_id"] in finding_ids
+        if (not finding["finding_id"] or finding["finding_id"] in finding_ids
+                or not finding["evidence_ids"]
+                or not (finding["affected_surface_ids"] or finding["affected_unit_ids"])
                 or any(ref not in evidence for ref in finding["evidence_ids"])
                 or any(surface_id not in full_registry for surface_id in finding["affected_surface_ids"])):
             raise ValueError("global_finding_invalid")
@@ -903,21 +929,41 @@ def remap_mark_targets(findings: list[dict], *, plan: dict | None,
 def validate_verification(raw: dict, *, plan: dict, snapshot: SourceSnapshot,
                           registry: dict[str, dict]) -> dict:
     report = parse_stage_report("verify", raw).model_dump(mode="json")
-    checks = _one_of_each(report["bundle_checks"], "bundle_id",
-                          set(plan["bundles"]), "verification_bundle")
-    evidence = {}
-    for check in checks.values():
-        for evidence_id, value in validate_evidence(check["evidence"], snapshot).items():
-            if evidence_id in evidence:
-                raise ValueError("verification_evidence_id_repeated")
-            evidence[evidence_id] = value
-        if any(ref not in registry for ref in check["preserved_surface_ids"]):
-            raise ValueError("verification_surface_invalid")
-        if check["verdict"] == "accept" and (not check["evidence"] or check["regressions"]):
-            raise ValueError("verification_accept_unsupported")
+    counts = Counter(row["bundle_id"] for row in report["bundle_checks"])
+    checks, discarded, evidence = {}, [], {}
+    invalid_evidence = set()
+    for check in report["bundle_checks"]:
+        identity = check["bundle_id"]
+        try:
+            if identity not in plan["bundles"] or counts[identity] != 1:
+                raise ValueError("verification_bundle_identity_invalid")
+            citations = validate_evidence(check["evidence"], snapshot)
+            for evidence_id, value in citations.items():
+                if evidence_id in evidence and any(value[field] != evidence[evidence_id][field]
+                                                    for field in ("u_id", "quote")):
+                    invalid_evidence.add(evidence_id)
+                else:
+                    evidence[evidence_id] = value
+            if any(ref not in registry for ref in check["preserved_surface_ids"]):
+                raise ValueError("verification_surface_invalid")
+            if check["verdict"] == "accept" and (not check["evidence"] or check["regressions"]):
+                raise ValueError("verification_accept_unsupported")
+            checks[identity] = check
+        except (ValueError, KeyError, TypeError) as exc:
+            discarded.append({"kind": "bundle_check", "id": identity, "reason": str(exc)})
+    if invalid_evidence:
+        for identity, check in list(checks.items()):
+            if any(row["evidence_id"] in invalid_evidence for row in check["evidence"]):
+                checks.pop(identity)
+                discarded.append({"kind": "bundle_check", "id": identity,
+                                  "reason": "verification_evidence_id_ambiguous"})
+        for identity in invalid_evidence:
+            evidence.pop(identity, None)
+    missing = set(plan["bundles"]) - set(checks)
     new_ids = set()
     for finding in report["new_findings"]:
         if (not finding["finding_id"] or finding["finding_id"] in new_ids
+                or not finding["evidence_ids"]
                 or any(ref not in evidence for ref in finding["evidence_ids"])
                 or any(ref not in registry for ref in finding["affected_surface_ids"])):
             raise ValueError("verification_new_finding_invalid")
@@ -926,6 +972,19 @@ def validate_verification(raw: dict, *, plan: dict, snapshot: SourceSnapshot,
         raise ValueError("verification_unprocessed_unknown")
     accepted = {bundle_id for bundle_id, check in checks.items()
                 if check["verdict"] == "accept" and bundle_id not in report["unprocessed_bundle_ids"]}
+    # A new problem rejects the affected group, not unrelated accepted fixes.
+    # An unlocated problem cannot safely be attributed and rejects all groups.
+    for finding in report["new_findings"]:
+        targets = set(finding["affected_surface_ids"])
+        if not targets:
+            accepted.clear()
+            break
+        for bundle_id in list(accepted):
+            bundle = plan["bundles"][bundle_id]
+            touched = set(bundle.get("affected_surface_ids", [])) | {
+                op.get("target_id") for op in bundle.get("operations", [])}
+            if targets & touched:
+                accepted.discard(bundle_id)
     # Treat every connected dependency component as one atomic group.
     neighbors = {bundle_id: set(bundle["dependency_bundle_ids"])
                  for bundle_id, bundle in plan["bundles"].items()}
@@ -948,15 +1007,14 @@ def validate_verification(raw: dict, *, plan: dict, snapshot: SourceSnapshot,
         if group <= accepted:
             grouped_acceptance.update(group)
     accepted = grouped_acceptance
-    if not report["complete"] or report["new_findings"]:
-        accepted.clear()
     prefix = "verify:"
     normalized_evidence = {prefix + key: {**value, "evidence_id": prefix + key}
                            for key, value in evidence.items()}
     new_findings = [{**finding, "finding_id": prefix + finding["finding_id"],
                      "evidence_ids": [prefix + ref for ref in finding["evidence_ids"]]}
                     for finding in report["new_findings"]]
-    return {"complete": report["complete"] and not report["unprocessed_bundle_ids"],
+    return {"complete": report["complete"] and not report["unprocessed_bundle_ids"] and not missing and not discarded,
+            "discarded": discarded, "missing_bundle_ids": sorted(missing),
             "accepted": accepted, "rejected": set(plan["bundles"]) - accepted,
             "new_findings": new_findings, "evidence": normalized_evidence,
             "native_report": raw}

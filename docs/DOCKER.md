@@ -89,7 +89,7 @@ git clone https://github.com/R1venDev/TranscriSummaryzator.git && cd TranscriSum
    результаты проверок, бюджет и редактируемые карточки сохраняются после
    перезапуска контейнеров.
 
-Compose включает существующий маршрут `luna_batch_source_first_v1` с лимитом
+Compose включает существующий маршрут `luna_batch_source_first_v2` с лимитом
 $0.25 на workflow и общим лимитом $5 за семь дней в durable ledger. Ошибка
 не переключает обработку на локальную модель. Условия хранения Batch у
 провайдера и проверку workspace см. в

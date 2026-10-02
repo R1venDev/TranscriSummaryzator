@@ -1,6 +1,37 @@
 # Luna source-first через OpenRouter Batch: устройство и выпуск
 
-Состояние: summary dashboard и scheduler переключены на source-first release 28.09.2026, tree `b70d4c5`; ASR, диаризация, speech service и Plane не менялись. Полный приёмочный прогон 411 реплик завершил 8 inference items в четырёх Batch за $0.043585. Изолированное поколение `20260928-190208-01e715afefd5` принято с `review_incomplete`: все три извлечения и три аудита имели локальные ошибки валидации, поэтому проверка смысла неполна. Оно не перенесено на production pointer из-за известных пропусков 80 000 свечей и поздней поправки U00388. Исправление в tree `b70d4c5` допускает уникальные небольшие расхождения цитаты и сохраняет проверенные строки частично неверного извлечения; его эффект на новой записи пока не измерен. История старых Luna/Gemini/Opus jobs и их контракты остаётся в [SUMMARY_LUNA_BATCH.md](SUMMARY_LUNA_BATCH.md).
+## Адаптивный output и пригодные частичные отчёты — 3 октября 2026
+
+Policy `luna_batch_source_first_v2`, prompts `luna_batch_stage_v2`. Штатный маршрут остаётся Luna/OpenRouter Batch на единственном разрешённом OpenAI endpoint. ASR, диаризация, входная стенограмма и речевые окружения не изменены.
+
+В новом маршруте нет таблицы фиксированных 25k/32k caps. `capacity.py` вычисляет верхний `max_tokens` для каждого реального payload из подтверждённого endpoint output limit, оставшегося контекста, тарифов без обещанного cache hit и оставшихся разрешённых денег. Из денег сначала вычитаются фактические input holds текущей волны и плановая стоимость известных будущих source inputs; output-деньги делятся между текущими и оставшимися items. Это резерв для reasoning и видимого JSON вместе, не требуемый размер ответа. После получения фактических bills освобождённый запас доступен следующим стадиям. Максимальное окно модели не резервируется целиком.
+
+Первоначальный input forecast — нижняя плановая стоимость известного источника, а не обещание цены всей цепочки: будущие отчёты ещё неизвестны. Каждая следующая волна резервирует реальные bytes и вычисленную output capacity до POST. При нехватке денег — честный `budget_blocked`, без повышения лимита, усечения source или sync. Действующие разрешения: $0.25/job, $5 за скользящие 7 суток, до 12 items, 6 Batch POST. Подтверждённые ограничения модели/API и деньги остаются конечными. Ограниченный split/retry по `length` пока не реализован; повреждённый JSON не принимается. Старые legacy jobs читаются прежними readers; legacy inference не является fallback.
+
+Allocation сохраняется до intent и POST с identity исходных данных; перезапуск использует те же body bytes и custom IDs. Перед отправкой сохранённые caps повторно проверяются по текущему endpoint и тарифу. Изменение prompts/policy входит в semantic identity: старый непроверенный output не становится cache hit новой policy.
+
+### Исправления и проверка полноты
+
+- Audit может ссылаться на проверенную `SOURCE_EVIDENCE` из своего входа. Эти цитаты повторно проверяются по той же source revision. Новая дословная цитата того же U-ID может получить report-local scope с provenance; перенос существующего ID на другую реплику запрещён.
+- Независимые валидные findings/needs_context сохраняются даже при неполной typed-проверке. Неверные цитаты, неизвестные/двойные IDs удаляются с причиной в приватном normalized report. Salvage не подтверждает положительное покрытие.
+- Global использует только app-issued link IDs. Ошибочные или отсутствующие link/resolution verdicts не превращаются в `supported`, но не уничтожают независимые grounded findings.
+- Repair получает D0, полный source, findings, таблицу source evidence и app-issued surface targets. Не более одной смысловой итерации; patch применяется к временной D1.
+- Verify принимает только явно одобренные, локально валидные bundles. Отсутствующее verdict, неверная цитата, reject или unresolved откатывают зависимую группу. Неполный общий report не отменяет явно проверенную независимую группу. Новое замечание откатывает затронутые группы; без координат затронутого места все группы остаются неприменёнными.
+- Публикация собирает один canonical document из принятых patches и явных пометок неопределённости, затем renderer/task projection и atomic pointer. D0/raw сохраняются. Task UUID, CAS и ручные overrides остаются в существующем TaskStore. UI показывает число применённых bundles отдельно от предупреждения о неполноте.
+
+### Выполненная проверка и её предел
+
+На сохранённых ответах реальной встречи из 411 реплик offline replay восстановил 7 findings аудита и 5 findings global. Два обрезанных `length` ответа не восстановлены. D0 не изменён. Эти 12 замечаний — кандидаты Luna, а не доказанная истина и не уже применённый live repair. Unit/integration проверки включают получение evidence по входному ID, плохой соседний finding, неправильный link ID, неполную verification и цепочку repair→verify→apply. Качество новой генерации требует отдельного полного API-прогона; offline PASS не измеряет смысловую точность.
+
+Официальные источники, сверены 02–03.10.2026: [OpenRouter reasoning/output](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens), [Batch contract](https://openrouter.ai/docs/batch-quickstart), [OpenAI reasoning guidance](https://developers.openai.com/api/docs/guides/reasoning-best-practices). Context7 `/openrouterteam/docs` использован для адресной сверки; фактический endpoint Chat serializer имеет приоритет над общими примерами.
+
+### Включение и откат
+
+Новая policy включается существующим `TRANSCRI_LUNA_SOURCE_FIRST_ENABLED=1`, с сохранённым `TRANSCRI_LUNA_SOURCE_FIRST_JOB_CAP_USD=0.25`. Отдельный scheduler/ключевой store не создаётся. До смены summary image сохраняются точные compose/digest и checkpoint активных jobs. При отсутствии активных jobs меняются только контейнеры app/scheduler; speech service не перезапускается. Откат — прежний pinned summary digest с теми же томами. Уже отправленные Batch сначала доводятся штатным scheduler новой версии до terminal: старый release не должен отправлять повтор или продолжать job с изменённым prompt. Прежние sealed generations и ручные правки сохраняются.
+
+## Историческое состояние v1
+
+Следующие сведения относятся к прежним native releases и опытам; они не доказывают текущий Docker rollout.
 
 ## Исходное состояние перед правками
 

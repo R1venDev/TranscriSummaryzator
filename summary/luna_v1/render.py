@@ -273,6 +273,9 @@ def render_document(document: dict, source_index: dict, effective_tasks: list[di
                       "конспект и выполненные проверки сохранены, недостающая область отмечена в статусе.")
         else:
             notice = "Автоматическая смысловая проверка завершилась не полностью; конспект опубликован с этой пометкой."
+        applied = quality_review.get("applied_bundle_count", 0)
+        if type(applied) is int and applied > 0:
+            notice += f" Проверены и применены {applied} пакет(ов) исправлений."
         warning_count = quality_review.get("coverage_warning_count", 0)
         if warning_count and status != "coverage_incomplete":
             notice += f" В отчёте о покрытии есть {warning_count} несогласованных строк(и); полнота проверки не подтверждена."

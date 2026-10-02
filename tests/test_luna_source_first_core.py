@@ -407,7 +407,7 @@ class SourceFirstCoreTests(unittest.TestCase):
     def test_verification_new_finding_has_validated_source_and_surface(self):
         registry = build_surfaces(_document(), self.snapshot.index)
         surface = next(iter(registry))
-        plan = {"bundles": {"B1": {"dependency_bundle_ids": []}}}
+        plan = {"bundles": {"B1": {"dependency_bundle_ids": [], "affected_surface_ids": [surface]}}}
         raw = {"schema_version": "luna_verification_v1", "complete": True,
                "bundle_checks": [{
                    "bundle_id": "B1", "verdict": "accept",
