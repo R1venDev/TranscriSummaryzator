@@ -78,6 +78,8 @@ def native_blocks(identity, assets, chapters):
     esc = lambda x: html.escape(str(x), quote=True)
     result = []
     for asset in assets:
+        if asset['role'] != 'preview':
+            continue
         block = str(uuid.uuid5(uuid.NAMESPACE_URL, identity + ':' + asset['role']))
         identifier = str(uuid.UUID(asset['asset_id']))
         preview = asset['role'] == 'preview'
@@ -231,7 +233,7 @@ def prepare(spec, cache):
             os.replace(temporary, target)
         except (OSError, subprocess.SubprocessError):
             raise PlaneError('Не удалось подготовить MP4 без перекодирования') from None
-    return [original, {'role': 'preview', 'path': str(target), 'sha256': digest(target),
+    return [{'role': 'preview', 'path': str(target), 'sha256': digest(target),
                       'name': Path(spec['name']).stem + '.mp4', 'type': 'video/mp4', 'size': target.stat().st_size}]
 
 
@@ -317,7 +319,7 @@ def drain(store):
             # body, including edits since media upload began. API has no CAS.
             body = client.request('GET', page_path).get('description_html') or ''
             marker = 'plane-timecodes-' + identity
-            present = [asset['asset_id'] in body for asset in assets]
+            present = [asset['asset_id'] in body for asset in assets if asset['role'] == 'preview']
             if marker in body and all(present):
                 save('published')
                 return {'state': 'media_published'}
@@ -337,9 +339,10 @@ def drain(store):
                            'native_blocks': blocks}, stream, ensure_ascii=False)
                 stream.flush()
                 os.fsync(stream.fileno())
-            client.request('PUT', page_path, {'description_html': blocks + body})
+            from summary.plane_wiki import insert_media
+            client.request('PUT', page_path, {'description_html': insert_media(body, blocks)})
             after = client.request('GET', page_path).get('description_html') or ''
-            if marker not in after or not all(a['asset_id'] in after for a in assets):
+            if marker not in after or not all(a['asset_id'] in after for a in assets if a['role'] == 'preview'):
                 raise PlaneError('Plane не подтвердил нативные блоки видео и таймкодов')
             save('published')
             with store._db() as db:
@@ -354,5 +357,80 @@ def drain(store):
         except Exception:
             save('blocked', 'Не удалось проверить публикацию видео; сохранено состояние для восстановления')
             return {'state': 'media_blocked'}
+    finally:
+        os.close(fd)
+
+
+def refresh_layout(store, job_id, source_index, transcript_url):
+    """Explicit authorized layout migration of an existing app-owned page.
+
+    Keeps remote summary/manual text and existing uploaded assets. No new page,
+    upload, inference or source writes. Exact before/target saved before PUT;
+    retry compares its app-issued layout marker, recovering a lost response.
+    """
+    from summary.plane import PlaneError, _json, _hash, _delivery_destination
+    from summary.plane_wiki import Tree, Node, clean_summary, participant_header, transcript_block, resolve_mentions, verify_transcript, verify_layout
+    fd = os.open(store.path.with_suffix('.media.lock'), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with store._db() as db:
+            setting_row = store._row(db)
+            settings = store._settings(setting_row)
+            row = db.execute("SELECT m.*,d.remote_id,d.external_id,d.destination,d.job_id,d.payload FROM page_media m JOIN deliveries d ON m.delivery_id=d.id WHERE d.job_id=? AND d.destination=? AND d.state IN ('created','update_available')", (str(job_id), _json(_delivery_destination(settings, 'page')))).fetchone()
+            if not row:
+                raise PlaneError('Нет опубликованного видео этой встречи')
+            row = dict(row)
+        spec, assets = json.loads(row['spec']), json.loads(row['assets'])
+        if spec['source_sha256'] != source_index['source_sha256']:
+            raise PlaneError('Источник Wiki не соответствует транскрипции')
+        previews = [a for a in assets if a['role'] == 'preview' and a.get('asset_id')]
+        if len(previews) != 1:
+            raise PlaneError('Нет единственного подтверждённого видео')
+        client = store.client_factory(settings, store._key(setting_row))
+        page_id = str(uuid.UUID(row['remote_id']))
+        path = client.prefix + 'pages/' + page_id + '/'
+        identity = _hash([page_id, spec['sha256']])[:32]
+        marker = 'transcri-wiki-layout-v2-' + identity
+        remote = client.request('GET', path)
+        before = remote.get('description_html') or ''
+        if 'transcrisummaryzator-id:' + row['external_id'] not in before:
+            raise PlaneError('Wiki не подтвердила identity встречи')
+        if marker in before:
+            if not verify_layout(before, source_index, transcript_url, 'plane-timecodes-' + identity, assets):
+                raise PlaneError('Опубликованная транскрипция изменена; автоматическая перезапись отключена')
+            return {'state': 'layout_current', 'page_id': page_id}
+        metadata = client.request('GET', path + 'attachments/' + str(uuid.UUID(previews[0]['asset_id'])) + '/')
+        if metadata.get('is_uploaded') is not True:
+            raise PlaneError('Plane не подтвердил видео')
+        members = client.list_all(client.prefix + 'members/')
+        transcript_id = 'transcri-transcript-' + source_index['source_sha256'][:32]
+        generated = Tree(json.loads(row['payload'])['description_html'])
+        titles = [n.text() for n in generated.root.children if isinstance(n, Node) and n.tag == 'h1']
+        meeting_title = titles[0] if len(titles) == 1 else None
+        preserved = clean_summary(before, [a['asset_id'] for a in assets], 'plane-timecodes-' + identity, transcript_id, meeting_title)
+        target = (resolve_mentions(participant_header(source_index), members)
+                  + native_blocks(identity, previews, spec['chapters'])
+                  + transcript_block(source_index, transcript_url) + preserved
+                  + '<p>' + marker + '</p>')
+        # No CAS in installed Plane API; decline observed concurrent changes.
+        if (client.request('GET', path).get('description_html') or '') != before:
+            raise PlaneError('Wiki редактируется; повторите обновление после сохранения')
+        recovery = store.path.parent / 'plane_media' / (identity + '.layout-v2.json')
+        recovery.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with recovery.open('w', encoding='utf-8') as stream:
+            os.chmod(recovery, 0o600)
+            json.dump({'page_id': page_id, 'source_sha256': spec['source_sha256'],
+                       'before_html': before, 'target_html': target}, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        with store._db() as db:
+            store._event(db, row['delivery_id'], 'wiki_layout_v2_intent', {'source_id': spec['source_sha256'], 'page_id': page_id})
+        client.request('PUT', path, {'description_html': target})
+        after = client.request('GET', path).get('description_html') or ''
+        if marker not in after or previews[0]['asset_id'] not in after or not verify_layout(after, source_index, transcript_url, 'plane-timecodes-' + identity, assets):
+            raise PlaneError('Plane не подтвердил новый формат Wiki')
+        with store._db() as db:
+            store._event(db, row['delivery_id'], 'wiki_layout_v2_saved', {'page_id': page_id, 'turns': len(source_index['by_id']), 'asset_id': previews[0]['asset_id']})
+        return {'state': 'layout_updated', 'page_id': page_id, 'turns': len(source_index['by_id'])}
     finally:
         os.close(fd)

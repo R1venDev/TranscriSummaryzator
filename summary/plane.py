@@ -78,7 +78,7 @@ def _id(value):
 class _SafeHTML(HTMLParser):
     tags = {"p", "br", "strong", "b", "em", "i", "u", "s", "h1", "h2", "h3", "h4", "h5", "h6",
             "ul", "ol", "li", "blockquote", "pre", "code", "table", "thead", "tbody", "tr", "th", "td",
-            "a", "details", "summary", "hr"}
+            "a", "details", "summary", "hr", "div", "mention-component"}
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.out, self.hidden = [], 0
@@ -92,6 +92,32 @@ class _SafeHTML(HTMLParser):
             href = dict(attrs).get("href", "")
             if urllib.parse.urlsplit(href).scheme in {"https", "http"}:
                 safe = ' href="' + escape(href, quote=True) + '"'
+        attributes = dict(attrs)
+        if tag == "p" and "data-transcri-participants" in attributes:
+            try:
+                names = json.loads(attributes["data-transcri-participants"])
+                if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+                    raise ValueError()
+                safe = ' data-transcri-participants="' + escape(json.dumps(names, ensure_ascii=False), quote=True) + '"'
+            except (ValueError, TypeError):
+                raise PlaneError("Неверный список участников Wiki") from None
+        elif tag == "details":
+            identifier = attributes.get("data-id", "")
+            if re.fullmatch(r"transcri-transcript-[0-9a-f]{32}", identifier):
+                safe = ' class="editor-details-block" data-id="' + identifier + '"'
+        elif tag == "summary":
+            safe = ' class="editor-details-summary"'
+        elif tag == "div" and attributes.get("data-type") == "detailsContent":
+            safe = ' class="editor-details-content" data-type="detailsContent"'
+        elif tag == "mention-component":
+            try:
+                identifier = str(uuid.UUID(attributes["entity_identifier"]))
+                node_id = str(uuid.UUID(attributes["id"]))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                return
+            if attributes.get("entity_name") != "user_mention":
+                return
+            safe = f' id="{node_id}" entity_identifier="{identifier}" entity_name="user_mention"'
         self.out.append("<" + tag + safe + ">")
     def handle_endtag(self, tag):
         if tag in {"script", "style", "iframe", "object"} and self.hidden:
@@ -216,6 +242,13 @@ class PlaneClient:
         payload = dict(json.loads(row["payload"]))
         if row["kind"] == "page":
             path = self.prefix + "pages/"
+            from summary.plane_wiki import PARTICIPANTS, resolve_mentions
+            if PARTICIPANTS in payload.get("description_html", ""):
+                try:
+                    members = self.list_all(self.prefix + "members/")
+                    payload["description_html"] = resolve_mentions(payload["description_html"], members)
+                except PlaneError as exc:
+                    raise PlanePreflightError("Не удалось проверить участников Plane; страница не отправлена") from exc
         else:
             try:
                 project = self.request("GET", self.prefix + "projects/" + self.project + "/")

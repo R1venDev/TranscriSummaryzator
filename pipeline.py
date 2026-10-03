@@ -106,7 +106,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "14c2e2dc0072a629b63edb283625e0a9f3dc0f09f37eebeabd93b9a40ffe4a2a"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "48f0ba4059888153a1c677d066a5bd1cbe1cbb299977b793ac4fa6c437895323"
 
 
 def _stage_pipeline_sha256(source):
@@ -576,7 +576,9 @@ def plane_selected(job_id, allow_auto=False, create=None):
         store = plane_store()
         idea_ids = store.hypothesis_ids(view.source_sha256, view.rendered["summary.json"]["ideas"])
         origin = os.environ.get("TRANSCRI_SUMMARY_ADMIN_ORIGIN", "http://127.0.0.1:{}".format(config().get("dashboard_port",8765)))
-        items, page = project_view(view, int(identifier), origin, idea_ids)
+        from summary.luna_v1.source import load_source
+        _, source_index, _ = load_source(output / "transcript.json")
+        items, page = project_view(view, int(identifier), origin, idea_ids, source_index)
         store.observe_generation(int(identifier), view.generation_id, items, page,
                                  source_id=view.source_sha256, allow_auto=allow_auto)
         if create is not None:
@@ -589,7 +591,6 @@ def plane_selected(job_id, allow_auto=False, create=None):
         from summary.plane_media import media_spec, enqueue as enqueue_media, unavailable as unavailable_media
         from summary.luna_v1.source import load_source
         try:
-            _, source_index, _ = load_source(output / "transcript.json")
             spec = media_spec(dict(row), output, view, source_index, STATE.parent)
             if spec:
                 enqueue_media(store, identifier, view.generation_id, spec)

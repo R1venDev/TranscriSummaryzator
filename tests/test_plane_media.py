@@ -68,6 +68,37 @@ class MediaTests(unittest.TestCase):
         with patch('summary.plane_media.prepare', side_effect=self.prepared), patch('summary.plane_media.upload_file') as upload:
             result = drain(self.store)
             return result, upload.call_count
+    def list_all(self, path):
+        return [{'id': str(uuid.uuid5(uuid.NAMESPACE_URL, 'user')), 'display_name': 'User'}]
+    def test_layout_migration_reuses_assets_full_source_and_lost_put(self):
+        from summary.plane_media import refresh_layout
+        enqueue(self.store, 1, 'g1', self.spec)
+        self.assertEqual(self.run_media()[0]['state'], 'media_published')
+        with self.store._db() as db:
+            row = db.execute('SELECT id,payload FROM deliveries').fetchone()
+            payload = json.loads(row['payload']); payload['description_html'] = '<h1>Meeting</h1>' + payload['description_html']
+            db.execute('UPDATE deliveries SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
+        self.body += '<h1>Meeting</h1><p><strong>Участники по транскрипции:</strong> @User</p><h2>Таймкоды</h2><ul><li>Duplicate chapter</li></ul>'
+        index = {'source_sha256': 'source-1', 'participants': ['@User'], 'by_id': {'U00001': {'start_ms': 3, 'speaker': '@User', 'text': 'Exact original text'}}}
+        self.fail_put = True
+        with self.assertRaises(PlaneError):
+            refresh_layout(self.store, 1, index, 'https://app.test/result?id=1')
+        put_count = sum(m == 'PUT' for m, _, _ in self.calls)
+        self.assertEqual(refresh_layout(self.store, 1, index, 'https://app.test/result?id=1')['state'], 'layout_current')
+        self.assertEqual(sum(m == 'PUT' for m, _, _ in self.calls), put_count)
+        self.assertEqual(len(self.ids), 1)
+        self.assertEqual(self.body.count('<attachment-component'), 1)
+        self.assertIn('Exact original text', self.body)
+        self.assertIn('<p>Manual edit</p>', self.body)
+        self.assertIn('<mention-component', self.body)
+        self.assertNotIn('Duplicate chapter', self.body)
+        self.assertNotIn('<h1>', self.body)
+    def test_layout_migration_denies_wrong_source_before_remote_write(self):
+        from summary.plane_media import refresh_layout
+        enqueue(self.store, 1, 'g1', self.spec)
+        with self.assertRaises(PlaneError):
+            refresh_layout(self.store, 1, {'source_sha256': 'other'}, 'https://app.test')
+        self.assertEqual(self.calls, [])
     def test_native_blocks_and_verified_chapters_escape_text(self):
         asset = {**self.prepared()[0], 'asset_id': str(uuid.uuid4())}
         rendered = native_blocks('identity', [asset], self.spec['chapters'])

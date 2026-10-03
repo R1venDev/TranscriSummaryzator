@@ -55,7 +55,7 @@ def app_origin(value):
     return value
 
 
-def project_view(view, job_id, origin, hypothesis_ids):
+def project_view(view, job_id, origin, hypothesis_ids, source_index=None):
     """Same tasks, manual overrides and review notices as the summary UI."""
     origin = app_origin(origin)
     doc = view.rendered['summary.json']
@@ -90,11 +90,19 @@ def project_view(view, job_id, origin, hypothesis_ids):
         description += f'<p><a href="{esc(summary_url)}">Конспект встречи</a></p>'
         items.append({'kind':'hypothesis','item_id':identifier,'title':title,
                       'description':idea['text'],'description_html':description})
+    from summary.plane_wiki import clean_summary, participant_header, transcript_block
     parser = WikiHTML(transcript_url)
-    parser.feed(view.rendered['summary.fragment.html'])
+    fragment = view.rendered['summary.fragment.html']
+    if source_index is not None:
+        if source_index['source_sha256'] != view.source_sha256:
+            raise ValueError('Транскрипция не соответствует конспекту')
+        generated_title = re.search(r'<h1>(.*?)</h1>', fragment, re.S)
+        fragment = clean_summary(fragment, meeting_title=html.unescape(generated_title.group(1)) if generated_title else None)
+    parser.feed(fragment)
     title_match = re.search(r'<h1>(.*?)</h1>', view.rendered['summary.fragment.html'], re.S)
     title = html.unescape(title_match.group(1)) if title_match else 'Встреча'
     page = {'title':title[:255], 'description_html':
+            (participant_header(source_index) + transcript_block(source_index, transcript_url) if source_index is not None else '') +
             f'<p><a href="{esc(summary_url)}">Открыть конспект и карточки в TranscriSummaryzator</a></p>' + ''.join(parser.parts)}
     return items, page
 
