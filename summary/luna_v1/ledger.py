@@ -289,6 +289,9 @@ class Ledger:
             if "planned_reserve_microusd" not in workflow_columns:
                 self.db.execute("ALTER TABLE source_first_workflows ADD COLUMN "
                                 "planned_reserve_microusd INTEGER NOT NULL DEFAULT 0")
+            for name in ("repair_recovery_path", "repair_recovery_sha256"):
+                if name not in workflow_columns:
+                    self.db.execute(f"ALTER TABLE source_first_workflows ADD COLUMN {name} TEXT")
             attempt_columns = {row[1] for row in self.db.execute(
                 "PRAGMA table_info(batch_attempts)")}
             for name, definition in (("missing_since", "REAL"),
@@ -521,6 +524,55 @@ class Ledger:
         return [dict(row) for row in self.db.execute(
             f"SELECT * FROM source_first_workflows WHERE status IN ({placeholders}) ORDER BY created_at",
             tuple(states))]
+
+    def resume_saved_repair(self, workflow_id: str, *, receipt_path: Path,
+                            receipt_sha256: str) -> bool:
+        """One bounded continuation; preserve all attempts, bills and old generation.
+
+        This does not reserve another logical job or authorize a higher cap.
+        The scheduler can dispatch only the missing verification stage.
+        """
+        if not _full_hash(receipt_sha256) or _sealed_sha256(receipt_path) != receipt_sha256:
+            raise ValueError("repair_recovery_receipt_changed")
+        receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT * FROM source_first_workflows WHERE id=?",
+                                  (workflow_id,)).fetchone()
+            if row is None or receipt.get("workflow_id") != workflow_id:
+                raise ValueError("repair_recovery_identity_invalid")
+            if row["repair_recovery_sha256"] is not None:
+                if (row["repair_recovery_sha256"] != receipt_sha256
+                        or row["repair_recovery_path"] != str(receipt_path)):
+                    raise ValueError("repair_recovery_already_registered")
+                self.db.execute("COMMIT")
+                return False
+            repair = self.db.execute("SELECT * FROM batch_attempts WHERE workflow_id=? AND stage='repair'",
+                                     (workflow_id,)).fetchall()
+            if (row["status"] != "accepted" or len(repair) != 1
+                    or repair[0]["status"] != "completed"
+                    or receipt.get("repair_terminal_sha256") != repair[0]["terminal_sha256"]
+                    or receipt.get("source_sha256") != row["source_sha256"]
+                    or receipt.get("accepted_document_sha256") != row["accepted_document_sha256"]
+                    or receipt.get("accepted_document_path") != row["accepted_document_path"]
+                    or _sealed_sha256(Path(row["accepted_document_path"])) != row["accepted_document_sha256"]
+                    or self.db.execute("SELECT 1 FROM batch_attempts WHERE workflow_id=? AND stage='verify'",
+                                       (workflow_id,)).fetchone() is not None):
+                raise ValueError("repair_recovery_not_eligible")
+            self.db.execute("""UPDATE source_first_workflows SET status='active',error_code=NULL,
+                repair_recovery_path=?,repair_recovery_sha256=?,updated_at=? WHERE id=?""",
+                (str(receipt_path), receipt_sha256, time.time(), workflow_id))
+            # Reopening a job older than the rolling window makes its entire
+            # plan active again. Check the projected state in this transaction,
+            # rather than subtracting all-time bills from a seven-day total.
+            if self._rolling_spent_microusd(time.time()) > WEEK_CAP_MICROUSD:
+                raise ValueError("repair_recovery_weekly_budget_exceeded")
+            self.db.execute("COMMIT")
+            return True
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _validate_batch_payload(path: Path, expected_sha256: str,

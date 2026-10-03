@@ -52,6 +52,7 @@ from .source_first_core import (
     validate_verification, safe_mark_document, remap_mark_targets,
 )
 from .review_salvage import salvage_review
+from .patch_normalization import NORMALIZATION_VERSION, normalize_patch_report
 from .tasks import ReconciliationConflict, RevisionConflict, TaskStore
 from .publication import adopt_sealed_generation, publish_document
 
@@ -1338,6 +1339,12 @@ def _repair_payload(snapshot: SourceSnapshot, context: dict, findings: dict,
         "AFFECTED_SURFACES": list(context["registry"].values()),
         "ALLOWED_OPERATIONS": ["replace_field", "update_task", "add_section_item", "create_task"],
         "TASK_SCHEMA_DESCRIPTION": WRITER_SCHEMA["$defs"]["task"],
+        "OPERATION_CONTRACT": {
+            "replace_field": "target_id = exact surface_id; field_key = its exact field_key; value_json = serialized field value",
+            "update_task": "Use one operation per changed business field, addressed by exact surface_id and field_key; retain task identity",
+            "unresolved": "Only exact FINDINGS finding_id strings; explanations belong in preservation_notes",
+            "shared_targets": "Put all findings changing the same field in one bundle and return one combined value",
+        },
     }
 
 
@@ -1363,13 +1370,102 @@ def _validated_patch(ledger: Ledger, workflow: dict, context: dict,
     if report is None:
         return None, None, None, list(failed.values()) or ["repair_unavailable"]
     try:
-        plan = validate_patch_plan(report, findings=findings,
-            registry=context["registry"], known_evidence_ids=set(evidence))
+        plan, provenance = normalize_patch_report(report, document=context["document"],
+            findings=findings, registry=context["registry"], evidence=evidence,
+            source_index=snapshot.index)
         candidate, before = stage_patch_candidate(context["document"], plan,
             context["registry"], snapshot.index, evidence)
+        normalized = {"plan": plan, "before": before,
+                      "candidate_sha256": digest(candidate), "provenance": provenance}
+        normalized_path = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "normalized" / (NORMALIZATION_VERSION + ".json")
+        normalized_sha = _json_file_once(normalized_path, normalized)
+        if workflow.get("repair_recovery_path"):
+            recovery = _read_sealed(Path(workflow["repair_recovery_path"]),
+                                    workflow["repair_recovery_sha256"])
+            if recovery["normalized_patch_sha256"] != normalized_sha:
+                raise ValueError("repair_recovery_candidate_changed")
         return plan, candidate, before, [] if plan["complete"] else ["repair_incomplete"]
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError) as exc:
+        if workflow.get("repair_recovery_sha256"):
+            # A registered candidate is immutable. Do not downgrade a changed
+            # recovery artifact into another publication of D0.
+            raise
+        diagnostic = Path(ledger.root) / "source_first" / workflow["semantic_key"] / "diagnostics" / (NORMALIZATION_VERSION + "-failure.json")
+        _json_file_once(diagnostic, {"error": str(exc), "native_sha256": digest(report)})
         return None, None, None, ["repair_validation_failed"]
+
+
+def _draft_root(ledger: Ledger, workflow: dict) -> Path:
+    root = Path(ledger.root) / "source_first" / workflow["semantic_key"]
+    if workflow.get("repair_recovery_sha256"):
+        root = root / "recovery" / workflow["repair_recovery_sha256"]
+    return root / "drafts"
+
+
+def resume_saved_repair(*, private_root: Path, workflow_id: str) -> dict:
+    """Prepare one continuation from sealed responses; never dispatch here.
+
+    Invoked for a published draft whose repair failed bookkeeping validation.
+    Original generations and native responses stay sealed. A fresh candidate
+    must still pass the normal paid verification and publication transaction.
+    """
+    ledger = Ledger(Path(private_root))
+    try:
+        workflow = ledger.get_batch_workflow(workflow_id)
+        if workflow is None:
+            raise ValueError("repair_recovery_workflow_unknown")
+        if workflow.get("repair_recovery_sha256"):
+            _read_sealed(Path(workflow["repair_recovery_path"]), workflow["repair_recovery_sha256"])
+            return {"status": workflow["status"], "workflow_id": workflow_id,
+                    "recovery_sha256": workflow["repair_recovery_sha256"]}
+        accepted = Path(workflow["accepted_document_path"] or "")
+        if (workflow["status"] != "accepted" or not accepted.is_file()
+                or _sha(accepted.read_bytes()) != workflow["accepted_document_sha256"]):
+            raise ValueError("repair_recovery_not_accepted")
+        sidecar = json.loads((accepted.parent / "review_sidecar.json").read_text())
+        if "repair_validation_failed" not in sidecar.get("technical_failures", []):
+            raise ValueError("repair_recovery_no_validation_failure")
+        pointer_path = Path(workflow["output_dir"]) / "summary_current.json"
+        pointer = json.loads(pointer_path.read_text())
+        if pointer["generation_id"] != accepted.parent.name:
+            raise ValueError("repair_recovery_newer_generation_selected")
+        manifest = _read_sealed(Path(workflow["manifest_path"]), workflow["manifest_sha256"])
+        snapshot = _snapshot_from_manifest(manifest)
+        if _sha(snapshot.transcript_path.read_bytes()) != snapshot.source_sha256:
+            raise ValueError("repair_recovery_source_changed")
+        context = _validated_wave_context(ledger, workflow, snapshot, tuple(manifest["packets"]))
+        audits, _ = _validated_audits(ledger, workflow, snapshot, tuple(manifest["packets"]), context)
+        global_report, _ = _validated_global(ledger, workflow, snapshot, context, audits)
+        findings = {row["finding_id"]: row for audit in audits for row in audit["findings"]}
+        evidence = dict(context["combined"]["evidence"])
+        for report in [*audits, *([global_report] if global_report else [])]:
+            findings.update({row["finding_id"]: row for row in report["findings"]})
+            evidence.update(report["evidence"])
+        plan, candidate, before, failures = _validated_patch(ledger, workflow, context,
+                                                            findings, evidence, snapshot)
+        if plan is None or not plan["bundles"]:
+            raise ValueError("repair_recovery_no_valid_bundles")
+        TaskStore(Path(private_root) / "tasks.sqlite3").preview_reconcile(snapshot.source_sha256, candidate["tasks"])
+        root = Path(private_root) / "source_first" / workflow["semantic_key"]
+        receipt_path = root / "repair_recovery.json"
+        if receipt_path.exists():
+            receipt = json.loads(receipt_path.read_text())
+        else:
+            receipt = {"workflow_id": workflow_id, "source_sha256": snapshot.source_sha256,
+                "accepted_document_path": str(accepted),
+                "accepted_document_sha256": workflow["accepted_document_sha256"],
+                "expected_pointer": pointer, "normalization_version": NORMALIZATION_VERSION,
+                "normalized_patch_sha256": _sha((root / "normalized" / (NORMALIZATION_VERSION + ".json")).read_bytes()),
+                "repair_terminal_sha256": _stage_attempt(ledger, workflow_id, "repair")["terminal_sha256"],
+                "generation_id": datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]}
+        receipt_sha = _json_file_once(receipt_path, receipt)
+        ledger.resume_saved_repair(workflow_id, receipt_path=receipt_path, receipt_sha256=receipt_sha)
+        return {"status": "active", "workflow_id": workflow_id,
+            "recovery_sha256": receipt_sha, "bundle_count": len(plan["bundles"]),
+            "native_bundle_count": sum(len(v) for v in plan["normalization"]["bundle_lineage"].values()),
+            "next_stage": "verify", "new_dispatches": 0}
+    finally:
+        ledger.close()
 
 
 def _validated_verify(ledger: Ledger, workflow: dict, plan: dict,
@@ -1447,7 +1543,7 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
             marks_to_apply, new_registry, snapshot, evidence)
     else:
         marks = []
-    projection_root = private_root / "source_first" / workflow["semantic_key"] / "drafts"
+    projection_root = _draft_root(ledger, workflow)
     projection_sha = _json_file_once(projection_root / "publication_projection.json", document)
     global_ambiguities = []
     if global_report:
@@ -1503,10 +1599,27 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
                "local_marks": marks, "policy_version": POLICY_VERSION,
                "source_draft_sha256": context["d0_sha256"],
                "effective_projection_sha256": projection_sha}
+    if plan and plan.get("normalization"):
+        quality["patch_normalization"] = plan["normalization"]
+        quality["applied_native_bundle_ids"] = [native for identity in sorted(accepted)
+            for native in plan["normalization"]["bundle_lineage"][identity]]
     task_store = TaskStore(private_root / "tasks.sqlite3")
     task_plan = task_store.preview_reconcile(snapshot.source_sha256, document["tasks"])
     generation_id = datetime.fromtimestamp(workflow["created_at"], timezone.utc).strftime(
         "%Y%m%d-%H%M%S") + "-" + workflow["id"][:12]
+    recovery = None
+    if workflow.get("repair_recovery_path"):
+        recovery = _read_sealed(Path(workflow["repair_recovery_path"]), workflow["repair_recovery_sha256"])
+        generation_id = recovery["generation_id"]
+        sidecar["generation_lineage"].append("previous_generation:" + recovery["expected_pointer"]["generation_id"])
+    def commit_tasks():
+        # publish_document holds the meeting's publication lock here. A newer
+        # user generation must not be overwritten by this bounded continuation.
+        if recovery:
+            current = json.loads((Path(workflow["output_dir"]) / "summary_current.json").read_text())
+            if current != recovery["expected_pointer"]:
+                raise RevisionConflict("repair_recovery_current_changed")
+        task_store.commit_reconcile(task_plan)
     writer = _stage_attempt(ledger, workflow["id"], "writer")
     try:
         generation, target = publish_document(
@@ -1520,7 +1633,7 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
             schema_sha256=manifest["schema_hashes"]["writer"],
             effective_tasks=task_plan.effective_tasks, generation_id=generation_id,
             quality_review=quality, review_sidecar=sidecar,
-            before_pointer=lambda: task_store.commit_reconcile(task_plan),
+            before_pointer=commit_tasks,
         )
     except (RevisionConflict, ReconciliationConflict):
         return {"status": "publication_revision_conflict", "workflow_id": workflow["id"]}
@@ -1613,7 +1726,7 @@ def _advance_workflow(*, ledger: Ledger, workflow: dict,
                                      error_code="writer_generation_failed")
         return {"status": "generation_failed", "workflow_id": workflow["id"],
                 "source_path": str(snapshot.transcript_path)}
-    draft_root = private_root / "source_first" / workflow["semantic_key"] / "drafts"
+    draft_root = _draft_root(ledger, workflow)
     context["d0_sha256"] = _json_file_once(draft_root / "d0.json", context["document"])
     failures = context["failures"]
     audit_attempt = _stage_attempt(ledger, workflow["id"], "audit")
