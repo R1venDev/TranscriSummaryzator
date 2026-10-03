@@ -48,7 +48,7 @@ class Tree(HTMLParser):
         self.stack[-1].children.append(data)
 
 
-def clean_summary(value, asset_ids=(), media_marker='', transcript_id='', meeting_title=None):
+def clean_summary(value, asset_ids=(), media_marker='', transcript_id='', meeting_title=None, remove_header=True, keep_timecodes=False):
     """Remove generated duplicates, preserving other remote body/edits.
 
     Only root meeting H1/participant paragraph, exact Timecodes H2 + its list,
@@ -61,9 +61,9 @@ def clean_summary(value, asset_ids=(), media_marker='', transcript_id='', meetin
             result.append(node)
             continue
         text = node.text().strip()
-        if (node.tag == 'h1' and meeting_title is not None and text == meeting_title.strip()) or (node.tag == 'p' and text.startswith(PARTICIPANTS)):
+        if remove_header and ((node.tag == 'h1' and meeting_title is not None and text == meeting_title.strip()) or (node.tag == 'p' and text.startswith(PARTICIPANTS))):
             continue
-        if node.tag == 'h2' and text == 'Таймкоды':
+        if not keep_timecodes and node.tag == 'h2' and text == 'Таймкоды':
             skip_list = True
             continue
         if skip_list:
@@ -159,7 +159,7 @@ def transcript_block(index, transcript_url):
 
 def insert_media(body, blocks):
     """Put media immediately after participant header, before the transcript."""
-    tree = Tree(body)
+    tree = Tree(clean_summary(body, remove_header=False))
     for i, node in enumerate(tree.root.children):
         if isinstance(node, Node) and node.tag == 'p' and node.text().strip().startswith(PARTICIPANTS):
             tree.root.children[i+1:i+1] = Tree(blocks).root.children

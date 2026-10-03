@@ -17,7 +17,8 @@ Only the playable MP4 is exported. A supported H.264/AAC MKV is remuxed with
 stream copy; the uploaded original is retained locally. Previously uploaded
 original assets are not deleted, but their duplicate Wiki node is removed by an
 explicit layout migration. An unsupported codec is reported rather than silently
-transcoded. Existing audio-only pages still contain the full source disclosure.
+transcoded. Audio-only pages contain the full source disclosure and retain their Timecodes
+section; video insertion replaces that list with one native chapter block.
 
 `summary.plane_media.refresh_layout(store, job_id, source_index, transcript_url)`
 is an explicit migration for app-owned existing video pages. It preserves remote

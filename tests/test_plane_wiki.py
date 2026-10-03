@@ -27,7 +27,7 @@ class WikiTests(unittest.TestCase):
         body = safe_html(page['description_html'])
         self.assertNotIn('<h1>', body)
         self.assertEqual(body.count(PARTICIPANTS), 1)
-        self.assertNotIn('<h2>Таймкоды</h2>', body)
+        self.assertIn('<h2>Таймкоды</h2>', body)  # audio-only fallback keeps the eighth section
         self.assertIn('<details class="editor-details-block"', body)
         self.assertNotIn(' open', body)
         for uid, unit in INDEX['by_id'].items():
@@ -59,7 +59,9 @@ class WikiTests(unittest.TestCase):
         blocks = native_blocks('test', assets, [{'seconds': 3, 'label': 'Topic'}])
         self.assertNotIn(original, blocks)
         self.assertEqual(blocks.count('<attachment-component'), 1)
-        value = insert_media(participant_header(INDEX) + transcript_block(INDEX, 'https://app.test/result?id=1') + '<p>Summary</p>', blocks)
+        value = insert_media(participant_header(INDEX) + transcript_block(INDEX, 'https://app.test/result?id=1') + '<h2>Таймкоды</h2><ul><li>Duplicate</li></ul><p>Summary</p>', blocks)
+        self.assertNotIn('<h2>Таймкоды</h2>', value)
+        self.assertNotIn('Duplicate', value)
         self.assertLess(value.index(PARTICIPANTS), value.index('<attachment-component'))
         self.assertLess(value.index('plane-timecodes-test'), value.index('<details'))
     def test_migration_preserves_other_body_and_details(self):

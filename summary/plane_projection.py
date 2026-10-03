@@ -97,7 +97,7 @@ def project_view(view, job_id, origin, hypothesis_ids, source_index=None):
         if source_index['source_sha256'] != view.source_sha256:
             raise ValueError('Транскрипция не соответствует конспекту')
         generated_title = re.search(r'<h1>(.*?)</h1>', fragment, re.S)
-        fragment = clean_summary(fragment, meeting_title=html.unescape(generated_title.group(1)) if generated_title else None)
+        fragment = clean_summary(fragment, meeting_title=html.unescape(generated_title.group(1)) if generated_title else None, keep_timecodes=True)
     parser.feed(fragment)
     title_match = re.search(r'<h1>(.*?)</h1>', view.rendered['summary.fragment.html'], re.S)
     title = html.unescape(title_match.group(1)) if title_match else 'Встреча'
