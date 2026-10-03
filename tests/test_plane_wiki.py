@@ -9,6 +9,18 @@ from test_luna_tasks import INDEX
 
 
 class WikiTests(unittest.TestCase):
+    def test_plane_response_includes_multiple_full_document_projections(self):
+        import json
+        from unittest.mock import MagicMock
+        from summary.plane import PlaneClient, PlaneError, MAX_PLANE_RESPONSE_BYTES
+        client = PlaneClient({'base_url':'https://plane.test','workspace_slug':'test'}, 'fake-key')
+        client.opener = MagicMock()
+        response = client.opener.open.return_value.__enter__.return_value
+        response.read.return_value = json.dumps({'description_html':'x' * (3*1024*1024)}).encode()
+        self.assertEqual(len(client.request('GET', client.prefix+'pages/id/')['description_html']), 3*1024*1024)
+        response.read.return_value = b'x' * (MAX_PLANE_RESPONSE_BYTES+1)
+        with self.assertRaisesRegex(PlaneError, 'превышает'):
+            client.request('GET', client.prefix+'pages/id/')
     def test_native_source_and_no_summary_duplicates(self):
         view = ProjectionTests().view()
         _, page = project_view(view, 1, 'https://app.test', ['H1'], INDEX)

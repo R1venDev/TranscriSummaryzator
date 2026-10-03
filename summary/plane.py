@@ -26,6 +26,8 @@ import uuid
 from scripts.summary_credentials import CredentialError, _fernet, load_master_key
 
 EXTERNAL_SOURCE = "transcrisummaryzator"
+# Plane returns HTML, JSON, stripped text and binary projections together.
+MAX_PLANE_RESPONSE_BYTES = 16 * 1024 * 1024
 DEFAULTS = dict(base_url="", workspace_slug="", project_id="", collection_id="",
                 parent_page_id="", task_type_id="", hypothesis_type_id="",
                 auto_tasks=False, auto_hypotheses=False,
@@ -160,15 +162,15 @@ class PlaneClient:
             headers={"X-API-Key": self.key, "Content-Type": "application/json", "Accept": "application/json"})
         try:
             with self.opener.open(request, timeout=25) as response:
-                data = response.read(2 * 1024 * 1024 + 1)
-                if len(data) > 2 * 1024 * 1024:
+                data = response.read(MAX_PLANE_RESPONSE_BYTES + 1)
+                if len(data) > MAX_PLANE_RESPONSE_BYTES:
                     raise PlaneError("Ответ Plane превышает допустимый размер")
                 return json.loads(data) if data else {}
         except urllib.error.HTTPError as exc:
             if exc.code in allowed_statuses:
-                data = exc.read(2 * 1024 * 1024 + 1)
+                data = exc.read(MAX_PLANE_RESPONSE_BYTES + 1)
                 try:
-                    if len(data) <= 2 * 1024 * 1024:
+                    if len(data) <= MAX_PLANE_RESPONSE_BYTES:
                         return json.loads(data)
                 except (ValueError, TypeError):
                     pass
@@ -178,6 +180,8 @@ class PlaneClient:
             except (ValueError, TypeError, AttributeError):
                 retry = 60
             raise PlaneHTTPError(exc.code, retry) from None
+        except PlaneError:
+            raise
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             raise PlaneError("Не удалось получить достоверный ответ Plane") from None
 
