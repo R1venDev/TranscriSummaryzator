@@ -106,7 +106,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "fb527d348094b1fe19e7572ecc07238be82e01fac6021812c116773a2408ff57"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "14c2e2dc0072a629b63edb283625e0a9f3dc0f09f37eebeabd93b9a40ffe4a2a"
 
 
 def _stage_pipeline_sha256(source):
@@ -563,7 +563,7 @@ def plane_selected(job_id, allow_auto=False, create=None):
         raise ValueError("Неверный номер записи")
     db = connect()
     try:
-        row = db.execute("SELECT status,output_dir FROM jobs WHERE id=?", (int(identifier),)).fetchone()
+        row = db.execute("SELECT status,output_dir,source_path,content_sha256,original_name FROM jobs WHERE id=?", (int(identifier),)).fetchone()
     finally:
         db.close()
     if not row or row["status"] != "done" or not row["output_dir"]:
@@ -583,6 +583,18 @@ def plane_selected(job_id, allow_auto=False, create=None):
             if view.generation_id != create.get("generation_id"):
                 raise ValueError("Конспект обновился; обновите страницу")
             store.enqueue(int(identifier), create.get("kind"), create.get("item_id"), view.generation_id)
+        # Media export starts at the immutable transcript boundary. Imported
+        # transcripts require a verified binding; ordinary uploads use queue
+        # source identity. This performs no ASR or model call.
+        from summary.plane_media import media_spec, enqueue as enqueue_media, unavailable as unavailable_media
+        from summary.luna_v1.source import load_source
+        try:
+            _, source_index, _ = load_source(output / "transcript.json")
+            spec = media_spec(dict(row), output, view, source_index, STATE.parent)
+            if spec:
+                enqueue_media(store, identifier, view.generation_id, spec)
+        except (ValueError, OSError, KeyError, TypeError):
+            unavailable_media(store, identifier, view.source_sha256)
     return view, idea_ids, store.items(int(identifier))
 
 
@@ -1926,76 +1938,7 @@ def process_job(job_id):
             write_json(duration_path, {"seconds": duration})
         else:
             duration = load_json(duration_path)["seconds"]
-        diagnostic_event("media_validation", category="observation", outcome="accepted", metrics={"duration_seconds": duration}, refs={"source": str(source)})
-        update_job(db, job_id, progress=5)
-        audio_cached = stage_cache_valid(job_dir, "audio", audio_key, ["audio.wav"])
-        diagnostic_decision("stage_cache.audio", "hit" if audio_cached else "miss", metrics={"cache_key": audio_key}, refs={"artifacts": ["audio.wav"]})
-        if not audio_cached:
-            update_job(db, job_id, stage="extract_audio", progress=7, detail="Извлекаю звуковую дорожку")
-            extract_audio(source, audio, cfg["audio_track"], log)
-            mark_stage_cached(job_dir, "audio", audio_key, ["audio.wav"])
-        update_job(db, job_id, progress=12)
-        diar_cached = stage_cache_valid(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"])
-        diagnostic_decision("stage_cache.diarizen", "hit" if diar_cached else "miss", metrics={"cache_key": diar_key}, refs={"artifacts": ["diarization.json", "diarization.rttm"]})
-        if not diar_cached:
-            update_job(db, job_id, stage="diarization", progress=15, detail="DiariZen: определяю участников")
-            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "diarizen"), PYTHONPATH=str(ROOT / "scripts"), PYTHONUNBUFFERED="1", PYTORCH_ENABLE_MPS_FALLBACK="1", PYTORCH_ALLOC_CONF="expandable_segments:True", HF_HOME=str(DATA_ROOT / "work" / "cache" / "huggingface"), MPLCONFIGDIR=str(DATA_ROOT / "work" / "cache" / "matplotlib"), PYTHONPYCACHEPREFIX=str(DATA_ROOT / "work" / "pycache"))
-            def diarization_progress(line):
-                markers = {
-                    "Extracting segmentations.": (20, "DiariZen: анализирую участки речи"),
-                    "Extracting Embeddings.": (40, "DiariZen: сравниваю голоса"),
-                    "Clustering.": (52, "DiariZen: объединяю голоса по участникам"),
-                }
-                if line in markers:
-                    progress, detail = markers[line]
-                    update_job(db, job_id, progress=progress, detail=detail)
-                    return
-                prefix = "DIARIZEN_PROGRESS "
-                if not line.startswith(prefix):
-                    return
-                payload = json.loads(line[len(prefix):])
-                current = int(payload.get("current", 0))
-                total = max(1, int(payload.get("total", 1)))
-                if payload.get("step") == "segmentation":
-                    progress = 20 + 20 * current / total
-                    detail = "DiariZen: анализ речи, пакет {} из {}".format(current, total)
-                elif payload.get("step") == "embeddings":
-                    progress = 40 + 12 * current / total
-                    detail = "DiariZen: сравнение голосов, пакет {} из {}".format(current, total)
-                else:
-                    return
-                update_job(db, job_id, progress=round(progress, 1), detail=detail)
-            diarization_command = [
-                str(ROOT / ".venv-diarizen" / "bin" / "python"), str(ROOT / "scripts" / "diarize_worker.py"),
-                "--audio", str(audio), "--output", str(diar_json), "--rttm", str(rttm),
-                "--model", cfg["diarization_model"], "--cache", str(DATA_ROOT / "work" / "cache" / "huggingface" / "hub"),
-                "--revision", cfg["diarization_model_revision"],
-                "--embedding-model", cfg["diarization_embedding_model"],
-                "--embedding-revision", cfg["diarization_embedding_revision"],
-                "--device", cfg["diarization_device"],
-                "--batch-size", str(cfg.get("diarization_batch_size", 8)),
-                "--min-speakers", str(cfg.get("diarization_min_speakers", 1)),
-                "--max-speakers", str(cfg["diarization_max_speakers"]),
-            ]
-            if job["speaker_count"] is not None:
-                diarization_command.extend(["--num-speakers", str(job["speaker_count"])])
-            run_command(diarization_command, log, env=env, progress_callback=diarization_progress)
-            mark_stage_cached(job_dir, "diarizen", diar_key, ["diarization.json", "diarization.rttm"])
-        update_job(db, job_id, progress=56)
-        ultra_cached = stage_cache_valid(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
-        diagnostic_decision("stage_cache.ultra", "hit" if ultra_cached else "miss", metrics={"cache_key": ultra_key}, refs={"artifacts": ["ultra.json", "ultra.rttm"]})
-        if not ultra_cached:
-            update_job(db, job_id, stage="ultra_diarization", progress=57, detail="Ultra Sortformer: независимо проверяю участников")
-            env = dict(os.environ, **diagnostic_environment(job_id, job_dir, "ultra"), PYTHONUNBUFFERED="1", HF_HOME=str(DATA_ROOT / "work" / "cache" / "ultra"), TORCH_HOME=str(DATA_ROOT / "work" / "cache" / "torch"))
-            run_command([
-                str(ROOT / ".venv-fusion" / "bin" / "python"), str(ROOT / "scripts" / "ultra_worker.py"),
-                "--audio", str(audio), "--output", str(ultra_json), "--rttm", str(ultra_rttm),
-                "--model", cfg.get("ultra_model", "mago-ai/ultra_diar_streaming_sortformer_8spk_v1"),
-                "--cache", str(DATA_ROOT / "work" / "cache" / "ultra"), "--device", cfg.get("ultra_device", "auto"),
-                "--revision", cfg["ultra_model_revision"],
-            ], log, env=env)
-            mark_stage_cached(job_dir, "ultra", ultra_key, ["ultra.json", "ultra.rttm"])
-        consensus_cached = stage_cache_valid(job_dir, "consensus", consensus_key, ["consensus.json", "track_mapping.json"])
+        diagnostic_event("media_validation", category="observation", outcome="accepted", metrics={"duration_seconds": duration}, refs={"source": str(source+_;��$z{-���jם"track_mapping.json"])
         diagnostic_decision("stage_cache.consensus", "hit" if consensus_cached else "miss", metrics={"cache_key": consensus_key}, refs={"artifacts": ["consensus.json", "track_mapping.json"]})
         if not consensus_cached:
             update_job(db, job_id, stage="consensus", progress=66, detail="Сопоставляю дорожки DiariZen и Ultra")

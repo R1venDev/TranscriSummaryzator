@@ -126,7 +126,7 @@ class PlaneClient:
         self.project = settings.get("project_id", "")
         self.opener = urllib.request.build_opener(_NoRedirect())
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, allowed_statuses=()):
         if not path.startswith(self.prefix) or path.startswith("//"):
             raise PlaneError("Недопустимый путь Plane API")
         encoded = _json(body).encode() if body is not None else None
@@ -139,6 +139,14 @@ class PlaneClient:
                     raise PlaneError("Ответ Plane превышает допустимый размер")
                 return json.loads(data) if data else {}
         except urllib.error.HTTPError as exc:
+            if exc.code in allowed_statuses:
+                data = exc.read(2 * 1024 * 1024 + 1)
+                try:
+                    if len(data) <= 2 * 1024 * 1024:
+                        return json.loads(data)
+                except (ValueError, TypeError):
+                    pass
+                raise PlaneError("Неизвестный формат ответа Plane") from None
             try:
                 retry = int(exc.headers.get("Retry-After", "60"))
             except (ValueError, TypeError, AttributeError):
@@ -265,6 +273,8 @@ class PlaneStore:
             CREATE TABLE IF NOT EXISTS hypotheses(source_id TEXT NOT NULL, item_id TEXT PRIMARY KEY,
                 text TEXT NOT NULL, anchors TEXT NOT NULL, ambiguous INTEGER NOT NULL DEFAULT 0);
             """)
+            from summary.plane_media import init_table
+            init_table(db)
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,0,?,NULL,?,?)",
                        (_json(DEFAULTS), _json({"state": "not_configured", "message": "Plane не настроен"}), _json({"projects": [], "collections": []})))
         os.chmod(self.path, 0o600)
@@ -578,12 +588,22 @@ class PlaneStore:
                 out = {"kind": item["kind"], "item_id": item["item_id"], "title": item["title"], "description": item["description"],
                        "state": state, "remote_url": sent["remote_url"] if sent else None, "error": sent["error"] if sent else ("Настройте подключение к Plane" if not configured else "")}
                 if item["kind"] == "page":
+                    media = db.execute("SELECT state,error FROM page_media WHERE delivery_id=?", (sent["id"],)).fetchone() if sent else None
+                    out["media_state"] = media["state"] if media else "unavailable"
+                    out["media_error"] = media["error"] if media else ""
                     page = out
                 else:
                     items.append(out)
         return {"generation_id": meeting["generation_id"] if meeting else None, "items": items, "meeting_page": page}
 
     def drain_one(self):
+        result = self._drain_delivery_one()
+        if result is None:
+            from summary.plane_media import drain
+            return drain(self)
+        return result
+
+    def _drain_delivery_one(self):
         with self._guard():
             with self._db() as db:
                 row = db.execute("SELECT * FROM deliveries WHERE state IN ('queued','sending','submission_unknown') AND next_attempt<=? ORDER BY created LIMIT 1", (time.time(),)).fetchone()

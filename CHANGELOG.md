@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-10-03 — видео в Wiki
+
+- Автоматический экспорт исходного видео, MP4 без перекодирования и нативного блока таймкодов в Plane.
+- Durable asset intent, encrypted presigned credentials, recovery, readback и видимый media state.
+- Без повторного inference, ASR или диаризации.
+
 [Русский README](README.md) · [English README](README.en.md) · [Статус проверки / Validation status](docs/STATUS.md)
 
 ## 2026.10.03

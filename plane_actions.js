@@ -84,6 +84,13 @@
     }
     const remote = page.remote_url && link('Wiki-страница встречи в Plane ↗', page.remote_url);
     if (remote) target.append(remote);
+    if (page.media_state === 'published') {
+      target.append(node('span', 'Видео и таймкоды опубликованы в Wiki.', 'plane-note'));
+    } else if (page.media_error) {
+      target.append(node('span', page.media_error, 'plane-error'));
+    } else if (page.media_state && page.media_state !== 'unavailable') {
+      target.append(node('span', 'Видео и таймкоды загружаются в Wiki…', 'plane-note'));
+    }
     if (page.state === 'update_available') {
       target.append(node('span', 'Конспект изменился. Изменения не отправлены в Wiki, чтобы сохранить ручные правки в Plane.', 'plane-note'));
     } else if (!remote && createdStates.has(page.state)) {
