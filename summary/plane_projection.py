@@ -55,12 +55,15 @@ def app_origin(value):
     return value
 
 
-def project_view(view, job_id, origin, hypothesis_ids, source_index=None):
+def project_view(view, job_id, origin, hypothesis_ids, source_index=None, project_id="default"):
     """Same tasks, manual overrides and review notices as the summary UI."""
     origin = app_origin(origin)
     doc = view.rendered['summary.json']
-    transcript_url = f'{origin}/result?id={int(job_id)}'
-    summary_url = f'{origin}/summary?id={int(job_id)}'
+    from summary.project_profiles import validate_id
+    validate_id(project_id)
+    suffix = '' if project_id == 'default' else '&project='+project_id
+    transcript_url = f'{origin}/result?id={int(job_id)}'+suffix
+    summary_url = f'{origin}/summary?id={int(job_id)}'+suffix
     esc = lambda text: html.escape(str(text), quote=True)
     def sources(ids):
         return ', '.join(f'<a href="{esc(transcript_url)}#u-{esc(uid)}">{esc(uid)}</a>' for uid in dict.fromkeys(ids))

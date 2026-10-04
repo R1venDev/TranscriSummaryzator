@@ -284,6 +284,8 @@ class Ledger:
                     self.db.execute(f"ALTER TABLE consumers ADD COLUMN {name} {definition}")
             workflow_columns = {row[1] for row in self.db.execute(
                 "PRAGMA table_info(source_first_workflows)")}
+            if "project_id" not in workflow_columns:
+                self.db.execute("ALTER TABLE source_first_workflows ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'")
             if "plan_sha256" not in workflow_columns:
                 self.db.execute("ALTER TABLE source_first_workflows ADD COLUMN plan_sha256 TEXT")
             if "planned_reserve_microusd" not in workflow_columns:
@@ -352,7 +354,7 @@ class Ledger:
                                 output_dir: Path, manifest_path: Path,
                                 manifest_sha256: str, credential_id: str,
                                 credential_version: int,
-                                workspace_id: str | None) -> StartDecision:
+                                workspace_id: str | None, project_id: str = "default") -> StartDecision:
         """Register a source-first logical job without a billable dispatch.
 
         It has its own table, so legacy single-item scheduler queries cannot
@@ -366,6 +368,8 @@ class Ledger:
                 or workspace_id is not None and (not isinstance(workspace_id, str)
                                                   or not workspace_id)):
             raise ValueError("invalid source-first identity")
+        from summary.project_profiles import validate_id
+        validate_id(project_id)
         output_dir = Path(output_dir)
         manifest_path = Path(manifest_path)
         if _sealed_sha256(manifest_path) != manifest_sha256:
@@ -382,7 +386,8 @@ class Ledger:
                         or prior["manifest_sha256"] != manifest_sha256
                         or prior["credential_id"] != credential_id
                         or prior["credential_version"] != credential_version
-                        or prior["workspace_id"] != workspace_id):
+                        or prior["workspace_id"] != workspace_id
+                        or prior["project_id"] != project_id):
                     raise ValueError("source-first semantic identity changed")
                 self.db.execute("COMMIT")
                 return StartDecision("accepted" if prior["status"] == "accepted"
@@ -393,11 +398,11 @@ class Ledger:
             workflow_id = uuid.uuid4().hex
             self.db.execute("""INSERT INTO source_first_workflows
                 (id,semantic_key,source_sha256,output_dir,manifest_path,manifest_sha256,
-                 status,credential_id,credential_version,workspace_id,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,'active',?,?,?,?,?)""",
+                 status,credential_id,credential_version,workspace_id,created_at,updated_at,project_id)
+                VALUES (?,?,?,?,?,?,'active',?,?,?,?,?,?)""",
                 (workflow_id, semantic_key, source_sha256, str(output_dir),
                  str(manifest_path), manifest_sha256, credential_id,
-                 credential_version, workspace_id, now, now))
+                 credential_version, workspace_id, now, now, project_id))
             self.db.execute("COMMIT")
             return StartDecision("new", workflow_id)
         except Exception:

@@ -54,3 +54,10 @@ The Gemini and Opus experiments are retained in closed, unmerged pull requests. 
 |---|---|---|
 | Gemini audit and repair | [#3](https://github.com/R1venDev/TranscriSummaryzator/pull/3) | [`339c93b5244951862ae3a6a6fa1849efc8272e66`](https://github.com/R1venDev/TranscriSummaryzator/commit/339c93b5244951862ae3a6a6fa1849efc8272e66) |
 | Opus Batch audit | [#4](https://github.com/R1venDev/TranscriSummaryzator/pull/4) | [`704fe439fd13f28e2c353d069ed06e3a3d027c5e`](https://github.com/R1venDev/TranscriSummaryzator/commit/704fe439fd13f28e2c353d069ed06e3a3d027c5e) |
+
+## 2026-10-04 — профили проектов
+
+- Создание, переключение и переименование профилей; существующие данные сохранены в Aurion.
+- Отдельные ключи моделей, Plane workspace/settings/outbox, карточки и голоса; закрепление профиля за записью и Batch workflow.
+- Общий ledger/cap, защита от чтения/изменения чужой записи, native speech ownership adapter.
+- Предыдущая публикация summary/speech images 84e7b9d проверена: workflow 37105780047 success, GHCR manifests доступны.

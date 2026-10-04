@@ -29,6 +29,8 @@ def import_transcript(raw: bytes, name: str) -> dict:
         temporary.flush()
         _, index, content_sha = load_source(temporary.name)
     identity = hashlib.sha256(b"imported-transcript\0" + name.encode("utf-8") + b"\0" + raw).hexdigest()
+    if pipeline.CURRENT.get() != pipeline.DEFAULT:
+        identity = hashlib.sha256((identity+"\0"+pipeline.CURRENT.get()).encode()).hexdigest()
     db = pipeline.connect()
     try:
         db.execute("BEGIN IMMEDIATE")
@@ -53,12 +55,12 @@ def import_transcript(raw: bytes, name: str) -> dict:
             """INSERT INTO jobs
             (fingerprint,content_sha256,source_path,original_name,status,stage,job_dir,
              output_dir,progress,detail,created_at,updated_at,finished_at,
-             summary_status,summary_detail)
+             summary_status,summary_detail,project_id)
             VALUES (?, ?, ?, ?, 'done', 'imported_transcript', ?, ?, 100, ?, ?, ?, ?,
-                    'not_started', ?)""",
+                    'not_started', ?, ?)""",
             (identity, content_sha, str(transcript), name, str(job_dir), str(output),
              "Импортирована готовая стенограмма; аудио не обрабатывалось", stamp, stamp, stamp,
-             "Готово к запуску саммари вручную"),
+             "Готово к запуску саммари вручную", pipeline.CURRENT.get()),
         )
         job_id = cursor.lastrowid
         pipeline.write_json(job_dir / "job.json", {
@@ -77,9 +79,12 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True, help="Name displayed in the dashboard")
+    parser.add_argument("--project-id", default="default")
     args = parser.parse_args()
+    pipeline.Projects(pipeline.STATE).require(args.project_id)
     raw = sys.stdin.buffer.read(MAX_BYTES + 1)
-    print(json.dumps(import_transcript(raw, args.name), ensure_ascii=False))
+    with pipeline.scope(args.project_id):
+        print(json.dumps(import_transcript(raw, args.name), ensure_ascii=False))
 
 
 if __name__ == "__main__":

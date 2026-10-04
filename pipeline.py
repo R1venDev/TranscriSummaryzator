@@ -36,6 +36,7 @@ from diagnostics import configure as configure_diagnostics, decision as diagnost
 from diagnostics import event as diagnostic_event, publish as publish_diagnostics
 from diagnostics import system_snapshot
 from summary_credentials import CredentialError, credential_dispatch_guard, verify_admin_password
+from summary.project_profiles import CURRENT, DEFAULT, Projects, private_path, scope
 
 
 ROOT = Path(__file__).resolve().parent
@@ -106,7 +107,7 @@ STAGE_DEPENDENCIES = {
 # only. Any later byte change (including a speech-path change) falls back to
 # the actual file digest, so a later edit cannot silently reuse old stages.
 LEGACY_PROTECTED_PIPELINE_SHA256 = "f310dd064f3515cfb24a29b80a85037203b3602d954110360878a3cf4e1f0115"
-PROTECTED_MIGRATION_SOURCE_SHA256 = "48f0ba4059888153a1c677d066a5bd1cbe1cbb299977b793ac4fa6c437895323"
+PROTECTED_MIGRATION_SOURCE_SHA256 = "a600d21e2e09a08b0de3cff7f0b4f99d97209bf35061bbaef933515b6786ca43"
 
 
 def _stage_pipeline_sha256(source):
@@ -259,6 +260,9 @@ def connect():
         "lease_until": "ALTER TABLE jobs ADD COLUMN lease_until TEXT",
         "attempt_id": "ALTER TABLE jobs ADD COLUMN attempt_id TEXT",
         "content_sha256": "ALTER TABLE jobs ADD COLUMN content_sha256 TEXT",
+        "project_id": "ALTER TABLE jobs ADD COLUMN project_id TEXT NOT NULL DEFAULT 'default'",
+        "native_job_id": "ALTER TABLE jobs ADD COLUMN native_job_id INTEGER",
+        "native_operation": "ALTER TABLE jobs ADD COLUMN native_operation TEXT",
     }
     for column, statement in migrations.items():
         if column not in columns:
@@ -289,6 +293,8 @@ def fingerprint(path):
 def submission_fingerprint(content_sha256, original_name):
     """Deduplicate only an identical recording submitted under the same name."""
     payload = str(content_sha256) + "\0" + Path(original_name).name
+    if CURRENT.get() != DEFAULT:
+        payload += "\0project:" + CURRENT.get()
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -296,16 +302,16 @@ def find_existing_job(db, content_sha256, original_name, source_path=None):
     submission = submission_fingerprint(content_sha256, original_name)
     if source_path is None:
         return db.execute(
-            "SELECT * FROM jobs WHERE fingerprint = ? OR (content_sha256 = ? AND original_name = ?) ORDER BY id LIMIT 1",
-            (submission, content_sha256, Path(original_name).name),
+            "SELECT * FROM jobs WHERE project_id=? AND (fingerprint = ? OR (content_sha256 = ? AND original_name = ?)) ORDER BY id LIMIT 1",
+            (CURRENT.get(), submission, content_sha256, Path(original_name).name),
         ).fetchone()
     return db.execute(
         """SELECT * FROM jobs
-           WHERE fingerprint = ?
+           WHERE project_id=? AND (fingerprint = ?
               OR (content_sha256 = ? AND original_name = ?)
-              OR (? IS NOT NULL AND content_sha256 = ? AND source_path = ?)
+              OR (? IS NOT NULL AND content_sha256 = ? AND source_path = ?))
            ORDER BY id LIMIT 1""",
-        (submission, content_sha256, Path(original_name).name,
+        (CURRENT.get(), submission, content_sha256, Path(original_name).name,
          str(source_path), content_sha256, str(source_path)),
     ).fetchone()
 
@@ -348,9 +354,9 @@ def enqueue(path, known_fingerprint=None, speaker_count=None, original_name=None
     job_dir.mkdir(parents=True, exist_ok=False)
     cursor = db.execute(
         """INSERT INTO jobs
-        (fingerprint, content_sha256, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?)""",
-        (fp, content_sha256, str(path), original_name, str(job_dir), normalize_speaker_count(speaker_count), now(), now()),
+        (fingerprint, content_sha256, source_path, original_name, status, stage, job_dir, speaker_count, created_at, updated_at, project_id)
+        VALUES (?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?)""",
+        (fp, content_sha256, str(path), original_name, str(job_dir), normalize_speaker_count(speaker_count), now(), now(), CURRENT.get()),
     )
     db.commit()
     write_status_snapshot(db)
@@ -374,7 +380,7 @@ def update_job(db, job_id, **values):
 
 def status_rows(db):
     return db.execute(
-        "SELECT id, original_name, status, stage, progress, detail, error, output_dir, speaker_count, created_at, started_at, finished_at, updated_at, summary_status, summary_stage, summary_progress, summary_detail, summary_error, summary_started_at, summary_finished_at FROM jobs ORDER BY id DESC LIMIT 50"
+        "SELECT id, original_name, status, stage, progress, detail, error, output_dir, speaker_count, created_at, started_at, finished_at, updated_at, summary_status, summary_stage, summary_progress, summary_detail, summary_error, summary_started_at, summary_finished_at FROM jobs WHERE project_id=? ORDER BY id DESC LIMIT 50", (CURRENT.get(),)
     ).fetchall()
 
 
@@ -542,17 +548,34 @@ def current_summary_generation_id(base):
         return None
 
 
+def project_for_output(output_dir):
+    with connect() as db:
+        row = db.execute("SELECT project_id FROM jobs WHERE output_dir=?", (str(output_dir),)).fetchone()
+    return row[0] if row else DEFAULT
+
+
+def project_private(filename, identifier=None):
+    identifier = CURRENT.get() if identifier is None else identifier
+    if filename == "credentials.sqlite3" and identifier == DEFAULT:
+        return SUMMARY_CREDENTIAL_DB
+    return private_path(STATE / "summary_private", filename, identifier)
+
+
+def voice_profiles_root():
+    return VOICE_PROFILES if CURRENT.get() == DEFAULT else VOICE_PROFILES / "projects" / CURRENT.get()
+
+
 def luna_effective_view(output_dir):
     """Read the selected sealed Luna document plus local human overrides."""
     from summary.luna_v1.task_api import read_current
     output_dir = Path(output_dir)
     return read_current(output_dir, output_dir / "transcript.json",
-                        STATE / "summary_private" / "tasks.sqlite3", current_summary_output)
+                        project_private("tasks.sqlite3", project_for_output(output_dir)), current_summary_output)
 
 
-def plane_store():
+def plane_store(identifier=None):
     from summary.plane import PlaneStore
-    return PlaneStore(STATE / "summary_private" / "plane.sqlite3")
+    return PlaneStore(project_private("plane.sqlite3", identifier))
 
 
 def plane_selected(job_id, allow_auto=False, create=None):
@@ -563,7 +586,7 @@ def plane_selected(job_id, allow_auto=False, create=None):
         raise ValueError("Неверный номер записи")
     db = connect()
     try:
-        row = db.execute("SELECT status,output_dir,source_path,content_sha256,original_name FROM jobs WHERE id=?", (int(identifier),)).fetchone()
+        row = db.execute("SELECT status,output_dir,source_path,content_sha256,original_name,project_id FROM jobs WHERE id=?", (int(identifier),)).fetchone()
     finally:
         db.close()
     if not row or row["status"] != "done" or not row["output_dir"]:
@@ -573,12 +596,14 @@ def plane_selected(job_id, allow_auto=False, create=None):
     with (output / ".summary_publication.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         view = luna_effective_view(output)
-        store = plane_store()
+        store = plane_store(row["project_id"])
+        if create is not None and row["project_id"] != CURRENT.get():
+            raise ValueError("Запись принадлежит другому профилю")
         idea_ids = store.hypothesis_ids(view.source_sha256, view.rendered["summary.json"]["ideas"])
         origin = os.environ.get("TRANSCRI_SUMMARY_ADMIN_ORIGIN", "http://127.0.0.1:{}".format(config().get("dashboard_port",8765)))
         from summary.luna_v1.source import load_source
         _, source_index, _ = load_source(output / "transcript.json")
-        items, page = project_view(view, int(identifier), origin, idea_ids, source_index)
+        items, page = project_view(view, int(identifier), origin, idea_ids, source_index, row["project_id"])
         store.observe_generation(int(identifier), view.generation_id, items, page,
                                  source_id=view.source_sha256, allow_auto=allow_auto)
         if create is not None:
@@ -600,29 +625,28 @@ def plane_selected(job_id, allow_auto=False, create=None):
 
 
 def plane_scheduler_tick(deliver=True):
-    """Independent delivery errors never block summary/speech processing."""
-    try:
-        store = plane_store()
-        db = connect()
-        try:
-            rows = db.execute("SELECT id,output_dir FROM jobs WHERE status='done' AND output_dir IS NOT NULL").fetchall()
-        finally:
-            db.close()
-        baseline = store.baseline_complete()
-        for row in rows:
-            generation = current_summary_generation_id(Path(row["output_dir"]))
-            if not generation or store.known_generation(row["id"]) == generation:
-                continue
+    """One scheduler, independent outboxes/destinations for each profile."""
+    for project in Projects(STATE).list():
+        with scope(project["id"]):
             try:
-                plane_selected(row["id"], allow_auto=baseline)
-            except (ValueError, OSError, sqlite3.Error):
-                continue  # legacy generations remain readable, not auto-exported
-        if not baseline:
-            store.mark_baseline_complete()
-        if deliver:
-            store.drain_one()
-    except Exception as exc:
-        print("Очередь Plane: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
+                store = plane_store()
+                with connect() as db:
+                    rows = db.execute("SELECT id,output_dir FROM jobs WHERE project_id=? AND status='done' AND output_dir IS NOT NULL", (project["id"],)).fetchall()
+                baseline = store.baseline_complete()
+                for row in rows:
+                    generation = current_summary_generation_id(Path(row["output_dir"]))
+                    if not generation or store.known_generation(row["id"]) == generation:
+                        continue
+                    try:
+                        plane_selected(row["id"], allow_auto=baseline)
+                    except (ValueError, OSError, sqlite3.Error):
+                        continue
+                if not baseline:
+                    store.mark_baseline_complete()
+                if deliver:
+                    store.drain_one()
+            except Exception as exc:
+                print("Очередь Plane: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
 
 
 def current_release_commit():
@@ -639,14 +663,14 @@ def current_release_commit():
 def profile_path(profile_id):
     if not profile_id or any(character not in "0123456789abcdef" for character in profile_id) or len(profile_id) != 32:
         raise ValueError("Профиль не найден")
-    return VOICE_PROFILES / profile_id / "profile.json"
+    return voice_profiles_root() / profile_id / "profile.json"
 
 
 def load_voice_profiles():
     profiles = []
-    if not VOICE_PROFILES.exists():
+    if not voice_profiles_root().exists():
         return profiles
-    for path in VOICE_PROFILES.glob("*/profile.json"):
+    for path in voice_profiles_root().glob("*/profile.json"):
         try:
             profile = load_json(path)
             samples = profile.get("samples", [])
@@ -1514,7 +1538,7 @@ def enrollment_signature(profiles):
             continue
         samples = []
         for sample in profile.get("samples", []):
-            path = VOICE_PROFILES / profile["id"] / sample.get("audio", "missing")
+            path = voice_profiles_root() / profile["id"] / sample.get("audio", "missing")
             if path.is_file():
                 stat = path.stat()
                 samples.append([str(path), stat.st_size, stat.st_mtime_ns])
@@ -1526,7 +1550,7 @@ def ensure_redimnet_enrollment(cfg, log):
     profiles = [profile for profile in load_voice_profiles() if profile.get("ready")]
     if not profiles:
         return []
-    destination = VOICE_PROFILES / "_redimnet2_enrollment.json"
+    destination = voice_profiles_root() / "_redimnet2_enrollment.json"
     signature = enrollment_signature(profiles)
     if destination.is_file():
         cached = load_json(destination)
@@ -1537,10 +1561,10 @@ def ensure_redimnet_enrollment(cfg, log):
                 item["name"] = names.get(item["id"], item.get("name", item["id"]))
             return result
     groups = {
-        profile["id"]: [VOICE_PROFILES / profile["id"] / sample["audio"] for sample in profile.get("samples", [])]
+        profile["id"]: [voice_profiles_root() / profile["id"] / sample["audio"] for sample in profile.get("samples", [])]
         for profile in profiles
     }
-    raw_path = VOICE_PROFILES / "_redimnet2_enrollment.raw.json"
+    raw_path = voice_profiles_root() / "_redimnet2_enrollment.raw.json"
     groups_result = extract_redimnet_embeddings(groups, raw_path, log, cfg)
     result = []
     by_id = {profile["id"]: profile for profile in profiles}
@@ -2148,6 +2172,7 @@ def _process_luna_summary(db, job, transcript, output_dir, job_dir, log, summary
         summary_python(), str(ROOT / "scripts" / "luna_summary_worker.py"), "submit",
         "--transcript", str(transcript), "--output", str(output_dir),
         "--private-root", str(STATE / "summary_private"),
+        "--project-id", job["project_id"],
     ]
     if force:
         command += ["--force-nonce", summary_run_id]
@@ -2344,7 +2369,7 @@ def run_next_summary():
     lease_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(timespec="seconds")
     db.execute("BEGIN IMMEDIATE")
     candidates = db.execute(
-        "SELECT id,output_dir,summary_status FROM jobs WHERE status='done' AND summary_status IN ('queued','queued_force') ORDER BY id LIMIT 50"
+        "SELECT id,output_dir,summary_status FROM jobs WHERE status='done' AND native_operation IS NULL AND summary_status IN ('queued','queued_force') ORDER BY id LIMIT 50"
     ).fetchall()
     job = next((candidate for candidate in candidates
                 if cfg.get("summary_backend") != "luna_batch" or not _luna_output_has_active_batch(candidate["output_dir"])), None)
@@ -2645,6 +2670,11 @@ def summary_scheduler(once=False):
     try:
         while True:
             try:
+                from summary.speech_bridge import sync as sync_speech
+                sync_speech(sys.modules[__name__])
+            except Exception as exc:
+                print("Ошибка получения готовых транскрипций: {}".format(type(exc).__name__), file=sys.stderr, flush=True)
+            try:
                 luna_scheduler_tick()
             except Exception as exc:
                 # The next ordinary scheduler tick may recover a known remote
@@ -2674,7 +2704,21 @@ def scan_inbox(seen, cfg):
             seen[resolved] = (signature, current, False)
             continue
         if not previous[2] and current - previous[1] >= cfg["stable_seconds"] and current - stat.st_mtime >= cfg["stable_seconds"]:
-            enqueue(path)
+            # The watcher observes storage, not the UI-selected profile.
+            # A published upload already owns this exact path; never enroll
+            # it again as a default-profile recording.
+            with connect() as db:
+                owner = db.execute("SELECT id FROM jobs WHERE source_path=?", (resolved,)).fetchone()
+            if owner is None:
+                identifier = DEFAULT
+                for metadata_path in INBOX.glob(".*.upload.json"):
+                    metadata = load_json(metadata_path)
+                    if metadata.get("storage_key") == path.name:
+                        identifier = metadata.get("project_id", DEFAULT)
+                        Projects(STATE).require(identifier)
+                        break
+                with scope(identifier):
+                    enqueue(path)
             seen[resolved] = (signature, previous[1], True)
     for missing in set(seen) - present:
         del seen[missing]
@@ -2736,6 +2780,8 @@ def dashboard_payload():
     for metadata_path in INBOX.glob(".*.upload.json"):
         try:
             metadata = load_json(metadata_path)
+            if metadata.get("project_id", DEFAULT) != CURRENT.get():
+                continue
             total = max(1, int(metadata["size"]))
             partial = INBOX / metadata.get("partial_name", ("." + metadata["name"] + ".partial"))
             received = partial.stat().st_size if partial.exists() else 0
@@ -2867,7 +2913,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not interpreter or not Path(interpreter).is_absolute() or not Path(interpreter).is_file():
             raise CredentialError("Не настроен изолированный Python суммаризатора")
         environment = os.environ.copy()
-        environment["TRANSCRI_SUMMARY_CREDENTIAL_DB"] = str(SUMMARY_CREDENTIAL_DB)
+        environment["TRANSCRI_SUMMARY_CREDENTIAL_DB"] = str(project_private("credentials.sqlite3"))
         request = json.dumps({"operation": operation, "body": body}, ensure_ascii=False)
         if len(request.encode("utf-8")) > 4096:
             raise CredentialError("Превышен лимит запроса к хранилищу")
@@ -2904,22 +2950,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.summary_credential_rpc("check", body)
                 status = 200
             elif action == "replace":
-                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                with credential_dispatch_guard(project_private("credentials.sqlite3")):
                     active = self.summary_active_credential_jobs(body.get("id"))
                     if active is None:
                         raise CredentialError("Состояние внешних запросов неизвестно; замена пока закрыта")
                     result = self.summary_credential_rpc("replace", {**body, "active_jobs": active})
                 status = 200
             elif action == "order":
-                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                with credential_dispatch_guard(project_private("credentials.sqlite3")):
                     result = self.summary_credential_rpc("order", body)
                 status = 200
             elif action == "enabled":
-                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                with credential_dispatch_guard(project_private("credentials.sqlite3")):
                     result = self.summary_credential_rpc("enabled", body)
                 status = 200
             elif action == "delete":
-                with credential_dispatch_guard(SUMMARY_CREDENTIAL_DB):
+                with credential_dispatch_guard(project_private("credentials.sqlite3")):
                     active = self.summary_active_credential_jobs(body.get("id"))
                     if active is None:
                         raise CredentialError("Состояние внешних запросов неизвестно; удаление пока закрыто")
@@ -3003,7 +3049,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 from summary.luna_v1.tasks import RevisionConflict
                 view = edit_current(
                     Path(row["output_dir"]), Path(row["output_dir"]) / "transcript.json",
-                    STATE / "summary_private" / "tasks.sqlite3", current_summary_output,
+                    project_private("tasks.sqlite3"), current_summary_output,
                     action_id=action_id,
                     expected_generation_id=body.get("expected_generation_id"),
                     expected_revision=body.get("expected_revision"),
@@ -3082,7 +3128,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not path.is_file():
                     self.send_json({"error": "Профиль не найден"}, 404)
                     return
-                trash = VOICE_PROFILES / ".trash"
+                trash = voice_profiles_root() / ".trash"
                 trash.mkdir(parents=True, exist_ok=True)
                 destination = trash / (profile_id + "-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
                 if destination.exists():
@@ -3289,9 +3335,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Неверный номер записи"}, 400)
                 return
             db = connect()
+            db.execute("BEGIN IMMEDIATE")
             job = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if not job or job["status"] != "done" or not job["output_dir"]:
+                db.rollback()
                 self.send_json({"error": "Сначала дождитесь окончания расшифровки"}, 409)
+                return
+            if job["native_operation"]:
+                db.rollback()
+                self.send_json({"error": "Дождитесь завершения изменения голосов"}, 409)
                 return
             active = {"running", "pending_batch", "submission_unknown"} if luna_backend else {"running"}
             if job["summary_status"] == "credential_required" and luna_backend:
@@ -3300,6 +3352,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if attempt.get("job_id"):
                     active.add("credential_required")
             if job["summary_status"] in active:
+                db.rollback()
                 self.send_json({"error": "Предыдущая отправка ещё не завершена или требует восстановления"}, 409)
                 return
             update_job(
@@ -3358,6 +3411,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "size": length,
                 "started_at": now(),
                 "source": "web",
+                "project_id": CURRENT.get(),
             },
         )
 
@@ -3599,7 +3653,7 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
                     content = selected.rendered["summary.fragment.html"]
                     try:
                         from summary.plane_projection import add_action_controls
-                        idea_ids = plane_store().hypothesis_ids(selected.source_sha256, selected.rendered["summary.json"]["ideas"])
+                        idea_ids = plane_store(project_for_output(row["output_dir"])).hypothesis_ids(selected.source_sha256, selected.rendered["summary.json"]["ideas"])
                         content = add_action_controls(content, selected.tasks, idea_ids)
                     except (ValueError, CredentialError, OSError, sqlite3.Error):
                         pass  # Plane configuration never hides an accepted summary
@@ -3768,6 +3822,10 @@ def rename_export(job_id, diarization=None):
                    summary_progress=0, summary_detail="Стенограмма изменена; требуется новое саммари",
                    summary_error=None, summary_started_at=None, summary_finished_at=None)
     print("Имена применены: {}".format(output_dir))
+
+
+from summary.project_http import install as install_project_http
+install_project_http(sys.modules[__name__])
 
 
 def doctor():

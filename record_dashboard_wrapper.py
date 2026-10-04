@@ -337,7 +337,8 @@ def delete_record(pipeline, job_id: int, name: str, created_at: str) -> dict:
     try:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
-        if row is None:
+        from summary.project_profiles import CURRENT, DEFAULT
+        if row is None or (row["project_id"] if "project_id" in row.keys() else DEFAULT) != CURRENT.get():
             raise DeleteError(404, "Запись не найдена")
         if row["original_name"] != name or row["created_at"] != created_at:
             raise DeleteError(409, "Список изменился; обновите страницу")

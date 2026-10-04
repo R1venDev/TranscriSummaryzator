@@ -35,6 +35,7 @@ def main() -> int:
     create.add_argument("--output", type=Path, required=True)
     create.add_argument("--private-root", type=Path, required=True)
     create.add_argument("--force-nonce")
+    create.add_argument("--project-id", default="default")
     poll = sub.add_parser("poll")
     poll.add_argument("--private-root", type=Path, required=True)
     args = parser.parse_args()
@@ -46,7 +47,7 @@ def main() -> int:
             outcome = submit_source_first(transcript_path=args.transcript,
                                           output_dir=args.output,
                                           private_root=args.private_root,
-                                          force_nonce=args.force_nonce)
+                                          force_nonce=args.force_nonce, project_id=args.project_id)
         _write_status(args.output / "summary_luna_attempt.json", outcome)
         print("SUMMARY_PROGRESS " + json.dumps({
             "stage": "summary_" + outcome["status"],

@@ -2276,3 +2276,7 @@ Worker boundary одновременно является dependency boundary и
 - Нельзя ослаблять universal gate ради одной записи; нужен корректный class-level fix и negative regression.
 
 Итоговый принцип системы: **ни один удобный текст не важнее доказуемого состояния, а ни одно доказуемое состояние не должно исчезнуть без явного конечного решения**.
+
+## Project namespaces
+
+`summary/project_profiles.py` owns the additive project registry; `project_http.py` fences existing HTTP paths and per-job context. Jobs/workflows persist project ownership; keys/cards/Plane outboxes use scoped paths while the scheduler and budget ledger remain global. Native speech ownership is adapted without changing recognition code. See [PROJECT_PROFILES](docs/PROJECT_PROFILES.md).

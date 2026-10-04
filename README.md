@@ -143,3 +143,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 - [Plane: настройка и поведение отправок](docs/PLANE.md)
 - [Статус реализации и ограничения](docs/STATUS.md)
 - [Предыдущий контракт Luna Batch](docs/SUMMARY_LUNA_BATCH.md)
+
+### Профили проектов / Project folders
+
+Создавайте отдельные профили Aurion, ExLand и других команд: свои записи, ключи моделей, workspace Plane и голосовые профили. Переключатель находится в верхней панели приложения. [Настройка и изоляция](docs/PROJECT_PROFILES.md). / Create project folders with separate recordings, model keys, Plane workspaces and voice profiles.

@@ -55,7 +55,7 @@ def bootstrap(*, reset_admin=False, enable_speech=False):
         master = private / "summary-master.key"
         if not master.exists():
             stored_secrets = data / "state" / "summary_private"
-            if any((stored_secrets / name).exists() for name in ("credentials.sqlite3", "plane.sqlite3")):
+            if any(stored_secrets.rglob("credentials.sqlite3")) or any(stored_secrets.rglob("plane.sqlite3")):
                 raise RuntimeError("Secret volume is missing; restore its master key before starting")
             write_secret(master, Fernet.generate_key().decode("ascii"))
         # Validate ownership and permissions even on repeated bootstrap.

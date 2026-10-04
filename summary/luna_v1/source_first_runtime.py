@@ -11,6 +11,7 @@ recorded attempts and saved artifacts, not from another state store.
 """
 
 from __future__ import annotations
+from summary.project_profiles import DEFAULT, private_path, validate_id
 
 from copy import deepcopy
 from dataclasses import replace
@@ -459,6 +460,7 @@ def _saved_policy_matches(row: dict, manifest: dict, snapshot: SourceSnapshot,
             and manifest.get("prompt_hashes") == expected_prompts
             and manifest.get("schema_hashes") == expected_schemas
             and manifest.get("force_nonce") == force_nonce
+            and manifest.get("project_id", DEFAULT) == row.get("project_id", DEFAULT)
             and manifest.get("workspace_id") == row["workspace_id"]
             and manifest.get("model_submit_slug") == SUBMIT_MODEL
             and manifest.get("resolved_batch_endpoint") == MODEL
@@ -466,10 +468,11 @@ def _saved_policy_matches(row: dict, manifest: dict, snapshot: SourceSnapshot,
 
 
 def _existing_same_policy(ledger: Ledger, snapshot: SourceSnapshot,
-                          output_dir: Path, force_nonce: str | None) -> dict | None:
+                          output_dir: Path, force_nonce: str | None, project_id: str = DEFAULT) -> dict | None:
     """Zero-call reuse of a sealed result from this exact code route policy."""
     for row in ledger.list_source_first_workflows(states=("active", "accepted")):
-        if (row["source_sha256"] != snapshot.source_sha256
+        if (row.get("project_id", DEFAULT) != project_id
+                or row["source_sha256"] != snapshot.source_sha256
                 or Path(row["output_dir"]) != output_dir):
             continue
         try:
@@ -492,13 +495,14 @@ def _existing_same_policy(ledger: Ledger, snapshot: SourceSnapshot,
 
 def submit_source_first(*, transcript_path: Path, output_dir: Path,
                         private_root: Path, force_nonce: str | None = None,
-                        client_factory=BatchClient) -> dict:
+                        client_factory=BatchClient, project_id: str = DEFAULT) -> dict:
     """Plan and send wave 1 (one writer Batch and K extraction items Batch).
 
     A blocked preflight never sends private input.  A repeated call reuses the
     existing workflow/attempt intent and cannot submit another Batch for the
     same input.  Later waves are driven by the ordinary polling scheduler.
     """
+    validate_id(project_id)
     snapshot = load_snapshot(Path(transcript_path))
     packets = plan_packets(snapshot)
     dimensions = plan_dimensions(packets)
@@ -506,10 +510,10 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
         return {"status": dimensions["status"], "reason": dimensions["reason"]}
     ledger = Ledger(private_root)
     try:
-        cached = _existing_same_policy(ledger, snapshot, Path(output_dir), force_nonce)
+        cached = _existing_same_policy(ledger, snapshot, Path(output_dir), force_nonce, project_id)
         if cached is not None:
             return cached
-        store = CredentialStore(Path(private_root) / "credentials.sqlite3")
+        store = CredentialStore(private_path(private_root, "credentials.sqlite3", project_id))
         with credential_dispatch_guard(store.path):
             candidates = store.dispatch_candidates()
             if not candidates:
@@ -539,6 +543,7 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                 return {"status": "preflight_blocked", "reason": str(exc)}
             semantic_key = digest({
                 "source_sha256": snapshot.source_sha256,
+                **({"project_id": project_id} if project_id != DEFAULT else {}),
                 "policy_version": POLICY_VERSION,
                 "prompt_hashes": {stage: prompt_sha256_for_stage(stage) for stage in STAGES},
                 "schema_hashes": {stage: digest(schema_for_stage(stage)) for stage in STAGES},
@@ -572,7 +577,7 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                             source_generation=Path(existing["accepted_document_path"]).parent,
                             source_output_dir=Path(existing["output_dir"]),
                             output_dir=Path(output_dir), transcript_path=Path(transcript_path),
-                            task_db_path=Path(private_root) / "tasks.sqlite3",
+                            task_db_path=private_path(private_root, "tasks.sqlite3", project_id),
                             source_sha256=snapshot.source_sha256,
                             semantic_key=semantic_key, job_id=existing["id"],
                             credential_id=existing["credential_id"],
@@ -625,6 +630,7 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                 force_nonce=force_nonce, route=route,
                 planned_capacity_microusd=planned_hold,
                 forecast_microusd=forecast)
+            manifest["project_id"] = project_id
             root = Path(private_root) / "source_first" / semantic_key
             manifest_path = root / "manifest.json"
             manifest_sha = _json_file_once(manifest_path, manifest)
@@ -633,7 +639,7 @@ def submit_source_first(*, transcript_path: Path, output_dir: Path,
                 output_dir=Path(output_dir), manifest_path=manifest_path,
                 manifest_sha256=manifest_sha,
                 credential_id=selected["id"], credential_version=selected["version"],
-                workspace_id=route.workspace_id,
+                workspace_id=route.workspace_id, project_id=project_id,
             )
             if decision.kind != "new":
                 return {"status": decision.kind, "workflow_id": decision.job_id,
@@ -884,7 +890,7 @@ def _poll_attempt(*, ledger: Ledger, attempt: dict, workflow: dict,
     if claimed is None:
         return {"attempt_id": attempt["id"], "status": "not_due"}
     try:
-        store = CredentialStore(private_root / "credentials.sqlite3")
+        store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
         token = _credential_for_read(store, attempt, workflow)
         client = client_factory(token)
         reply = client.get(attempt["remote_id"])
@@ -986,7 +992,7 @@ def _cleanup_terminal_once(*, ledger: Ledger, attempt: dict,
     if receipt.exists():
         return None
     try:
-        store = CredentialStore(private_root / "credentials.sqlite3")
+        store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
         token = _credential_for_read(store, attempt, workflow)
         reply = client_factory(token).delete(attempt["remote_id"])
         deletion = reply.body.get("deletion") if isinstance(reply.body, dict) else None
@@ -1286,7 +1292,7 @@ def _dispatch_wave(*, ledger: Ledger, workflow: dict, manifest: dict,
     existing = _stage_attempt(ledger, workflow["id"], stage)
     if existing is not None:
         return {"status": existing["status"], "attempt_id": existing["id"]}
-    store = CredentialStore(private_root / "credentials.sqlite3")
+    store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
     try:
         with credential_dispatch_guard(store.path):
             token = store.reveal_for_dispatch(workflow["credential_id"],
@@ -1445,7 +1451,7 @@ def resume_saved_repair(*, private_root: Path, workflow_id: str) -> dict:
                                                             findings, evidence, snapshot)
         if plan is None or not plan["bundles"]:
             raise ValueError("repair_recovery_no_valid_bundles")
-        TaskStore(Path(private_root) / "tasks.sqlite3").preview_reconcile(snapshot.source_sha256, candidate["tasks"])
+        TaskStore(private_path(private_root, "tasks.sqlite3", workflow.get("project_id", DEFAULT))).preview_reconcile(snapshot.source_sha256, candidate["tasks"])
         root = Path(private_root) / "source_first" / workflow["semantic_key"]
         receipt_path = root / "repair_recovery.json"
         if receipt_path.exists():
@@ -1603,7 +1609,7 @@ def _publish(*, ledger: Ledger, workflow: dict, manifest: dict,
         quality["patch_normalization"] = plan["normalization"]
         quality["applied_native_bundle_ids"] = [native for identity in sorted(accepted)
             for native in plan["normalization"]["bundle_lineage"][identity]]
-    task_store = TaskStore(private_root / "tasks.sqlite3")
+    task_store = TaskStore(private_path(private_root, "tasks.sqlite3", workflow.get("project_id", DEFAULT)))
     task_plan = task_store.preview_reconcile(snapshot.source_sha256, document["tasks"])
     generation_id = datetime.fromtimestamp(workflow["created_at"], timezone.utc).strftime(
         "%Y%m%d-%H%M%S") + "-" + workflow["id"][:12]
@@ -1691,7 +1697,7 @@ def _advance_workflow(*, ledger: Ledger, workflow: dict,
     extract = _stage_attempt(ledger, workflow["id"], "extract")
     if not writer or not extract:
         try:
-            store = CredentialStore(private_root / "credentials.sqlite3")
+            store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
             with credential_dispatch_guard(store.path):
                 token = store.reveal_for_dispatch(workflow["credential_id"],
                                                   workflow["credential_version"])
@@ -1927,7 +1933,7 @@ def poll_source_first_once(*, private_root: Path,
                     # before either physical POST.
                     continue
                 try:
-                    store = CredentialStore(private_root / "credentials.sqlite3")
+                    store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
                     with credential_dispatch_guard(store.path):
                         token = store.reveal_for_dispatch(attempt["credential_id"],
                                                           attempt["credential_version"])
@@ -1965,7 +1971,7 @@ def poll_source_first_once(*, private_root: Path,
                                  "attempt_id": attempt["id"]})
             elif attempt["status"] == "submission_unknown":
                 try:
-                    store = CredentialStore(private_root / "credentials.sqlite3")
+                    store = CredentialStore(private_path(private_root, "credentials.sqlite3", workflow.get("project_id", DEFAULT)))
                     token = _credential_for_read(store, attempt, workflow)
                     outcomes.append(_recover_unknown(ledger=ledger,
                         attempt=attempt, client=client_factory(token),
